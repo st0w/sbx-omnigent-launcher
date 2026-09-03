@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sbx-omnigent-launcher"
+version = "0.1.0"
+description = "Docker Sandboxes (sbx) provider for Omnigent managed hosts."
+license = "Apache-2.0"
+readme = "README.md"
+requires-python = ">=3.12"
+
+# NOTE: omnigent is intentionally NOT listed as a dependency. This package is
+# installed into the SAME environment where omnigent already lives, and it
+# imports omnigent at runtime. Pinning a version here risks pip trying to swap
+# the omnigent already in your env. Install with `uv pip install -e .` (or
+# `pip install -e . --no-deps`) into that shared environment.
+dependencies = []
+
+[project.scripts]
+# Run `omni-sbx server ...` exactly as you would `omni server ...`.
+omni-sbx = "sbx_omnigent.entrypoint:main"
+# The trusted-plane swarm coordinator CLI (drive coder/reviewer swarms) and
+# the worktree lifecycle CLI. A swarm-coordinator agent calls these via its
+# shell; they resolve on the venv PATH once this package is installed.
+omni-sbx-swarm = "sbx_omnigent.swarm:main"
+omni-sbx-worktrees = "sbx_omnigent.worktrees:main"
+# Fire a declarative pipeline.yaml to completion (the DAG runner).
+omni-sbx-pipeline = "sbx_omnigent.runner:main"
+# The Antigravity (agy) token harvester: bootstrap the trusted auth-agy box
+# and run the always-on refresh loop that keeps the wire-swap secret fresh.
+omni-sbx-agy = "sbx_omnigent.agy:main"
+
+[tool.setuptools]
+packages = ["sbx_omnigent"]
+
+[tool.setuptools.package-data]
+# Role prompt templates shipped inside the package (read Path-relative;
+# also declared here so a non-editable wheel includes them).
+sbx_omnigent = ["templates/*.md"]
+
+[tool.ruff]
+line-length = 79
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "**/scratch/**",
+]
+
+
+[tool.ruff.lint]
+# Q001 (multiline) and Q002 (docstring) are allowed to stay double-quoted
+# (PEP 257 docstrings); only inline strings must be single-quoted (Q000).
+ignore = ["Q001", "Q002"]
+
+select = [
+    "E", "W",  # pycodestyle errors, warnings
+    "F",       # pyflakes
+    "I",       # isort (imports)
+    "B",       # flake8-bugbear
+    "A",       # flake8-builtins (prevent system variable shadowing)
+    "Q",       # flake8-quotes
+    "C",       # flake8-comprehensions
+    "UP",      # pyupgrade
+    "RUF",     # ruff-specific rules
+    "PLC0415", # import-outside-toplevel
+]
+
+
+[tool.ruff.lint.pycodestyle]
+# 72-char cap on comment and docstring lines (enforced by W505).
+max-doc-length = 72
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
+multiline-quotes = "single"
+docstring-quotes = "single"
+
+
+[tool.ruff.format]
+quote-style = "single"
+line-ending = "lf" # PEP-8

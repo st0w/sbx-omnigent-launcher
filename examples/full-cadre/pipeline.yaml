@@ -1,0 +1,103 @@
+# Full-cadre pipeline — the whole swarm in one file.
+#
+# Planning + TDD + two COMPETING coders (Claude vs agy), each vetted by a
+# security + bug reviewer consensus gate; a judge picks the winner, a refactor
+# agent polishes it, and one final review ships it. Every role the launcher
+# ships, working together:
+#
+#   plan ─▶ tests ─┬─▶ impl-a (Claude) ─▶ review-a [sec+bugs] ─┐
+#    (agy)  (TDD)  └─▶ impl-b (agy)    ─▶ review-b [sec+bugs] ─┴─▶ pick ─▶ refactor ─▶ review-r ─▶ publish
+#                       each review loops findings back to its OWN impl on a block   (winner)   [sec+bugs]
+#
+# The competing impls are vetted BEFORE the judge — a review gate loops a block
+# back to its specific writer, so both candidates are clean before the judge
+# picks. AFTER the judge, the refactor agent cleans up the winner (behavior-
+# preserving; tests stay green) and a final review vets it before publish. The
+# judge publishes its winner as its own branch, so the refactor writer can seed
+# `from: pick`.
+#
+# This is the heaviest example — up to ~12 microVMs (plan + tests + 2 impls +
+# 4 impl-reviewers + judge + refactor + 2 refactor-reviewers). Uses three
+# Antigravity (agy) agents; see Setup in README.md. To run with NO agy at all,
+# swap the antigravity-native agents below for claude-native (give impl_agy a
+# different model/effort so the two coders still differ) and drop agy_enabled
+# from your server config.
+
+version: 1
+name: full-cadre
+
+repo: /path/to/your/project     # EDIT — a local git repo path or a GitHub URL
+base_branch: main               # optional; branch to cut from / publish onto
+publish:                        # ship the refactored winner (not the raw impl)
+  mode: pr                      # pr (draft PR) | local (push branch) | none
+  branch: refactor
+
+task: |                         # EDIT — what you want built
+  Describe the change to make, concretely.
+acceptance: |                   # EDIT — the done contract (tests + reviewers check this)
+  The observable behavior that must hold, and what must NOT change.
+
+# Optional: project-wide guidance baked into EVERY agent's system prompt.
+# Editing this needs a server restart (it's a bundle change). See README.
+# context: |
+#   This is a Django 5 service; the module under work lives in <path>.
+#   Use pytest, follow PEP8, never touch files under migrations/.
+
+agents:
+  plan:                         # read-only design; interactive (blocks on your APPROVED)
+    template: planner
+    harness: antigravity-native
+    model: gemini-3.5-flash
+  tdd:                          # writes a FAILING test suite from the plan (tests only)
+    template: tdd-writer
+    model: claude-sonnet-5
+    effort: high
+  impl_claude:                  # competing coder A — own isolated branch off the tests
+    template: coder
+    model: claude-sonnet-5
+    effort: high
+  impl_agy:                     # competing coder B — own isolated branch off the tests
+    template: coder
+    harness: antigravity-native
+    model: gemini-3.5-flash
+  sec:                          # security auditor (read-only); ends with VERDICT:
+    template: security-reviewer
+    model: claude-sonnet-5
+  bugs:                         # correctness/bug auditor (read-only); ends with VERDICT:
+    template: bug-reviewer
+    harness: antigravity-native
+    model: gemini-3.5-flash
+  judge:                        # picks the winning branch to publish; ends with SELECT:
+    template: judge
+    model: claude-opus-4-8
+  refactor:                     # cleans up the winner (behavior-preserving; tests stay green)
+    template: refactoring
+    model: claude-sonnet-5
+    effort: high
+
+stages:
+  - { id: plan,  run: plan }                                    # design (interactive)
+  - { id: tests, run: tdd, write: true, needs: [plan] }         # tests only, own branch
+  - id: implement                                               # two ISOLATED writers
+    parallel:
+      - { id: impl-a, run: impl_claude, write: true, from: tests, needs: [plan] }
+      - { id: impl-b, run: impl_agy,    write: true, from: tests, needs: [plan] }
+  - id: review-a                                                # vet impl-a
+    run: [sec, bugs]
+    needs: [impl-a]
+    gate: consensus                                             # both must APPROVE
+    on_block: impl-a                                            # a block re-drives impl-a
+  - id: review-b                                                # vet impl-b
+    run: [sec, bugs]
+    needs: [impl-b]
+    gate: consensus
+    on_block: impl-b
+  - { id: pick, run: judge, needs: [impl-a, impl-b], selects: branch }
+  # After the judge: refactor the winner (seeds from the judge's branch), then
+  # one final review before publish.
+  - { id: refactor, run: refactor, write: true, from: pick, needs: [pick] }
+  - id: review-r                                                # vet the refactor
+    run: [sec, bugs]
+    needs: [refactor]
+    gate: consensus                                            # both must APPROVE
+    on_block: refactor                                         # a block re-drives refactor

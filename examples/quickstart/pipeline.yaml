@@ -1,0 +1,40 @@
+# Quickstart pipeline — the minimal working swarm: one coder + one reviewer.
+#
+# All-Claude (no Antigravity, so NO agy harvester/login needed) and NO planner
+# (so it runs UNATTENDED — there is no human plan-approval gate). This is the
+# fastest path from "installed" to "a reviewed change on a branch." Once it
+# works, see ../mixed-models/ and ../tdd-race/ for the full cadre (agy agents,
+# interactive planning, competing writers + judge).
+#
+#   build (coder) ──▶ review (reviewer, must APPROVE) ──▶ publish
+#                     └── blocks? loop findings back to build ──┘
+
+version: 1
+name: quickstart
+
+repo: /path/to/your/project     # EDIT — a local git repo path or a GitHub URL
+publish: local                  # local (push a branch) | pr (draft PR) | none
+
+task: |                         # EDIT — what you want built
+  Describe the change to make, concretely.
+acceptance: |                   # EDIT — how "done" is judged (the reviewer checks this)
+  The done contract: the observable behavior that must hold, and what must NOT change.
+
+agents:
+  build:                        # the implementer — gets an isolated rw branch
+    template: coder
+    model: claude-sonnet-5
+  reviewer:                     # reads build's branch :ro and must end VERDICT: APPROVED
+    template: security-reviewer
+    model: claude-sonnet-5
+
+stages:
+  - { id: build,  run: build, write: true }
+  - id: review
+    run: [reviewer]
+    needs: [build]
+    gate: consensus             # reviewer must APPROVE
+    on_block: build             # a block loops the findings back to build
+
+# (Omit the `stages:` block entirely and the runner synthesizes exactly this
+#  build → review shape from the agents — a coder + everything-else-reviews.)

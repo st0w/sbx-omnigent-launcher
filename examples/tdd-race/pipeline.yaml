@@ -1,0 +1,56 @@
+# TDD + competing-writers pipeline — the DAG's full power in one file.
+#
+# A specialist TDD agent writes the tests; TWO coders then implement the SAME
+# task independently, each in its OWN isolated worktree + branch (never a shared
+# filesystem); a judge compares them and picks the winner, which is published.
+#
+#   plan ─▶ tests ─┬─▶ impl-a (Claude, own branch) ─┐
+#     (agy)  (TDD)  └─▶ impl-b (agy,    own branch) ─┴─▶ pick (judge) ─▶ publish
+#
+# Both coders' worktrees are cut FROM the tests branch (inheritance), so each
+# starts with the tests but writes on its own branch. See docs/PIPELINES.md.
+
+version: 1
+name: tdd-race
+
+repo: /path/to/your/project     # EDIT
+publish: local                  # local | pr | none
+
+task: |                         # EDIT
+  Add a `parse_ports(spec)` helper to net.py that turns "22,80,1000-1002" into a
+  sorted list of unique ints [22, 80, 1000, 1001, 1002].
+acceptance: |
+  Handles single ports and inclusive A-B ranges; dedupes; sorts; raises
+  ValueError on out-of-range (<1 or >65535), reversed ranges, and malformed or
+  empty input; changes nothing else.
+
+agents:
+  plan:
+    template: planner
+    harness: antigravity-native
+    model: gemini-3.5-flash
+  tdd:
+    template: tdd-writer
+    model: claude-sonnet-5
+    effort: high
+    skills: ./skills            # skills dir (skills/tdd/SKILL.md) copied into the bundle
+  impl_claude:
+    template: coder
+    model: claude-sonnet-5
+    effort: high
+  impl_agy:
+    template: coder
+    harness: antigravity-native
+    model: gemini-3.5-flash
+  judge:
+    template: judge
+    model: claude-opus-4-8
+
+stages:
+  - { id: plan,  run: plan }
+  - { id: tests, run: tdd, write: true, needs: [plan] }   # writes ONLY tests/
+  - id: implement                                          # two ISOLATED writers
+    parallel:
+      - { id: impl-a, run: impl_claude, write: true, from: tests, needs: [plan] }
+      - { id: impl-b, run: impl_agy,    write: true, from: tests, needs: [plan] }
+  - { id: pick, run: judge, needs: [impl-a, impl-b], selects: branch }

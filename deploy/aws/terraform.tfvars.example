@@ -1,0 +1,44 @@
+# Copy to terraform.tfvars and edit. Do NOT commit terraform.tfvars.
+
+name   = "omnigent"
+region = "us-east-1"
+
+# Must be a type that supports NESTED VIRTUALIZATION — sbx runs agents in
+# microVMs launched by KVM, so the host needs Intel VT-x passed through.
+# Since Feb 2026 ordinary instances can do this; before that it was metal
+# only. The list is all Intel / x86_64:
+#
+#   C7i C7i-flex M7i M7i-flex R7i I7i
+#   C8i C8i-flex M8i M8i-flex R8i R8i-flex X8i  C8id M8id R8id
+#
+# Graviton and T-family cannot start a sandbox at all.
+#   m7i.2xlarge   8 vCPU /  32 GiB  — exactly 32 GB; tight at peak
+#   m7i.4xlarge  16 vCPU /  64 GiB  — default, fits 4 guests + headroom
+#   r7i.4xlarge  16 vCPU / 128 GiB  — if you raise per-guest memory
+instance_type = "m7i.4xlarge"
+
+# Passes the virtualization extensions through. Set false ONLY if you switch
+# instance_type to a .metal type, which has them natively.
+enable_nested_virtualization = true
+
+# amd64: every nested-virt-capable instance type is Intel.
+ami_name_filter = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
+
+# The sbx image store plus every agent worktree lands here.
+root_volume_gb = 500
+
+# Optional separate volume at /srv that survives instance replacement.
+# 0 disables it. Set it and point --worktree-root / --canonical-root there.
+data_volume_gb = 0
+
+# Optional: grant the host read on exactly this one secret, for
+# --publish-token-command. Leave commented out for no Secrets Manager access.
+# publish_secret_arn = "arn:aws:secretsmanager:us-east-1:111122223333:secret:omnigent/publish-token-AbCdEf"
+
+# SSM-SessionManagerRunShell is an ACCOUNT-WIDE singleton. Only enable this
+# in an account this stack owns.
+# manage_session_preferences = true
+
+tags = {
+  Owner = "platform"
+}

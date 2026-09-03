@@ -1,0 +1,61 @@
+# What this can and cannot check, stated plainly.
+#
+# The unit suite (1,399 tests) does NOT run here. Six modules in this package
+# import `omnigent`, the private host package this launcher plugs into, and it
+# is not published. Without it only 22 tests collect and all 22 error, so a
+# test job on a public runner would assert nothing. The suite runs where that
+# package exists:
+#
+#     <omnigent-venv>/bin/python -m unittest discover -s tests
+#
+# Making it runnable here means declaring `click` and `pyyaml` as real
+# dependencies and putting the `omnigent` imports behind an optional boundary.
+# That is a code change, not a CI change; until then this workflow guards what
+# it honestly can.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      # Pinned in pyproject under [tool.ruff]; line-length 79 and the rule
+      # selection both come from there, so local and CI cannot disagree.
+      - name: ruff check
+        run: uvx ruff check --output-format=github .
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      # Catches a broken pyproject, a bad license expression, and package-data
+      # that would ship a wheel without the role prompt templates.
+      - name: Build wheel and sdist
+        run: uv build
+      - name: Confirm templates are in the wheel
+        run: |
+          python -c "
+          import glob, zipfile, sys
+          whl = glob.glob('dist/*.whl')[0]
+          names = zipfile.ZipFile(whl).namelist()
+          md = [n for n in names if n.endswith('.md') and 'templates/' in n]
+          print(f'{len(md)} template(s) packaged')
+          sys.exit(0 if md else 'templates missing from the wheel')
+          "

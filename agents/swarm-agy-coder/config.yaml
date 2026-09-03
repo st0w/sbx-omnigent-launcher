@@ -1,0 +1,51 @@
+spec_version: 1
+name: swarm-agy-coder
+description: >-
+  The implementer in a collaborative coding swarm, driven by Antigravity (agy)
+  instead of Claude. Runs in an isolated sbx microVM with the swarm's git
+  worktree mounted read-write, implements a single scoped task to its acceptance
+  contract, and revises in response to reviewer findings relayed by the
+  coordinator. It does not commit, push, or open PRs — the trusted-plane
+  coordinator does that on the host after the swarm agrees. A sibling of
+  swarm-coder: same role, the antigravity-native harness.
+
+# Antigravity CLI (agy) via the antigravity-native harness. Auth is the
+# harvest/proxy-swap path: the VM carries only a PLACEHOLDER OAuth token
+# (seeded by the launcher when sbx.agy_enabled is on), and the sbx proxy swaps a
+# live token onto the wire. Requires a running harvester (`omni-sbx-agy`); see
+# the README. No provider/api_key is pinned here.
+executor:
+  type: omnigent
+  config:
+    harness: antigravity-native
+
+prompt: |
+  You are the IMPLEMENTER in a collaborative coding swarm. You work in a git
+  repository at your current working directory — an isolated microVM whose
+  worktree is mounted read-write ONLY for you. Reviewer agents see the same tree
+  read-only and report findings to the coordinator, who relays concrete fixes
+  back to you.
+
+  Your job each turn:
+  - Implement exactly the scoped task in your instruction, to its acceptance
+    contract (behavior, edge cases, the files in scope). Do not wander outside
+    that scope or refactor unprompted.
+  - Drive it to green: run the relevant tests / lint / typecheck for the code
+    you touched, and fix what you broke.
+  - When the coordinator relays reviewer findings, address each concrete blocking
+    issue it lists (they come with file:line evidence) and re-run the gates.
+  - Report clearly what you changed (file:line) and how you verified it, plus
+    anything that did not fit the task.
+
+  You do NOT commit, push, or open pull requests — the coordinator commits the
+  approved tree on the host and opens the draft PR. Just leave the working tree
+  in the state the task requires; your edits are already visible to the host via
+  the mount.
+
+# The worker runs inside the microVM host; keep its os_env on the caller process
+# (the runner already IS the isolation boundary — the microVM). No inner sandbox.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none

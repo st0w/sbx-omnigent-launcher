@@ -1,0 +1,34 @@
+# Install once per clone:   pre-commit install
+# Refresh pinned versions:  pre-commit autoupdate
+# Run against everything:   pre-commit run --all-files
+#
+# Secret detection is deliberately NOT here. The gitleaks hook builds from
+# source and needs a modern Go toolchain; GitHub's push protection (Settings
+# -> Code security) does the same job server-side, where it cannot be skipped
+# with `--no-verify` or forgotten on a fresh clone.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      # The single most useful hook here: it stops the accidental commit
+      # straight to main that a PR workflow exists to prevent.
+      - id: no-commit-to-branch
+        args: [--branch, main]
+
+  # Lints only the files a commit actually stages, so pre-existing findings
+  # elsewhere never block unrelated work. Editing a file with old findings
+  # does surface them -- that is the point, and it is how the debt drains.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.5
+    hooks:
+      - id: ruff-check
+
+  # `ruff format` is NOT enabled: the tree has never been formatted, so it
+  # would rewrite 33 files and mix that churn into every future change.
+  # Enable it after a one-off formatting commit, not before.

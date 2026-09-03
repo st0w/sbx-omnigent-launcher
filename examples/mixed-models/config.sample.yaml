@@ -1,0 +1,46 @@
+# Mixed-models pipeline — server `sandbox:` block.
+#
+# Same provider config as the other examples, plus `agy_enabled` — this scenario
+# runs two Antigravity (agy) agents (the planner and the bug reviewer), so the
+# launcher must seed each agy VM and a token harvester must be running. Copy this
+# block into your Omnigent server config, adjusting paths/ports.
+
+sandbox:
+  provider: sbx
+
+  # Local server = the Docker host gateway, NOT localhost. Requires an sbx
+  # egress policy for BOTH host.docker.internal:6767 and localhost:6767 (see the
+  # top-level README "Network policy").
+  server_url: http://host.docker.internal:6767
+
+  sbx:
+    image: ghcr.io/omnigent-ai/omnigent-host:latest
+
+    # REQUIRED for pipelines that mount worktrees. This pipeline runs up to four
+    # agent VMs at once (plan + build + sec + bugs); the control plane is the
+    # host-side `omni-sbx-pipeline` runner process, NOT a VM. Must match the
+    # --worktree-root you pass to the runner.
+    worktree_root: /srv/swarm/worktrees
+
+    # For Claude via subscription (the `build` coder and `sec` reviewer): strip
+    # the sbx api-key sentinel so the OAuth token wins.
+    unset_env:
+      - ANTHROPIC_API_KEY
+      - CLAUDECODE
+
+    # REQUIRED here — the planner and bug reviewer are antigravity-native. When
+    # on, the launcher seeds each agy VM with an inert PLACEHOLDER OAuth token +
+    # onboarding marker so the readiness gate passes; a running harvester
+    # (`omni-sbx-agy`, see the top-level README) keeps the wire-swap secret
+    # fresh. Harmless for the Claude VMs.
+    agy_enabled: true
+
+    # Set ONLY for a Business/enterprise Google account (else agy re-runs
+    # enterprise onboarding a headless VM can't answer). Ignored unless
+    # agy_enabled. Uncomment the pair for a Vertex account (the project id is
+    # REQUIRED for it, or an agy turn fails with `invalid project ID`).
+    # agy_enterprise: true
+    # agy_gcp_project: your-gcp-project-id
+    # agy_gcp_location: us
+
+# Credentials via `sbx secret` — see the top-level README. Never put keys here.

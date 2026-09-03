@@ -1,0 +1,77 @@
+# A CODEX writer, beside a Claude reviewer — the smallest pipeline that
+# exercises the codex-native harness end to end.
+#
+#   build (codex-native) ──▶ review (claude-native) ──▶ verify ──▶ publish
+#                            a block loops findings back to build
+#
+# The point is the plumbing, not the code. Codex is the WRITER deliberately:
+# that is the path with the most moving parts — credential seeding into the
+# microVM, codex's own launch flag, a real terminal turn, file writes, and
+# settle-and-commit. The Claude side is the already-proven half, so it reviews.
+#
+# The task is trivial on purpose; a full run is a couple of minutes.
+#
+# Setup: `codex login` on the host first. The launcher seeds that credential
+# into the VM over stdin and refuses to start if the token is expired or
+# within six hours of expiring, naming the exact re-auth command.
+
+version: 1
+name: codex-smoke
+
+repo: /path/to/your/scratch-repo   # EDIT — see README.md for a two-file seed
+base_branch: main
+publish: local                     # push the branch back to that repo
+turn_timeout: 1800
+
+task: |
+  `parse_duration` in durations.py accepts only a bare number of seconds.
+  Add support for unit suffixes and combinations:
+
+    "45s"    -> 45
+    "30m"    -> 1800
+    "2h"     -> 7200
+    "1h30m"  -> 5400
+    "1h30m15s" -> 5415
+
+  A bare number keeps meaning seconds ("90" -> 90). Units must appear in
+  descending order (h, then m, then s) and each at most once; anything else
+  is an error — raise ValueError naming the offending spec.
+
+  Add tests for the new behavior to test_durations.py. Do not change the
+  existing tests.
+
+acceptance: |
+  `python3 -m unittest discover -s .` passes, the three existing tests are
+  unmodified and still pass, the suffix and combination forms above parse to
+  the stated values, and a malformed spec raises ValueError.
+
+verify:
+  timeout: 900
+  command: python3 -m unittest discover -s . -v
+
+agents:
+  build:
+    template: coder
+    harness: codex-native
+    # Codex model names age out, and a deprecated one does not fail loudly —
+    # the TUI interrupts startup with a migration picker and the turn simply
+    # times out. If every turn dies at the timeout with no output, read the
+    # agent's pane before investigating anything else.
+    model: gpt-5.6-luna
+  reviewer:
+    template: security-reviewer
+    # NOT a Haiku model, deliberately. Claude Code silently downgrades
+    # `--permission-mode auto` to manual when the session model is Haiku 4.5
+    # (auto mode needs a model-side risk classifier Haiku does not run), and
+    # the agent then blocks on an approval prompt for every tool call — which
+    # is fatal to an unattended pipeline. Sonnet is the cheapest model
+    # verified to hold auto mode.
+    model: claude-sonnet-5
+
+stages:
+  - { id: build, run: build, write: true }
+  - id: review
+    run: [reviewer]
+    needs: [build]
+    gate: consensus
+    on_block: build
