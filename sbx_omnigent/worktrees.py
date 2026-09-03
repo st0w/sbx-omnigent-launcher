@@ -978,6 +978,36 @@ class WorktreeManager:
             )
         return [line.strip() for line in out.splitlines() if line.strip()]
 
+    def node_added_lines(
+        self, run_id: str, node_id: str, *, against: str
+    ) -> list[str]:
+        """
+        Lines a node's branch ADDED versus another ref.
+
+        Content, where :meth:`node_diff_files` gives only names — so a
+        gate can ask what the writer actually wrote, not merely where.
+        Added lines only: what the base tree already contained is
+        somebody else's decision and not this writer's to answer for.
+
+        :param run_id: Pipeline run id.
+        :param node_id: The node whose branch to inspect.
+        :param against: Ref the branch was cut from.
+        :returns: The added lines, without their ``+`` marker.
+        :raises click.ClickException: If neither ref resolves.
+        """
+        repo = self._run_repo(run_id)
+        branch = self.node_branch(run_id, node_id)
+        argv = ['git', '-C', repo, 'diff', '--unified=0']
+        try:
+            out = self._run([*argv, against, branch])
+        except click.ClickException:
+            out = self._run([*argv, f'origin/{against}', branch])
+        return [
+            line[1:]
+            for line in out.splitlines()
+            if line.startswith('+') and not line.startswith('+++')
+        ]
+
     def create_node_worktree(
         self,
         run_id: str,

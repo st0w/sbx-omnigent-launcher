@@ -95,6 +95,30 @@ _DECISIONS_HEADER_RE = re.compile(
     r'DECISIONS FOR LATER MODULES[ \t]*:?[ \t]*\*{0,2}[ \t]*$',
     re.MULTILINE | re.IGNORECASE,
 )
+#: Ways to tell a coverage tool not to count a line. Each ecosystem
+#: spells the same escape hatch differently, and the launcher drives
+#: Python, Rust and JS projects alike.
+#:
+#: These exist for genuinely unreachable code, and a writer short of a
+#: coverage floor can reach for them instead of writing the test. The
+#: gate cannot tell earned coverage from suppressed coverage — the
+#: number moves either way — so the suppression itself is what gets
+#: checked. Live on `ingestion-m2-5`: a candidate sat at 90.87% against
+#: a 95% floor with the suite frozen, added 28 markers, and reported
+#: 95.03%; the excluded lines included rule-version checks, source
+#: discovery, and the first-poll branch of every source. Its sibling
+#: reached 95.07% with none, which is the proof it was avoidable.
+_COVERAGE_SUPPRESSORS = (
+    'pragma: no cover',
+    'pragma: no branch',
+    'istanbul ignore',
+    'tarpaulin_include',
+    'codecov:ignore',
+    'LCOV_EXCL',
+    'coverage: ignore',
+)
+
+
 #: A markdown thematic break closing a section. It has to be checked
 #: BEFORE the item pattern, because `---` matches "bullet `-`, text
 #: `--`" and was lifted into the committed ledger as a decision reading
@@ -5759,6 +5783,7 @@ class PipelineRunner:
         # and a writer cannot re-drive its way out of a contract it
         # cannot satisfy.
         self._halt_on_writer_dispute(stage)
+        self._enforce_no_coverage_suppression(stage)
         if stage.tests_only:
             self._enforce_tests_only(stage)
         self._require_implementation(stage)
@@ -5814,6 +5839,103 @@ class PipelineRunner:
         return sorted(
             f for f in changed
             if not self._is_test_path(f) and not self._is_generated(f)
+        )
+
+    def _suppressed_coverage(
+        self, stage: pipeline.PipelineStage
+    ) -> list[str]:
+        """
+        Coverage-exclusion markers this writer's branch ADDED.
+
+        :param stage: The writer stage that just committed.
+        :returns: The offending added lines, stripped, in order.
+        """
+        try:
+            added = self._wt.node_added_lines(
+                self._run_id, stage.id, against=self._seed_ref(stage)
+            )
+        except click.ClickException:
+            # A git hiccup must not fail a stage that may be fine; this
+            # is a check, not a source of flakiness.
+            return []
+        return [
+            line.strip()
+            for line in added
+            if any(m in line for m in _COVERAGE_SUPPRESSORS)
+        ]
+
+    def _enforce_no_coverage_suppression(
+        self, stage: pipeline.PipelineStage
+    ) -> None:
+        """
+        Refuse coverage bought with exclusion markers rather than tests.
+
+        A coverage floor asks "is this code exercised". A writer that
+        cannot reach the floor — because the suite is frozen and it may
+        not add tests — can instead mark the uncovered lines uncounted
+        and watch the number rise. The gate goes green over code nobody
+        ran, which is worse than a red gate: it launders untested code
+        as tested.
+
+        Re-driven once rather than halted, on the same reasoning as
+        :meth:`_enforce_tests_only` — the writer can undo this itself,
+        and an unattended run should not stop for something it can fix.
+        A writer that does it twice is not going to stop.
+
+        Genuinely untestable code is a design signal, not a licence for
+        this: an SDK boundary belongs behind an injected seam, which is
+        how a sibling candidate hit the same floor with zero markers.
+
+        :param stage: The writer stage that just committed.
+        :raises PipelineRunError: If the markers survive a re-drive.
+        """
+        found = self._suppressed_coverage(stage)
+        if not found:
+            return
+        listed = '\n'.join(f'  {line}' for line in found[:20])
+        click.echo(
+            f'[coverage] {stage.id}: added {len(found)} coverage-exclusion '
+            f'marker(s); re-driving to earn the coverage instead.'
+        )
+        self._redrive_writer(
+            stage.id,
+            listed,
+            message=f'{stage.id}: remove coverage suppression',
+            instruction=self._coverage_instruction(listed),
+        )
+        found = self._suppressed_coverage(stage)
+        if not found:
+            click.echo(
+                f'[coverage] {stage.id}: suppression removed.'
+            )
+            return
+        raise PipelineRunError(
+            f'{stage.id} added {len(found)} coverage-exclusion marker(s) '
+            f'and kept them after being asked to remove them:\n\n'
+            f'{listed}\n\nA coverage floor reached by marking lines '
+            f'uncounted is not coverage — it ships untested code through '
+            f'a green gate. Either test those paths, or restructure so '
+            f'they are testable (an SDK call belongs behind an injected '
+            f'seam). If some line truly cannot be exercised, that is a '
+            f'contract question for a human, not a marker for a writer '
+            f'to add on its own.'
+        )
+
+    def _coverage_instruction(self, listed: str) -> str:
+        """The re-drive turn for a writer that suppressed coverage."""
+        return (
+            'You added coverage-exclusion markers:\n\n'
+            f'{listed}\n\n'
+            'Remove every one of them. A coverage floor measures whether '
+            'code is exercised; marking a line uncounted moves the number '
+            'without testing anything, and ships untested code behind a '
+            'green gate. Earn the coverage instead: write the test if the '
+            'suite is yours to extend, or restructure so the path is '
+            'reachable — an SDK call behind an injected seam is testable '
+            'with a plain fake. If you believe a line genuinely cannot be '
+            'exercised, do NOT mark it: say so in your reply, label it '
+            'DISPUTED, and stop, because that is a contract question a '
+            'human settles.'
         )
 
     def _enforce_tests_only(self, stage: pipeline.PipelineStage) -> None:
