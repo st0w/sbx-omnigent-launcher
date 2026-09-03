@@ -572,6 +572,24 @@ directly too — no test, gate config, linter config, CI workflow, or
 ignore/allow-list entry may be weakened to close a finding, and any legitimate
 change to one must be disclosed in the reply.
 
+**Guard the pipeline's own contract, not only the repo's checks.** Everything
+above is a gate's *configuration*; `pipeline.yaml` is the gate's *terms*. When
+it lives inside the repo it builds — a common layout, since a pipeline wants
+versioning alongside the code it drives — a module that finds a stage contract
+inconvenient can edit the acceptance criterion instead of meeting it, and
+nothing downstream will mention it. That is the supply-chain move one level up:
+same silence, larger blast radius, because the contract binds every later
+module too. List the directory:
+
+```yaml
+guarded:
+  - omnigent/*                 # the pipeline yaml and its prompt files
+```
+
+A pipeline defined outside the repo it builds loses nothing by listing it: the
+runner only diffs the branch under review, so a path that never appears there
+costs nothing.
+
 This is deliberately **pure git inspection in the trusted plane**. The obvious
 alternative — having the runner run `cargo test` in the node's worktree — would
 execute agent-authored code on the host with the publish token in the
@@ -865,6 +883,20 @@ tooling at all:
 verify:
   command: make check
 ```
+
+**Who repairs a failing gate — and why `acceptance:` must not contradict it.**
+A gate failure is closed by the writer that PRODUCED the branch, which after a
+judge is the refactor node: it is the only writer running once an
+implementation exists, so tests added there cannot invalidate a competition
+that already happened, and its review stage votes again on the changed branch
+before the gate re-runs. Write an `acceptance:` that forbids that repair — *"the
+test suite is frozen after the tests stage"* — and any module below
+`coverage_min` becomes unpublishable: the gate fails, the runner routes the fix
+to the refactor node, and that fix is the thing the reviewers were told to
+refuse. Live, this halted a module at review-r with both readings defensible
+and neither actionable. If your contract freezes tests, say which half is
+which — weakening an existing test (changing, deleting, relaxing, skipping) is
+a frozen-artifact change; adding coverage the gate demands is not.
 
 ### Polyglot repos: delegate to the repo
 
