@@ -117,6 +117,8 @@ class FakeWT:
         #: node_id -> changed paths, or a list-of-lists consumed per
         #: call (so a re-drive can return a different result).
         self.diff_files: dict[str, list] = {}
+        #: node -> lines the branch ADDED, for the coverage gate.
+        self.added_lines: dict[str, list] = {}
         #: (node_id, against) for every diff query.
         self.diff_queries: list[tuple[str, str]] = []
         #: ordered ('settle'|'commit', node_id) events, to assert a
@@ -185,6 +187,15 @@ class FakeWT:
 
     def node_branch(self, run_id, node_id) -> str:
         return f'pl/{run_id}/{node_id}'
+
+    def node_added_lines(self, run_id, node_id, *, against):
+        # A list of lists is a per-call SEQUENCE (the last repeats),
+        # so a test can model a writer that removes the markers on
+        # re-drive.
+        val = self.added_lines.get(node_id, [])
+        if val and isinstance(val[0], list):
+            return val.pop(0) if len(val) > 1 else val[0]
+        return val
 
     def node_diff_files(self, run_id, node_id, *, against):
         self.diff_queries.append((node_id, against))
@@ -843,6 +854,81 @@ stages:
     gate: consensus
     on_block: build
 """
+
+
+class TestCoverageCannotBeSuppressed(_Base):
+    """
+    A writer may not buy the coverage gate with exclusion markers.
+
+    The gate asks "is this code covered". It cannot tell coverage that
+    was EARNED from coverage that was SUPPRESSED, so a writer short of
+    the threshold can add `# pragma: no cover` until the number moves
+    and ship untested code through a green gate.
+
+    Observed live on `ingestion-m2-5`: one candidate sat at 90.87%
+    against a 95% floor with the suite frozen, added 28 exclusions, and
+    reported 95.03%. Among the excluded lines were the rule-version tie
+    checks, source discovery, and `if checkpoint is None` — the first
+    poll of every source. Its sibling reached 95.07% with zero.
+
+    Re-driven once rather than halted, like the tests-only gate: the
+    writer can undo this itself, and an unattended run should not stop
+    for something it can fix.
+    """
+
+    def _wt_adding(self, lines):
+        wt = FakeWT()
+        wt.added_lines['build'] = lines
+        return wt
+
+    def test_an_added_pragma_re_drives_the_writer(self) -> None:
+        # Present on the first look, gone after the re-drive: the run
+        # continues rather than dying on something the writer can undo.
+        wt = FakeWT()
+        wt.added_lines['build'] = [
+            ['    return x  # pragma: no cover'],
+            [],
+        ]
+        sc = FakeSC(dict(_LINEAR_REPLIES))
+        result, _sc, _wt = self._run(_LINEAR, {}, wt=wt, sc=sc)
+
+        self.assertEqual(result.status, 'completed')
+        self.assertTrue(
+            any('coverage' in m.lower() for _s, m in sc.sent),
+            'the writer was never told to remove the suppression',
+        )
+
+    def test_it_is_fatal_when_the_writer_keeps_them(self) -> None:
+        wt = self._wt_adding(['    return x  # pragma: no cover'])
+        with self.assertRaises(R.PipelineRunError) as caught:
+            self._run(_LINEAR, dict(_LINEAR_REPLIES), wt=wt)
+        self.assertIn('pragma: no cover', str(caught.exception))
+
+    def test_other_ecosystems_are_caught_too(self) -> None:
+        # The launcher runs Rust and JS projects, and each has its own
+        # spelling of the same escape hatch.
+        for marker in (
+            '/* istanbul ignore next */',
+            '#[cfg(not(tarpaulin_include))]',
+            '// LCOV_EXCL_START',
+        ):
+            with self.subTest(marker=marker):
+                wt = self._wt_adding([marker])
+                with self.assertRaises(R.PipelineRunError):
+                    self._run(_LINEAR, dict(_LINEAR_REPLIES), wt=wt)
+
+    def test_a_writer_adding_none_is_untouched(self) -> None:
+        wt = self._wt_adding(['    return x + 1'])
+        result, _sc, _wt = self._run(_LINEAR, dict(_LINEAR_REPLIES), wt=wt)
+        self.assertEqual(result.status, 'completed')
+
+    def test_a_pre_existing_marker_is_not_the_writer_s_fault(self) -> None:
+        # Only ADDED lines are inspected. A marker already in the base
+        # tree is someone else's decision and must not fail this stage.
+        wt = FakeWT()
+        wt.added_lines['build'] = []
+        result, _sc, _wt = self._run(_LINEAR, dict(_LINEAR_REPLIES), wt=wt)
+        self.assertEqual(result.status, 'completed')
 
 
 class TestAWriterDisputeHaltsTheRun(_Base):
