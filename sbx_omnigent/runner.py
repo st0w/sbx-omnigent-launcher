@@ -6420,10 +6420,17 @@ class PipelineRunner:
         if not claims:
             return
         listed = '\n'.join(f'  {claim}' for claim in claims)
-        click.echo(
-            f'[{stage.id}] HALTING — the writer says the contract it was '
-            f'given cannot be satisfied. Re-driving it cannot fix that.'
-        )
+        # The claim after the marker is one line. The REASONING that
+        # makes it actionable — which test, which two clauses, why no
+        # code satisfies both — is the rest of the reply, and this
+        # stage is about to end the run and dispose the VM. Capture
+        # before raising, the same reason `_await_plan_approval` does.
+        # Live on `ingestion-m2-5` this was missing: the halt fired
+        # correctly and the human was left with "m2 cannot be marked
+        # complete under the binding constraints" and no way to learn
+        # why.
+        if node is not None and node.session:
+            self._capture_turn(node.session, 'disputed its own contract')
         raise PipelineRunError(
             f'{stage.id}: the writer raised {len(claims)} dispute(s) — it '
             f'says its own contract is impossible, not that its code is '
@@ -6431,8 +6438,9 @@ class PipelineRunner:
             f'resolve this: it is not the party that can change what is '
             f'disputed. A contract no implementation can satisfy does not '
             f'just fail this stage — it pressures the next one into '
-            f'breaking a frozen boundary to get green. Read the reply, '
-            f'settle the contract, and re-run.'
+            f'breaking a frozen boundary to get green. Its full reply is '
+            f'in the run directory under turns/; read it, settle the '
+            f'contract, and re-run.'
         )
 
     def _halt_on_dispute(
