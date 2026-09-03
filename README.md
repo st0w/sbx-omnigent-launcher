@@ -1,8 +1,9 @@
 # sbx-omnigent-launcher
 
-Run Omnigent **managed hosts inside Docker Sandboxes (`sbx`) microVMs** — one
-isolated microVM per coding agent — without forking or patching Omnigent. On top
-of that isolation, this package gives you a **declarative pipeline** layer:
+Run [Omnigent](https://github.com/omnigent-ai/omnigent) **managed hosts inside
+Docker Sandboxes (`sbx`) microVMs** — one isolated microVM per coding agent —
+without forking or patching Omnigent. On top of that isolation, this package
+gives you a **declarative pipeline** layer:
 describe a whole coding swarm (who's on it, each agent's model and skills, how
 their work flows through a DAG) in a single `pipeline.yaml`, and fire it with one
 command. Each writer agent works in its own microVM on its own isolated git
@@ -91,7 +92,10 @@ API, and the `OMNIGENT_BUILTIN_AGENT_DIRS` env var.
 ## Requirements
 
 - The `sbx` CLI installed on the server host and signed in (`sbx login`).
-- Omnigent installed in a Python environment (the one that provides `omni`).
+- [Omnigent](https://github.com/omnigent-ai/omnigent) installed in a Python
+  environment (the one that provides `omni`). Omnigent is the open-source agent
+  framework and meta-harness that actually runs the agents; this package is a
+  provider for it, adding microVM isolation and the pipeline layer on top.
 - Network path from a microVM back to your server (for a local server, via the
   Docker host gateway `host.docker.internal`) **plus an `sbx` egress policy that
   permits it** — see [Network policy](#network-policy). Without the policy the
