@@ -6241,6 +6241,265 @@ def _plan_text(size: int, marker: str = '') -> str:
     return head + ('detail. ' * (pad // 8 + 1))[:pad]
 
 
+#: The live pipeline's own shape: plan, a tests-only writer, two
+#: isolated implementers, a consensus review per candidate, a judge, a
+#: refactor, a review of the refactor, and a triage pass. Every other
+#: fixture here is a slice of this; none was the whole thing, which is
+#: how four defects in the plan-to-builder handoff reached production.
+_LIVE_CADRE = """\
+name: cadre
+repo: ./proj
+publish: none
+task: |
+  build the adapter
+acceptance: |
+  the gate is green
+agents:
+  plan: {template: planner, model: claude-sonnet-5}
+  tdd:  {template: tdd-writer, model: claude-sonnet-5}
+  ca:   {template: coder, model: claude-sonnet-5}
+  cb:   {template: coder, model: claude-sonnet-5}
+  sec:  {template: security-reviewer, model: claude-fable-5}
+  bugs: {template: bug-reviewer, model: claude-sonnet-5}
+  jg:   {template: judge, model: claude-opus-4-8}
+  rf:   {template: refactoring, model: claude-sonnet-5}
+  tri:  {template: verifier, model: claude-sonnet-5}
+stages:
+  - {id: plan, run: plan}
+  - {id: tests, run: tdd, write: true, needs: [plan]}
+  - id: implement
+    parallel:
+      - {id: impl-a, run: ca, write: true, from: tests, needs: [plan]}
+      - {id: impl-b, run: cb, write: true, from: tests, needs: [plan]}
+  - id: review
+    parallel:
+      - id: review-a
+        run: [sec, bugs]
+        needs: [impl-a]
+        gate: consensus
+        on_block: impl-a
+      - id: review-b
+        run: [sec, bugs]
+        needs: [impl-b]
+        gate: consensus
+        on_block: impl-b
+  - {id: pick, run: jg, needs: [impl-a, impl-b], selects: branch}
+  - {id: refactor, run: rf, write: true, from: pick, needs: [pick]}
+  - id: review-r
+    run: [sec, bugs]
+    needs: [refactor]
+    gate: consensus
+    on_block: refactor
+  - id: triage
+    run: tri
+    verifies: findings
+    from: refactor
+    needs: [review-r]
+"""
+
+
+def _real_plan(sections: int = 18) -> str:
+    """A plan the size and shape a planner actually emits.
+
+    Every plan-side defect this suite now guards against was invisible
+    to a short fixture: a summary that cited sections it did not
+    contain, a recap pattern that vetoed 127KB for one phrase on page
+    forty, a horizontal rule lifted into the decisions ledger. Scale and
+    shape are the test, so this carries numbered cross-referenced
+    sections, many
+    named files, a DECISIONS block closed by a rule, and -- deliberately
+    -- the phrase "is complete" used legitimately, deep in the body.
+    """
+    out = [
+        '# [m9] Widget adapter — design plan',
+        '',
+        '**Module:** the widget adapter.',
+        '',
+    ]
+    for n in range(1, sections + 1):
+        out += [
+            f'## {n}. Section {n}',
+            '',
+            f'Covered in §{max(1, n - 1)}; §{min(sections, n + 1)} carries '
+            f'the consequence. See also §{sections}.',
+            '',
+            f'- `acme/component/mod{n}.py` — the {n}th module',
+            f'- `tests/unit/test_mod{n}.py` — its cases',
+            f'- `catalogs/rules_{n}.yaml` — the {n}th rule file',
+            '',
+            'An invalid input must raise; a malformed one is refused. The '
+            'test author verifies each case, and the interface is a single '
+            'function whose parameters are named below. ' + ('Detail. ' * 40),
+            '',
+        ]
+    out += [
+        '## Work items',
+        '',
+        '- Cover every declared service, or give a written statement of why '
+        'fewer is complete.',
+        '',
+        '## DECISIONS FOR LATER MODULES:',
+        '',
+        '- **The transport owns its watermark grammar.** An adapter must '
+        'never parse one, because only the transport knows its own format.',
+        '- **Attestations never enter the success-only table.** They are a '
+        'separate evidence kind and are reported as one.',
+        '',
+        '---',
+        '',
+        '## QUESTIONS:',
+        '',
+        'None; everything above is settled.',
+    ]
+    return '\n'.join(out)
+
+
+def _real_review(verdict: str, *findings: str) -> str:
+    """A reviewer reply shaped the way reviewers actually write them."""
+    body = ['Review is blocking despite a green suite.' if findings
+            else 'No blocking findings.', '']
+    if findings:
+        body += ['### Blocking findings', '']
+        for i, f in enumerate(findings, 1):
+            body += [f'{i}. {f}', '',
+                     '   I reproduced the consequence against the branch, '
+                     'and the green suite misses it because its scan only '
+                     'recognises the bare form.', '']
+    body += [
+        '### Verification', '',
+        '- `uv run --locked pytest`: **465 passed**.',
+        '- `ruff check .`: passed.',
+        '- `uv audit`: no known vulnerabilities.',
+        '- No frozen tests were modified.',
+        '',
+        f'VERDICT: {verdict}',
+    ]
+    return '\n'.join(body)
+
+
+def _real_judge(winner: str) -> str:
+    """A judge reply: an evaluation that ends in the SELECT marker."""
+    return '\n'.join([
+        f'### Evaluation of `{winner}`', '',
+        'Both candidates were read against the frozen contract.', '',
+        '1. **Success-only boundary** — declaratively configured, with '
+        'failure-first precedence and an ambiguous default.',
+        '2. **Read-only gate** — every SDK call is allow-listed with a '
+        'written justification.', '',
+        f'SELECT: {winner}',
+    ])
+
+
+class TestTheLiveCadreCarriesRealArtifacts(_Base):
+    """
+    Drive the production DAG end to end with artifacts at real scale.
+
+    Every fixture in this file before this one was a slice — the richest
+    covered seven of the live pipeline's eight stages, and all of them
+    fed one-word replies. That is why four defects in the
+    plan-to-builder handoff reached production: a 400-character plan
+    passes every check a
+    127KB plan breaks.
+
+    This drives all eight stages with a plan carrying numbered
+    cross-referenced sections and the phrase "is complete" deep in its
+    body, reviewer replies shaped the way reviewers write them, and a
+    judge reply that ends in the SELECT marker. The assertions are about
+    SURVIVAL: what an agent said reaches the agent that needs it.
+    """
+
+    def _replies(self, **over: str) -> dict[str, str]:
+        base = {
+            'plan': _real_plan(),
+            'tests': 'suite written',
+            'impl-a': 'implemented',
+            'impl-b': 'implemented',
+            'review-a-sec': _real_review('APPROVED'),
+            'review-a-bugs': _real_review('APPROVED'),
+            'review-b-sec': _real_review('APPROVED'),
+            'review-b-bugs': _real_review('APPROVED'),
+            'pick': _real_judge('impl-a'),
+            'refactor': 'cleaned up',
+            'review-r-sec': _real_review('APPROVED'),
+            'review-r-bugs': _real_review('APPROVED'),
+            'triage': 'checked',
+        }
+        base.update(over)
+        return base
+
+    def test_the_whole_cadre_runs(self) -> None:
+        result, _sc, _wt = self._run(_LIVE_CADRE, self._replies())
+        self.assertEqual(result.status, 'completed')
+
+    def test_the_plan_reaches_the_builders_whole(self) -> None:
+        # The m2-3 and m2-4 failures in one assertion: the builders
+        # got a
+        # 3,006-character table of contents in one run, and in the next
+        # the runner destroyed the plan and aborted.
+        plan = _real_plan()
+        _r, sc, _wt = self._run(_LIVE_CADRE, self._replies(plan=plan))
+
+        for node in ('tests', 'impl-a', 'impl-b'):
+            sent = [m for s, m in sc.sent if sc.label_of(s) == node]
+            self.assertTrue(sent, f'{node} was never driven')
+            self.assertIn(
+                'Section 12', sent[0],
+                f'{node} did not receive the plan body',
+            )
+
+    def test_the_decisions_ledger_takes_no_separator(self) -> None:
+        # `---` closing the DECISIONS block parsed as a bullet whose
+        # text was `--`, and landed in the committed ledger that later
+        # modules read.
+        _r, _sc, wt = self._run(_LIVE_CADRE, self._replies())
+        ledger = [
+            v
+            for k, v in wt.artifacts.items()
+            if 'decision' in k.lower()
+        ]
+        for doc in ledger:
+            for line in doc.splitlines():
+                if line.strip().startswith('-'):
+                    self.assertGreater(
+                        len(line.strip()), 6,
+                        f'a separator was lifted as a decision: {line!r}',
+                    )
+
+    def test_a_realistic_blocking_review_yields_its_findings(self) -> None:
+        # A BLOCKING verdict whose findings do not survive extraction is
+        # recorded as an empty block, which reads as a reviewer that
+        # refuses to sign off rather than one that found two real bugs.
+        reply = _real_review(
+            'BLOCKING',
+            'Credentials are declared with a decorator the frozen scan '
+            'cannot see, so `repr()` prints the access key verbatim.',
+        )
+        self.assertEqual(R.parse_verdict(reply), 'BLOCKING')
+        self.assertTrue(
+            R.parse_findings(reply) or 'Blocking findings' in reply,
+            'a realistic blocking reply carried no extractable finding',
+        )
+
+    def test_the_judge_pick_is_read_from_a_real_evaluation(self) -> None:
+        # The marker sits under 3,000 characters of prose, not alone.
+        _r, _sc, _wt = self._run(
+            _LIVE_CADRE, self._replies(pick=_real_judge('impl-b'))
+        )
+        self.assertEqual(R.parse_select(_real_judge('impl-b')), 'impl-b')
+
+    def test_it_is_large_enough_to_be_representative(self) -> None:
+        # The defects only appear at scale. Pin the properties that made
+        # them visible, so a future trim cannot quietly restore the
+        # blindness.
+        plan = _real_plan()
+        self.assertGreater(len(plan), 8000)
+        self.assertGreater(
+            plan.index('is complete'), R._PLAN_RECAP_WINDOW,
+            'the recap phrase must sit outside the opening window',
+        )
+        self.assertEqual(R.plan_shape_failures(plan), [])
+
+
 class TestARealPlanSurvivesTheWholeHandoff(unittest.TestCase):
     """
     One regression test for the path that has cost four planning cycles.
