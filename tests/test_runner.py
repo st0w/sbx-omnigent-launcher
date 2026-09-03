@@ -907,6 +907,31 @@ class TestAWriterDisputeHaltsTheRun(_Base):
             )
         self.assertIn('build', [node for node, _m, _a in wt.commits])
 
+    def test_the_disputing_writer_s_reply_is_captured(self) -> None:
+        # The claim after the marker is ONE LINE; the reasoning that
+        # makes it actionable is the rest of the reply. Halting
+        # without capturing destroys it -- the same loss
+        # `_await_plan_approval` captures for. Live on
+        # `ingestion-m2-5`: the halt fired correctly, the human got
+        # "m2 cannot be marked complete under the binding
+        # constraints", and every word of why went with the session.
+        wt = FakeWT()
+        sc = FakeSC({
+            'plan': 'P',
+            'build': 'DISPUTED: the contract cannot be satisfied.',
+        })
+        sc.transcript_for_label['build'] = [
+            ('assistant', 'DISPUTED: the contract cannot be satisfied.'),
+            ('assistant', 'Specifically, test X asserts A while test Y '
+                          'asserts not-A over the same fixture.'),
+        ]
+        with self.assertRaises(R.PipelineRunError):
+            self._run(_LINEAR, {}, wt=wt, sc=sc)
+
+        doc = wt.artifacts['turns/build.md']
+        self.assertIn('test X asserts A while test Y', doc)
+        self.assertIn('dispute', doc.lower())
+
     def test_a_writer_with_no_dispute_is_untouched(self) -> None:
         # The common case must not move: an ordinary reply runs on.
         result, _sc, _wt = self._run(
