@@ -1,0 +1,93 @@
+# Sample `sandbox:` block for the sbx (Docker Sandboxes) managed-host provider.
+#
+# This is NOT a standalone config file — copy the `sandbox:` block below into
+# your existing Omnigent server config, which lives at one of:
+#   - ~/.omnigent/config.yaml            (global)
+#   - ./.omnigent/config.yaml            (project-local, relative to where you
+#                                         launch `omni-sbx server`)
+#
+# Adding this block enables `host_type="managed"` sessions to run each coding
+# host inside its own sbx microVM.
+
+sandbox:
+  provider: sbx
+
+  # The URL the sandboxed host dials back to. This is the address the microVM
+  # uses to reach THIS server — for a local server that is the Docker host
+  # gateway, NOT localhost (localhost inside the VM is the VM itself). 6767 is
+  # Omnigent's default local-server port; match it to your actual server port.
+  #
+  # Reaching this address ALSO requires an sbx egress policy allowing it —
+  # without it every managed session hangs before the host tunnel connects.
+  # A local server needs BOTH host.docker.internal:6767 and localhost:6767
+  # allowed (the dial-back fails if either is missing). See the README
+  # "Network policy" section:
+  #   sbx policy allow network "host.docker.internal:6767,localhost:6767"
+  server_url: http://host.docker.internal:6767
+
+  sbx:
+    # Container image the microVM boots from. The prebaked host image carries
+    # omnigent + claude + tmux + git + curl. Pin to a :vX.Y.Z or :sha-<short>
+    # tag that MATCHES your server version to avoid host<->server protocol
+    # skew; `:latest` tracks main HEAD.
+    image: ghcr.io/omnigent-ai/omnigent-host:latest
+
+    # Optional sbx governance profile applied to every sandbox (least
+    # privilege). Manage profiles with `sbx policy`. Omit to use the default.
+    # profile: coding-agent
+
+    # Optional resource caps per sandbox. Omit to let sbx auto-size.
+    # cpus: 4
+    # memory: 8g
+
+    # Absolute host directory holding per-swarm git worktrees. Only needed
+    # for collaborative-swarm sessions: a workspace of the form
+    # `git@sbxmount:<path>#<rw|ro>` bind-mounts <path> into the microVM
+    # (rw for the coder, ro for a reviewer) instead of cloning a repo URL.
+    # The mount source must resolve strictly UNDER this root — the allowlist
+    # that stops a sandbox from mounting an arbitrary host directory. Omit to
+    # disable the mount path (ordinary repo-URL managed sessions don't need it).
+    # worktree_root: /srv/worktrees
+
+    # Env vars to strip from the `omnigent host` launch (via `env -u`)
+    # so the coding harness never inherits them. For Claude via /login
+    # (subscription), strip the sbx `proxy-managed` sentinel that would
+    # otherwise force API-key mode:
+    # unset_env:
+    #   - ANTHROPIC_API_KEY
+    #   - CLAUDECODE
+
+    # Antigravity (agy) agents. Only needed to run `antigravity-native` agents
+    # (e.g. the bundled swarm-agy-coder / swarm-agy-reviewer-bug). When on, the
+    # launcher seeds every VM with an inert PLACEHOLDER OAuth token + onboarding
+    # marker at creation so the readiness gate passes; a running token harvester
+    # (`omni-sbx-agy`, see README) keeps the wire-swap secret fresh. Harmless for
+    # Claude VMs. Default off.
+    # agy_enabled: true
+    # Set ONLY for a Business/enterprise Google account (else agy re-runs
+    # enterprise onboarding — theme picker + EULA — that a headless VM can't
+    # answer). Ignored unless agy_enabled. Default off.
+    # agy_enterprise: true
+    # GCP project id (+ optional location, default `us`) for a Business /
+    # enterprise (Vertex) account — REQUIRED for that account or agy fails a turn
+    # with `invalid project ID`. Seeded into the VM's agy settings.json. Ignored
+    # unless agy_enabled.
+    # agy_gcp_project: your-gcp-project-id
+    # agy_gcp_location: us
+
+# Credentials are NOT configured here. sbx runs a host-side proxy that injects
+# the real key into the agent's outbound API calls; the key never enters the
+# microVM. Store secrets once with the `sbx secret` CLI on the server host, e.g.
+#
+#   # Built-in service (proxy matches the provider's domains automatically):
+#   echo "$ANTHROPIC_API_KEY" | sbx secret set -g anthropic
+#   echo "$GEMINI_API_KEY"    | sbx secret set -g google
+#
+#   # Custom: also sets GEMINI_API_KEY to a placeholder INSIDE the VM, so an
+#   # agent config that reads ${GEMINI_API_KEY} resolves, and the proxy swaps
+#   # the real value on requests to the given host:
+#   sbx secret set-custom -g --host generativelanguage.googleapis.com \
+#     --env GEMINI_API_KEY --value "$GEMINI_API_KEY"
+#
+# Global (-g) secrets apply to every sandbox at creation time. See the README
+# "Credentials" section and https://docs.docker.com/ai/sandboxes/security/credentials/

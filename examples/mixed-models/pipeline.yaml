@@ -1,0 +1,41 @@
+# Mixed-models pipeline — a heterogeneous review swarm as ONE declarative file.
+#
+# Recast of the classic coordinator+coder+reviewers swarm as a pipeline: no
+# coordinator agent, no pasted agent ids, no long CLI kickoff. `omni-sbx server
+# --pipeline this-file` registers the agents; `omni-sbx-pipeline -c this-file`
+# fires the run. Set `repo:` and `task:` to your own before running.
+#
+# Each role runs its own model; per-agent effort is enforced for the Claude
+# harnesses (agy has no effort knob — see docs/ANTIGRAVITY.md, docs/PIPELINES.md).
+
+version: 1
+name: mixed-models
+
+# EDIT: a local path or a GitHub URL to cut worktrees from.
+repo: /path/to/your/project
+publish: local            # local | pr | none
+
+# EDIT: the change to make + how it's judged done. Omit BOTH to just provision
+# the VMs and drive them by hand (provision-only mode).
+task: |
+  Add a `parse_ports(spec)` helper to net.py that turns a string like
+  "22,80,1000-1002" into a sorted list of unique ints [22, 80, 1000, 1001, 1002].
+acceptance: |
+  Handles single ports and inclusive A-B ranges; dedupes; sorts ascending;
+  raises ValueError on out-of-range (<1 or >65535), reversed ranges, and
+  malformed/empty input; changes nothing else in net.py.
+
+agents:
+  plan:  { template: planner,           harness: antigravity-native, model: gemini-3.5-flash }
+  build: { template: coder,             model: claude-sonnet-5, effort: medium }
+  sec:   { template: security-reviewer, model: claude-sonnet-5 }
+  bugs:  { template: bug-reviewer,      harness: antigravity-native, model: gemini-3.5-flash }
+
+stages:
+  - { id: plan,  run: plan }                                   # read-only design
+  - { id: build, run: build, write: true, needs: [plan] }      # isolated rw branch
+  - id: review
+    run: [sec, bugs]                                           # both must APPROVE
+    needs: [build]
+    gate: consensus
+    on_block: build                                           # findings loop back

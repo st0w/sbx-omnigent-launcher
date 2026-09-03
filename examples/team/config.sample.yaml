@@ -1,0 +1,27 @@
+# Team swarm — server `sandbox:` block.
+#
+# Identical to the Basic example's provider config — the difference between
+# scenarios is the AGENTS/ROLES you compose, not the server config. Copy this
+# block into your Omnigent server config, adjusting paths/ports for your host.
+
+sandbox:
+  provider: sbx
+
+  # Local server = the Docker host gateway, NOT localhost. Requires an sbx
+  # egress policy for BOTH host.docker.internal:6767 and localhost:6767 (see the
+  # top-level README "Network policy").
+  server_url: http://host.docker.internal:6767
+
+  sbx:
+    image: ghcr.io/omnigent-ai/omnigent-host:latest
+
+    # REQUIRED for swarms. A team runs more VMs at once (planner + coder + two
+    # reviewers = 4 per swarm), all mounting worktrees from here. Must match the
+    # --worktree-root you pass to omni-sbx-swarm.
+    worktree_root: /srv/swarm/worktrees
+
+    unset_env:
+      - ANTHROPIC_API_KEY
+      - CLAUDECODE
+
+# Credentials via `sbx secret` — see the top-level README.

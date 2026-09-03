@@ -1,0 +1,89 @@
+#!/bin/bash
+# Bootstrap for the sbx-omnigent pipeline host.
+#
+# Deliberately minimal. It prepares the machine and stops: sbx, the harness
+# authentication and the Antigravity trusted box all need an interactive
+# login, so they are done over a Session Manager shell (see README.md).
+#
+# NOTHING SECRET GOES IN HERE. user_data is readable by anyone who can call
+# ec2:DescribeInstanceAttribute, and it is preserved in the instance record.
+set -euo pipefail
+
+exec > >(tee -a /var/log/omnigent-bootstrap.log) 2>&1
+echo "=== omnigent bootstrap $(date -Is) ==="
+
+export DEBIAN_FRONTEND=noninteractive
+
+# The image runs its own apt at boot; ours has to wait that out or it dies
+# on the lock. Same failure the pipeline's own verify prologue hit.
+apt_retry() {
+  local n=0
+  until apt-get -o DPkg::Lock::Timeout=600 "$@"; do
+    n=$((n + 1))
+    if [ "$n" -ge 12 ]; then
+      echo "apt still locked after $n attempts; giving up" >&2
+      return 1
+    fi
+    echo "apt busy (attempt $n) — waiting"
+    sleep 10
+  done
+}
+
+apt_retry update
+apt_retry install -y --no-install-recommends \
+  ca-certificates curl git jq tmux unzip
+
+# Canonical's AMIs ship the SSM agent as a snap. Make sure it is actually
+# running — with no inbound path, this is the ONLY way onto the box.
+if snap list amazon-ssm-agent >/dev/null 2>&1; then
+  snap start --enable amazon-ssm-agent || true
+fi
+
+##############################################################################
+# Optional persistent data volume
+##############################################################################
+
+VOL_ID="${data_volume_id}"
+
+if [ -n "$${VOL_ID}" ]; then
+  # Nitro renames /dev/sdf, so address the volume by its stable id instead.
+  DEV="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$${VOL_ID//-/}"
+
+  echo "waiting for $${DEV}"
+  for _ in $(seq 1 60); do
+    [ -e "$${DEV}" ] && break
+    sleep 5
+  done
+
+  if [ ! -e "$${DEV}" ]; then
+    echo "data volume never appeared at $${DEV}; leaving /srv on the root disk" >&2
+  else
+    # Only format a volume that has no filesystem — this script must never
+    # be what destroys a campaign's run directory on a reboot.
+    if ! blkid "$${DEV}" >/dev/null 2>&1; then
+      echo "no filesystem on $${DEV}; creating ext4"
+      mkfs.ext4 -L omnigent "$${DEV}"
+    else
+      echo "$${DEV} already has a filesystem; leaving it alone"
+    fi
+
+    UUID="$(blkid -s UUID -o value "$${DEV}")"
+    mkdir -p /srv
+    if ! grep -q "$${UUID}" /etc/fstab; then
+      echo "UUID=$${UUID} /srv ext4 defaults,nofail 0 2" >> /etc/fstab
+    fi
+    mountpoint -q /srv || mount /srv
+  fi
+fi
+
+##############################################################################
+# Pipeline roots
+##############################################################################
+
+install -d -o ubuntu -g ubuntu -m 0750 \
+  /srv/omnigent \
+  /srv/omnigent/worktrees \
+  /srv/omnigent/canonical
+
+echo "=== bootstrap complete $(date -Is) ==="
+df -h / /srv 2>/dev/null || true

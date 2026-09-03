@@ -1,0 +1,102 @@
+# Per-module pipeline — YOU supply the module list; the runner runs the
+# FULL cadre ONCE PER MODULE, in order.
+#
+#   for each module (in dependency order):
+#     plan ─▶ tests ─┬─▶ impl-a ─▶ review-a ─┐
+#            (module) └─▶ impl-b ─▶ review-b ─┴─▶ pick ─▶ refactor ─▶ review-r ─▶ publish
+#     └─ each module is PLANNED in-loop against the FROZEN prior modules,
+#        built to green, and published to its own pipeline/<run>-<module>.
+#
+# Use this when one run is too big to converge (a whole component) but the
+# work splits into ordered, dependent modules. You provide the module
+# table (`subtask_file` below); each module's planner proposes THAT
+# module's design + work breakdown, and its TDD writer turns that into the
+# failing suite. Earlier modules' artifacts are frozen inputs to later
+# ones (the later planner's worktree seeds from the accumulated tip).
+#
+# Contrast the FLAT campaign, where a single up-front planner proposes the
+# chunk list itself (no `subtasks:` in config) — see ../README.md.
+#
+# Heaviest shape (~12 microVMs) PER MODULE, so a 5-module run is a long,
+# expensive job — drive it live (the per-module planner blocks on your
+# APPROVED once per module). Uses three Antigravity (agy) agents; to run
+# with NO agy, swap the antigravity-native agents for claude-native (give
+# impl_b a different model so the two coders still differ).
+
+version: 1
+name: per-module
+
+repo: /path/to/your/project     # EDIT — a local git repo path or a GitHub URL
+base_branch: main               # branch to cut from / publish onto
+publish:                        # each module ships its OWN draft PR
+  mode: pr                      # pr (draft PR) | local (push branch) | none
+  branch: refactor              # publish the refactored winner of each module
+
+context_file: context.md        # shared "system prompt" baked into every agent
+task_file: brief.md             # the shared brief — NO module table (that's below)
+subtask_file: modules.md        # EDIT — the ordered module table, one line each
+
+acceptance: |                   # module-level "done" (every module is held to it)
+  A module is done when the final review (review-r) passes on the
+  refactored winner and its artifacts are frozen for later modules. If a
+  gate cannot be met, two stages disagree on a contract, or a frozen
+  artifact needs changing — halt and escalate to the human with the
+  specific conflict. Never resolve ambiguity by fiat.
+
+agents:
+  plan:                         # read-only design; interactive PER MODULE
+    template: planner
+    harness: antigravity-native
+    model: gemini-3.5-flash
+  tdd:                          # writes the module's FAILING suite from its plan
+    template: tdd-writer
+    model: claude-sonnet-5
+    effort: high
+  impl_a:                       # competing coder A
+    template: coder
+    model: claude-opus-4-8
+    effort: high
+  impl_b:                       # competing coder B
+    template: coder
+    harness: antigravity-native
+    model: gemini-3.5-flash
+  sec:                          # security auditor (read-only); ends with VERDICT:
+    template: security-reviewer
+    model: claude-opus-4-8
+    effort: high
+  bugs:                         # correctness auditor (read-only); ends with VERDICT:
+    template: bug-reviewer
+    harness: antigravity-native
+    model: gemini-3.5-flash
+  judge:                        # picks the winning branch; ends with SELECT:
+    template: judge
+    model: claude-sonnet-5
+  refactor:                     # behavior-preserving cleanup of the winner
+    template: refactoring
+    model: claude-sonnet-5
+    effort: high
+
+stages:
+  - { id: plan,  run: plan }                                    # module design (interactive)
+  - { id: tests, run: tdd, write: true, needs: [plan] }         # module tests, own branch
+  - id: implement                                               # two ISOLATED writers
+    parallel:
+      - { id: impl-a, run: impl_a, write: true, from: tests, needs: [plan] }
+      - { id: impl-b, run: impl_b, write: true, from: tests, needs: [plan] }
+  - id: review-a
+    run: [sec, bugs]
+    needs: [impl-a]
+    gate: consensus
+    on_block: impl-a
+  - id: review-b
+    run: [sec, bugs]
+    needs: [impl-b]
+    gate: consensus
+    on_block: impl-b
+  - { id: pick, run: judge, needs: [impl-a, impl-b], selects: branch }
+  - { id: refactor, run: refactor, write: true, from: pick, needs: [pick] }
+  - id: review-r
+    run: [sec, bugs]
+    needs: [refactor]
+    gate: consensus
+    on_block: refactor

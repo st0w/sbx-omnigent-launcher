@@ -1,0 +1,31 @@
+# Basic swarm — server `sandbox:` block.
+#
+# Copy this block into your Omnigent server config (~/.omnigent/config.yaml or
+# ./.omnigent/config.yaml), adjusting paths/ports for your host. This is the
+# same provider config every swarm uses; the Basic scenario needs nothing extra.
+
+sandbox:
+  provider: sbx
+
+  # Where the microVM dials back to reach THIS server. Local server = the Docker
+  # host gateway, NOT localhost. Match the port to your server (6767 default).
+  # Requires an sbx egress policy for BOTH host.docker.internal:6767 and
+  # localhost:6767 — see the top-level README "Network policy".
+  server_url: http://host.docker.internal:6767
+
+  sbx:
+    image: ghcr.io/omnigent-ai/omnigent-host:latest
+
+    # Absolute host dir holding per-swarm worktrees. REQUIRED for swarms — the
+    # coder/reviewer VMs bind-mount worktrees from here. Must match the
+    # --worktree-root you pass to omni-sbx-swarm.
+    worktree_root: /srv/swarm/worktrees
+
+    # For Claude via subscription (recommended): strip the sbx api-key sentinel
+    # so the OAuth token wins. See the README "Claude via subscription".
+    unset_env:
+      - ANTHROPIC_API_KEY
+      - CLAUDECODE
+
+# Credentials for the microVM agents are stored via `sbx secret` (never in this
+# file). See the top-level README "Credentials" / "Claude via subscription".
