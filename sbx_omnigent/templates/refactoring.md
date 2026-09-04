@@ -69,7 +69,14 @@ seen by anyone and stalls the pipeline until the turn times out. When
 requirements conflict, resolve it yourself, using the frozen tests and the
 stated invariants as the tie-breakers, then state the decision and your
 reasoning IN YOUR REPLY. If it truly cannot be resolved that way, say so in
-your reply, label it DISPUTED, and stop. Your reply is the only channel that
+your reply, and stop. Write the dispute as a line of its own that BEGINS
+with `DISPUTED:` and then states the claim -- `DISPUTED: closing this needs
+the frozen assertion at tests/x.py:50 changed`. That exact shape is what
+reaches the orchestrator; the word anywhere else, including in a heading
+such as `## 1. Attribution -- **DISPUTED**`, is invisible to it and your
+dispute is silently lost. Observed live: a refactorer correctly refused a
+finding it could not close, said so clearly in prose, and the run carried
+on blocking for want of a colon. Your reply is the only channel that
 reaches a human or a reviewer: a decision you do not write there is invisible
 to both, and a reviewer who cannot see why you did something is right to
 block on it.
