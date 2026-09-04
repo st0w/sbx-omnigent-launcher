@@ -5177,7 +5177,8 @@ class TestCompetingWriters(_Base):
         self.assertEqual(wt.node_from['refactor'], 'pick')
         # refactor got the cleanup framing, NOT the implement task.
         rf_msg = sc.message_for_label('refactor')
-        self.assertIn('REFACTOR it', rf_msg)
+        self.assertIn('You are REFACTORING', rf_msg)
+        self.assertIn('THE SAME OUTPUTS FROM THE SAME INPUTS', rf_msg)
         self.assertNotIn('Task:\nimplement parse_ports', rf_msg)
         # the refactored branch (reviewed) is what ships.
         self.assertEqual(wt.published[0], 'refactor')
@@ -6487,7 +6488,10 @@ class TestTheLiveCadreCarriesRealArtifacts(_Base):
         )
         self.assertEqual(R.parse_select(_real_judge('impl-b')), 'impl-b')
 
-    def test_it_is_large_enough_to_be_representative(self) -> None:
+    def test_the_cadre_plan_is_representative(self) -> None:
+        # Renamed: this collided with an identically named method later
+        # in the same class, so Python silently kept the other one and
+        # this never ran. Two fixtures, two scales, two tests.
         # The defects only appear at scale. Pin the properties that made
         # them visible, so a future trim cannot quietly restore the
         # blindness.
@@ -6498,6 +6502,49 @@ class TestTheLiveCadreCarriesRealArtifacts(_Base):
             'the recap phrase must sit outside the opening window',
         )
         self.assertEqual(R.plan_shape_failures(plan), [])
+
+    def test_a_refactor_review_is_scoped_to_the_diff(self) -> None:
+        # review-r used to receive the implementation instruction: the
+        # whole task, the whole acceptance contract, and "review the
+        # working tree against this contract". So it re-read the entire
+        # module every round against the entire brief and blocked on
+        # whatever it found — a loop with no end, because a large
+        # module always has one more real defect in it.
+        _r, sc, _wt = self._run(_LIVE_CADRE, self._replies())
+
+        sent = [m for s_, m in sc.sent if 'review-r' in sc.label_of(s_)]
+        self.assertTrue(sent, 'review-r was never driven')
+        self.assertIn('You are reviewing a REFACTOR', sent[0])
+        self.assertIn('YOUR SUBJECT IS THE CHANGE', sent[0])
+        self.assertIn('functionally IDENTICAL', sent[0])
+        self.assertNotIn(
+            'Review the working tree in your mount', sent[0]
+        )
+
+    def test_a_refactor_review_defers_a_pre_existing_defect(self) -> None:
+        # The half that ends the loop: a defect on BOTH sides of the
+        # diff is not something this refactor did.
+        _r, sc, _wt = self._run(_LIVE_CADRE, self._replies())
+
+        msg = next(
+            m for s_, m in sc.sent if 'review-r' in sc.label_of(s_)
+        )
+        self.assertIn('PRE-EXISTING', msg)
+        self.assertIn('NON-BLOCKING list', msg)
+
+    def test_an_implementation_review_keeps_the_whole_contract(
+        self,
+    ) -> None:
+        # The new framing must reach review-r ONLY. A writer that
+        # produced the whole tree is rightly read against the whole
+        # contract.
+        _r, sc, _wt = self._run(_LIVE_CADRE, self._replies())
+
+        msg = next(
+            m for s_, m in sc.sent if 'review-a' in sc.label_of(s_)
+        )
+        self.assertIn('Review the working tree in your mount', msg)
+        self.assertNotIn('You are reviewing a REFACTOR', msg)
 
 
 class TestARealPlanSurvivesTheWholeHandoff(unittest.TestCase):
