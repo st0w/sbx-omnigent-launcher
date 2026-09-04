@@ -884,6 +884,37 @@ _REVIEW_NOT_WEIGHTED = (
 )
 
 #: The two tokens a review must end on.
+#: Handed to every reviewer above the decisions ledger. A reviewer
+#: that cannot see what the human already settled re-opens it:
+#: observed on `ingestion-m3-1`, where the [m3c] planner recorded "one
+#: frozen assertion was amended under explicit human authorization"
+#: into the ledger exactly as asked, the ledger reached the next
+#: PLANNER and nobody else, and both bug reviewers found the amended
+#: assertion, could not know it was authorized, and raised DISPUTED.
+#: That was the right move on the evidence they held; the evidence was
+#: the bug.
+#:
+#: The second paragraph is the other half, and it is not optional. A
+#: ruling fixes what the code may LOOK like, never whether it is
+#: right, and a reviewer that reads the ledger as permission to
+#: approve a defect is worse than one that never saw it.
+_REVIEW_SETTLED = (
+    '\n\nSETTLED ALREADY, with the human. Each line below was '
+    'recorded by an approved plan — for this increment or for an '
+    'earlier one — and BINDS the code you are reading. Read them '
+    'BEFORE '
+    'you block on something that looks like a contract violation: a '
+    'frozen artifact amended under authorization, or a rule stricter '
+    'than the brief reads literally, is a question already answered, '
+    'and re-opening it spends a round arriving where the human '
+    'already is.\n\nA settled decision is not a defence for a '
+    'defect. It says what the code is ALLOWED to look like, never '
+    'whether it is correct: if the code is wrong it is wrong whether '
+    'or not a decision explains its shape. Block, and name the '
+    'decision you read.\n\n'
+)
+
+
 _REVIEW_VERDICT_LINE = (
     '\n\nEnd your reply with a single verdict line, using one of these '
     'two exact tokens: `VERDICT: APPROVED` (the change meets the '
@@ -4685,6 +4716,30 @@ class PipelineRunner:
                 parts.append(f'{head}\n{body}')
         return '\n'.join(parts)
 
+    def _rulings_block(self) -> str:
+        """
+        The settled decisions, framed for a reviewer turn.
+
+        :meth:`_decisions_block` serves the PLANNER, which is also
+        shown REFERRALS — open observations it may accept or reject.
+        A reviewer must not see those: a referral is explicitly not
+        binding, and one printed beside real rulings reads as a
+        closed question. Decisions only, therefore.
+
+        :returns: The block, or ``''`` when nothing has been settled.
+            An empty heading would assert that nothing was, which is
+            a claim; silence is not.
+        """
+        titles = {s.id: s.title for s in self._subtasks}
+        parts = []
+        for module_id, items in self._decisions_by_module():
+            head = f'[{module_id}] {titles.get(module_id, "")}'.strip()
+            body = '\n'.join(f'  - {text}' for text in items)
+            parts.append(f'{head}\n{body}')
+        if not parts:
+            return ''
+        return _REVIEW_SETTLED + '\n'.join(parts)
+
     def _decisions_doc(self) -> str:
         """The decisions ledger as the committed Markdown document."""
         titles = {s.id: s.title for s in self._subtasks}
@@ -7723,6 +7778,7 @@ class PipelineRunner:
             + _REVIEW_NOT_THE_GATE
             + _REVIEW_NOT_WEIGHTED.format(later=later)
             + self._scope_block()
+            + self._rulings_block()
             + _FINDINGS_ASK
             + self._guarded_block(stage)
             + _REVIEW_VERDICT_LINE
@@ -7826,6 +7882,7 @@ class PipelineRunner:
             + _REVIEW_VERIFY
             + _REVIEW_NOT_THE_GATE
             + _REVIEW_NOT_WEIGHTED.format(later='')
+            + self._rulings_block()
             + _FINDINGS_ASK
             + self._guarded_block(stage)
             + _REVIEW_VERDICT_LINE

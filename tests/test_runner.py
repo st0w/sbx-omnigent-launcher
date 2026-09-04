@@ -4797,6 +4797,89 @@ class TestTheIncrementBoundsEveryRole(_Base):
         )
 
 
+class TestSettledDecisionsReachTheReviewers(_Base):
+    """
+    A reviewer that cannot see what the human already settled either
+    re-litigates it or blocks on an authorized deviation.
+
+    Observed live on `ingestion-m3-1`. The [m3c] planner recorded
+    "One frozen assertion was amended under explicit human
+    authorization (2026-09-04)" into the decisions ledger, exactly as
+    it was asked to. `_decisions_block` fed that ledger to the next
+    PLANNER and to nobody else, so both bug reviewers found the
+    amended assertion, had no way to know it was authorized, and
+    raised DISPUTED. That is the correct move on the evidence they
+    held — and it halted the campaign on a question already answered.
+
+    The ledger is where a human ruling lives. A reviewer is the role
+    most likely to trip over one.
+    """
+
+    _RULING = (
+        'One frozen assertion was amended under explicit human '
+        'authorization: the integration test now expects no unmapped row'
+    )
+
+    def _runner(self, source=_COMPETE_REVIEWED, decisions=True):
+        cfg = self._cfg(source)
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        if decisions:
+            runner._decisions = [('m3c', self._RULING)]
+        return runner
+
+    def test_the_reviewer_is_told_what_the_human_already_settled(
+        self,
+    ) -> None:
+        r = self._runner()
+        msg = r._review_instruction(r._stage_by_id['review-a'])
+        self.assertIn(self._RULING, msg)
+
+    def test_the_refactor_reviewer_is_told_too(self) -> None:
+        # The refactor review is a SEPARATE instruction, and it is the
+        # one reviewing the last writer before publish — the worst
+        # place to re-open a settled question.
+        r = self._runner(source=_JUDGE_REFACTOR)
+        r._nodes['refactor'] = R.NodeResult(
+            'refactor', 'writer', branch='b/refactor'
+        )
+        msg = r._refactor_review_instruction(r._stage_by_id['review-r'])
+        self.assertIn(self._RULING, msg)
+
+    def test_a_settled_decision_is_not_a_defence_for_a_defect(
+        self,
+    ) -> None:
+        # Without this half, handing a reviewer the ledger buys a
+        # different failure: "a decision explains it" becomes a reason
+        # to approve code that is actually wrong.
+        r = self._runner()
+        msg = r._review_instruction(r._stage_by_id['review-a'])
+        self.assertIn('not a defence for a defect', msg)
+
+    def test_a_run_with_no_settled_decisions_says_nothing(self) -> None:
+        # A dangling empty heading reads as "nothing was settled",
+        # which is a claim; silence is not.
+        r = self._runner(decisions=False)
+        msg = r._review_instruction(r._stage_by_id['review-a'])
+        self.assertNotIn('not a defence for a defect', msg)
+
+    def test_referrals_are_not_shown_to_reviewers_as_settled(
+        self,
+    ) -> None:
+        # Referrals are explicitly NOT binding — "the module that owns
+        # one decides what to do about it, and deciding it is wrong is
+        # a legitimate outcome". Presenting one beside real rulings
+        # would let a reviewer treat an open question as closed.
+        r = self._runner()
+        r._referrals = [('m3c', 'a reviewer wondered about pagination')]
+        msg = r._review_instruction(r._stage_by_id['review-a'])
+        self.assertNotIn('wondered about pagination', msg)
+
+
+
 class TestTheReviewedClaimSurvivesAResume(_Base):
     """
     The judge is told "both candidates already passed their review gate,
