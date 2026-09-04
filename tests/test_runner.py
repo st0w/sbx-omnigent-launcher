@@ -543,6 +543,13 @@ class _Base(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+        # No test may spend the reviewer-retry backoff. It exists to
+        # outlast a provider outage in production, which is minutes;
+        # four tests drive a reviewer that dies on purpose, and paying
+        # it would add six minutes to the suite for nothing.
+        backoff = mock.patch.object(R, '_REVIEW_RETRY_BACKOFF_S', 0.0)
+        backoff.start()
+        self.addCleanup(backoff.stop)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
@@ -4191,6 +4198,46 @@ class TestAReviewerThatLostItsRunner(_Base):
         said = ' '.join(str(c.args[0]) for c in echo.call_args_list)
         self.assertIn('attempt 1 died', said)
         self.assertIn('recorded no verdict', said)
+
+    def _sc_raising_first(self, label='review-sec'):
+        """A reviewer whose turn never returns, rather than failing."""
+        sc = FakeSC(dict(_LINEAR_REPLIES))
+        send = sc.send_and_wait
+        seen: list[str] = []
+
+        def once(session, message, **kw):
+            if sc._label.get(session, '') == label and label not in seen:
+                seen.append(label)
+                raise R.SwarmSessionError('stream closed mid-turn')
+            return send(session, message, **kw)
+
+        sc.send_and_wait = once
+        return sc
+
+    def test_a_transport_failure_is_retried_like_a_dead_guest(self) -> None:
+        # A turn that never CAME BACK is as safe to retry as one that
+        # came back failed — read-only mount, nothing written, no
+        # verdict recorded. It escaped because SwarmSessionError and
+        # PipelineRunError are in disjoint hierarchies, so the stage
+        # died on the first dropped stream or server hiccup.
+        sc = self._sc_raising_first()
+
+        result, _sc, _wt = self._run(_LINEAR, {}, sc=sc)
+
+        self.assertEqual(result.status, 'completed')
+
+    def test_the_retry_waits_before_re_driving(self) -> None:
+        # Two attempts seconds apart are one attempt with extra steps.
+        # Observed live: both attempts of a review stage failed within
+        # minutes of each other during a provider incident that had
+        # another hour to run.
+        sc = self._sc_failing_first()
+
+        with mock.patch.object(R, '_REVIEW_RETRY_BACKOFF_S', 12.5):
+            with mock.patch.object(R.time, 'sleep') as slept:
+                self._run(_LINEAR, {}, sc=sc)
+
+        self.assertIn(12.5, [c.args[0] for c in slept.call_args_list])
 
     def test_failing_twice_still_fails_the_stage(self) -> None:
         # Bounded: this is a retry, not a loop.

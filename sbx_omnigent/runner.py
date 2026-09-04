@@ -603,6 +603,24 @@ _VERDICT_POLL_CEILING_S = 3600.0
 #: is still unproven. The retry is right regardless of which it is.
 _REVIEW_TURN_ATTEMPTS = 2
 
+#: Seconds to wait before re-driving a reviewer whose turn died.
+#:
+#: The retry above exists for a guest that died; it also catches the
+#: case where the MODEL PROVIDER is down, and those want opposite
+#: timing. A dead guest is ready to replace immediately. A provider
+#: returning 529 is not, and two attempts seconds apart are one
+#: attempt with extra steps. Observed live on `ingestion-m2-5`: both
+#: attempts of a review stage failed inside a few minutes during an
+#: acknowledged Anthropic incident, spending the whole budget while
+#: the incident had another hour to run.
+#:
+#: Deliberately in minutes rather than seconds, and deliberately flat
+#: rather than exponential: with two attempts there is nothing to
+#: grow, and a wait long enough to outlast a blip is the entire
+#: mechanism. The cost when the fault was NOT the provider is one
+#: idle minute against a whole stage.
+_REVIEW_RETRY_BACKOFF_S = 90.0
+
 #: Asked of a reviewer that finished its turn without stating a verdict.
 #: Since reviewers were told to EXECUTE what they review, they install
 #: toolchains and run instrumented builds — work that outlives the turn,
@@ -6410,18 +6428,29 @@ class PipelineRunner:
                 return session, self._drive(
                     session, self._review_instruction(stage)
                 )
-            except PipelineRunError as exc:
+            except (PipelineRunError, SwarmSessionError) as exc:
+                # SwarmSessionError as well as PipelineRunError: a turn
+                # that never CAME BACK is as safe to retry as one that
+                # came back failed, and every word of this method's
+                # rationale covers it — read-only mount, nothing
+                # written, no verdict recorded. It was escaping because
+                # the two live in disjoint hierarchies, so the stage
+                # died on the first dropped stream or server hiccup.
                 if attempt == _REVIEW_TURN_ATTEMPTS:
                     raise
                 click.echo(
                     f'[review] {label}: attempt {attempt} died '
                     f'({exc}); its mount was read-only and it recorded '
-                    f'no verdict, so nothing is lost — booting a fresh '
-                    f'guest and reviewing again.'
+                    f'no verdict, so nothing is lost — waiting '
+                    f'{_REVIEW_RETRY_BACKOFF_S:.0f}s, then booting a '
+                    f'fresh guest and reviewing again.'
                 )
                 self._free_session(
                     session, f'{label}: freeing the guest that died.'
                 )
+                # AFTER the guest is freed, so an outage is not waited
+                # out while a dead VM holds its slot.
+                time.sleep(_REVIEW_RETRY_BACKOFF_S)
         raise AssertionError('unreachable')
 
     def _review_guest(
