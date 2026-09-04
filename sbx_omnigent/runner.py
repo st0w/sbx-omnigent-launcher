@@ -821,6 +821,56 @@ _FINDINGS_ASK = (
 #: What a reviewer uniquely provides is judgement about whether the code
 #: does what it claims, and it cannot spend an hour on that if it spends
 #: the hour recompiling.
+#: The read-only mount note, shared by every review instruction.
+_REVIEW_MOUNT = (
+    '\n\nYour mount is READ-ONLY: you can read and build the tree but '
+    'not write into it. Build somewhere on the VM'
+    "'s own disk instead — for Cargo, `export "
+    'CARGO_TARGET_DIR=/tmp/review-target` before any cargo command; '
+    'other toolchains have an equivalent. DO NOT COPY the tree anywhere '
+    'first, and do not try to make the mount writable: cargo builds a '
+    'read-only source directory fine with the target directory '
+    'elsewhere, the copy is gigabytes for nothing, and one reviewer '
+    'that reached for `rm -rf` to clear space stalled its whole turn on '
+    'a permission prompt.'
+)
+
+#: Run it, do not read it. Shared by every review instruction.
+_REVIEW_VERIFY = (
+    '\n\nBefore any verdict, CHECK THAT THE CODE IS REALLY THERE and '
+    'that the test suite really passes — run it. If the tooling you '
+    'need is missing, install it (see the environment notes above); '
+    'your VM has network access for that. You may NOT return `VERDICT: '
+    'APPROVED` on a change you could not execute, and "the code looks '
+    'correct" is not a substitute for running it. If you could not '
+    'verify, return `VERDICT: BLOCKING` and say exactly what stopped '
+    'you. An empty or placeholder implementation that merely '
+    'compiles-by-absence is a BLOCKING finding.'
+)
+
+#: A verdict is a release decision, not a weighted opinion.
+_REVIEW_NOT_WEIGHTED = (
+    '\n\nA verdict is not a weighted opinion. Every finding you report '
+    'as BLOCKING must be one you would hold the release for. If you '
+    'would discount a finding — as minor, pre-existing, external, '
+    "upstream drift, someone else's module, not attributable to this "
+    'change{later} — then it is NOT blocking: put it in a clearly '
+    'separate NON-BLOCKING list and keep it out of the reasoning for '
+    'your verdict. Never state a blocking finding and argue it down in '
+    'the same breath. The writer reads a hedged finding as permission '
+    'to make the symptom go away rather than the cause, and a gate that '
+    'was weakened to clear a finding you had already discounted is the '
+    'worst outcome this pipeline can produce.'
+)
+
+#: The two tokens a review must end on.
+_REVIEW_VERDICT_LINE = (
+    '\n\nEnd your reply with a single verdict line, using one of these '
+    'two exact tokens: `VERDICT: APPROVED` (the change meets the '
+    'contract, and you verified it) or `VERDICT: BLOCKING` (it does '
+    'not, or you could not verify).'
+)
+
 _REVIEW_NOT_THE_GATE = (
     '\n\nRUN THE TESTS, NOT THE COVERAGE GATE. Execute the suite '
     'covering what you are reviewing — that is what stops an empty '
@@ -846,8 +896,13 @@ _UNATTENDED = (
     'When requirements conflict, resolve it yourself — the frozen '
     'tests and the stated invariants are the tie-breakers — then STATE '
     'THE DECISION AND YOUR REASONING IN YOUR REPLY and carry on. If it '
-    'genuinely cannot be resolved that way, say so in your reply, '
-    'label it DISPUTED, and stop. Your reply is the only channel that '
+    'genuinely cannot be resolved that way, say so in your reply and '
+    'stop — on a line of its own that BEGINS with `DISPUTED:` and then '
+    'states the claim, as in `DISPUTED: closing this needs the frozen '
+    'assertion at tests/x.py:50 changed`. That exact shape is what '
+    'reaches the orchestrator; the word anywhere else, including in a '
+    'heading, is invisible to it and your dispute is silently lost. '
+    'Your reply is the only channel that '
     'reaches a human OR a reviewer: a decision you do not write there '
     'is invisible to both, and a reviewer who cannot see why you did '
     'something is right to block on it.'
@@ -6250,10 +6305,16 @@ class PipelineRunner:
         self._ensure_writer_session(stage)
         assert node.session is not None
         # A loop-back reuses the writer's session so its fix turn keeps
-        # the prior review context.
-        node.output = self._drive(
-            node.session, instruction or self._fix_instruction(findings)
-        )
+        # the prior review context — but a RESUMED run re-attaches the
+        # node to a fresh session, so there is no history to keep. A
+        # refactorer therefore has its contract restated on every fix
+        # turn rather than once: it is the one writer whose findings
+        # routinely ask for work it is forbidden to do, so the turn
+        # that relays them is exactly the turn that must also say so.
+        turn = instruction or self._fix_instruction(findings)
+        if instruction is None and self._is_refactor(stage):
+            turn = f'{self._refactor_contract()}\n\n{turn}'
+        node.output = self._drive(node.session, turn)
         # Kept even on success: this session is disposed at publish, and
         # what a writer did with a reviewer's findings is exactly what
         # someone reading the pull request later wants to see.
@@ -7498,6 +7559,41 @@ class PipelineRunner:
             instr += f'\n\n{ctx}'
         return instr
 
+    @staticmethod
+    def _refactor_contract() -> str:
+        """
+        The refactor contract, in the words that bound it.
+
+        Held apart from :meth:`_refactor_instruction` because it must
+        be repeated on EVERY turn, not stated once. A loop-back drives
+        the writer with reviewer findings alone and leans on session
+        history to carry the framing — and after a resume there is no
+        history to lean on, because the node is re-attached to its
+        worktree with a FRESH session. Observed live: a campaign
+        resumed five times, and every fix turn after the first arrived
+        as a bare list of blocking findings. The agent kept its role
+        prompt and lost the one paragraph saying which of those
+        findings were its to close.
+
+        :returns: The contract paragraph.
+        """
+        return (
+            'You are REFACTORING. Your job is to make working code '
+            'better at producing THE SAME OUTPUTS FROM THE SAME '
+            'INPUTS: simpler, with lower cyclomatic complexity and '
+            'less duplication; clearer to read; cheaper to run; easier '
+            'to audit and maintain. That is the whole job.\n\n'
+            'You may NOT change behaviour, the public API, or the '
+            'feature set. No new features, no new modules, no bug '
+            '"fixes" that alter results, no scope beyond cleanup. You '
+            'are not responsible for whether the implementation '
+            'satisfies its plan, is complete, or is well designed — '
+            'that was settled before this code reached you, by agents '
+            'whose job it was. Every existing test must still pass: '
+            'run them, keep them green, and do not weaken, skip, '
+            'delete or rewrite one.'
+        )
+
     def _refactor_instruction(
         self, stage: pipeline.PipelineStage
     ) -> str:
@@ -7505,21 +7601,21 @@ class PipelineRunner:
         Frame a refactor node's turn as behavior-preserving cleanup.
 
         The winning implementation is already in the node's worktree
-        (seeded from the judge). The turn describes the code to CLEAN UP
-        — keep behavior, keep tests green, no new features — rather than
-        the raw implementation task, so the agent polishes the existing
-        code instead of re-implementing from scratch.
+        (seeded from the judge). The turn describes the code to CLEAN
+        UP — keep behavior, keep tests green, no new features — rather
+        than the raw implementation task, so the agent polishes the
+        existing code instead of re-implementing from scratch.
+
+        :param stage: The refactor stage being driven.
+        :returns: The first-turn instruction.
         """
         instr = (
             f'{self._chunk_preamble()}'
             'A COMPLETE, WORKING implementation (the winning candidate) '
-            'is already in your worktree. REFACTOR it for clarity, '
-            'structure, and maintainability WITHOUT changing behavior: no '
-            'new features, no API changes, no scope beyond cleanup. Every '
-            'existing test must still pass — run them and keep them green; '
-            'do not weaken, skip, or delete any test.\n\nThe feature it '
-            'implements (context only — do NOT re-implement it):\n'
-            f'{self._config.task}'
+            'is already in your worktree.\n\n'
+            f'{self._refactor_contract()}\n\n'
+            'The feature it implements (context only — do NOT '
+            f're-implement it):\n{self._config.task}'
         )
         if self._config.acceptance:
             instr += (
@@ -7560,6 +7656,11 @@ class PipelineRunner:
         return bool(agent and agent.template == 'tdd-writer')
 
     def _review_instruction(self, stage: pipeline.PipelineStage) -> str:
+        # A refactor review asks a DIFFERENT question from an
+        # implementation review, and asking the implementation one
+        # cost a whole campaign. See _refactor_review_instruction.
+        if self._reviews_a_refactor(stage):
+            return self._refactor_review_instruction(stage)
         # Only inside a campaign: on a flat run there is no increment
         # list, so this would point at a "plan above" that is not there
         # — a dangling reference is worse than saying nothing.
@@ -7570,51 +7671,145 @@ class PipelineRunner:
         )
         return (
             self._task_block()
-            + '\n\nYour mount is READ-ONLY: you can read and build the '
-            'tree but not write into it. Build somewhere on the VM'
-            "'s own disk instead — for Cargo, `export "
-            'CARGO_TARGET_DIR=/tmp/review-target` before any cargo '
-            'command; other toolchains have an equivalent. DO NOT COPY '
-            'the tree anywhere first, and do not try to make the mount '
-            'writable: cargo builds a read-only source directory fine '
-            'with the target directory elsewhere, the copy is gigabytes '
-            'for nothing, and one reviewer that reached for `rm -rf` to '
-            'clear space stalled its whole turn on a permission prompt.'
+            + _REVIEW_MOUNT
             + '\n\nReview the working tree in your mount against this '
-            'contract.\n\nBefore any verdict, CHECK THAT THE CODE IS '
-            'REALLY THERE and that the test suite really passes — run '
-            'it. If the tooling you need is missing, install it (see '
-            'the environment notes above); your VM has network access '
-            'for that. You may NOT return `VERDICT: APPROVED` on a '
-            'change you could not execute, and "the code looks correct" '
-            'is not a substitute for running it. If you could not '
-            'verify, return `VERDICT: BLOCKING` and say exactly what '
-            'stopped you. An empty or placeholder implementation that '
-            'merely compiles-by-absence is a BLOCKING finding.'
+            'contract.'
+            + _REVIEW_VERIFY
             + _REVIEW_NOT_THE_GATE
-            + '\n\nA '
-            'verdict is not a weighted opinion. Every finding you report '
-            'as BLOCKING must be one you would hold the release for. If '
-            'you would discount a finding — as minor, pre-existing, '
-            "external, upstream drift, someone else's module, not "
-            f'attributable to this change{later} — then it is NOT '
-            'blocking: put '
-            'it in a clearly separate NON-BLOCKING list and keep it out '
-            'of the reasoning for your verdict. Never state a blocking '
-            'finding and argue it down in the same breath. The writer '
-            'reads a hedged finding as permission to make the symptom go '
-            'away rather than the cause, and a gate that was weakened to '
-            'clear a finding you had already discounted is the worst '
-            'outcome this pipeline can produce.'
+            + _REVIEW_NOT_WEIGHTED.format(later=later)
             + self._scope_block()
             + _FINDINGS_ASK
             + self._guarded_block(stage)
-            + '\n\nEnd '
-            'your reply with a single verdict line, using one of these '
-            'two exact tokens: `VERDICT: APPROVED` (the change meets '
-            'the contract, and you verified it) or `VERDICT: BLOCKING` '
-            '(it does not, or you could not verify).'
+            + _REVIEW_VERDICT_LINE
         )
+
+    def _reviews_a_refactor(self, stage: pipeline.PipelineStage) -> bool:
+        """
+        Whether this review stage's target is the shipped refactorer.
+
+        :param stage: The review stage about to run.
+        :returns: ``True`` when the reviewed node is a refactor node.
+        """
+        # Deliberately total: this only SELECTS framing, so a target
+        # that cannot be resolved yet degrades to the implementation
+        # instruction rather than killing the turn.
+        try:
+            target = self._review_target(stage)
+        except PipelineRunError:
+            return False
+        target_stage = self._stage_by_id.get(target)
+        return target_stage is not None and self._is_refactor(target_stage)
+
+    def _refactor_review_instruction(
+        self, stage: pipeline.PipelineStage
+    ) -> str:
+        """
+        Ask a refactor's reviewers the question a refactor answers.
+
+        Every review stage used to receive one instruction: the whole
+        task, the whole acceptance contract, and "review the working
+        tree against this contract". For an implementation review that
+        is right — the writer produced the tree, so the tree IS the
+        change. For a REFACTOR review it is wrong twice over. The
+        refactor changed a fraction of the tree, and whether the
+        implementation satisfies the contract was already asked and
+        answered, by consensus, at the implementation's own review.
+
+        Asking it again, every round, against the whole tree, is what
+        made a campaign unable to finish. Observed live on
+        `ingestion-m2-5`: reviewers returned a BLOCKING verdict in
+        every one of thirteen rounds, and the findings never repeated
+        because they were never the same defect twice — each round
+        re-read 7,900 lines against a 28,000-character brief and found
+        the next real thing. Three of the last seven named code that
+        did not exist when the judge picked the winner: they were
+        defects in the REPAIRS, which is a loop that generates its own
+        work. Each functional finding reached the one writer left
+        after the judge, which can only close a functional defect by
+        adding surface, and new surface is what the next round finds.
+
+        So this instruction names the DIFF as the subject and says
+        what a refactor is for. A defect on both sides of the diff is
+        pre-existing: real, worth recording, not this gate's business.
+        The changed files are listed from the host rather than left to
+        the reviewer to derive, the same way guarded files are, so the
+        scope is a fact rather than an act of good faith.
+
+        :param stage: The review stage about to run.
+        :returns: The full instruction for a refactor reviewer.
+        """
+        target = self._review_target(stage)
+        changed = self._changed_files(target)
+        listed = (
+            '\n\nThe files this refactor touched:\n'
+            + '\n'.join(f'  - {path}' for path in changed)
+            if changed
+            else ''
+        )
+        return (
+            f'{self._chunk_preamble()}'
+            'You are reviewing a REFACTOR. A complete implementation of '
+            'this increment was reviewed on its own merits and APPROVED '
+            'by consensus before it reached this stage; a separate '
+            'writer has since cleaned it up without being permitted to '
+            'change what it does.'
+            + _REVIEW_MOUNT
+            + listed
+            + '\n\nYOUR SUBJECT IS THE CHANGE, NOT THE TREE. Compare '
+            'the refactored code against what it replaced, side by '
+            'side, and answer two questions only:\n'
+            '  1. Is it functionally IDENTICAL — the same outputs for '
+            'the same inputs, the same errors for the same failures, '
+            'the same order, the same effects?\n'
+            '  2. Is it BETTER — simpler, clearer, less duplicated, '
+            'less complex, more efficient, easier to audit?\n\n'
+            'A NO to the first is BLOCKING: behaviour moved, and that '
+            'is the one thing a refactor may not do. A NO to the '
+            'second is BLOCKING only if the change made the code '
+            'WORSE; a refactor that improves little is not a defect.'
+            + '\n\nYou are NOT assessing whether the implementation '
+            'meets the plan, is feature-complete, or is well designed. '
+            'That verdict was already returned upstream and is not '
+            'yours to revisit. A defect that is present IDENTICALLY on '
+            'both sides of this diff is PRE-EXISTING: it is not '
+            'something this refactor did, it does not belong in your '
+            'verdict, and blocking on it stops a release for a fault '
+            'the change under review did not introduce. Record it in '
+            'the NON-BLOCKING list, where the triage stage downstream '
+            'will check it against the shipping code. That list is '
+            'read; nothing you put there is lost.'
+            + _REVIEW_VERIFY
+            + _REVIEW_NOT_THE_GATE
+            + _REVIEW_NOT_WEIGHTED.format(later='')
+            + _FINDINGS_ASK
+            + self._guarded_block(stage)
+            + _REVIEW_VERDICT_LINE
+        )
+
+    def _changed_files(self, target: str) -> list[str]:
+        """
+        The files a node changed against the branch it was cut from.
+
+        Computed on the HOST, like :meth:`_guarded_changes`, so a
+        reviewer is handed the scope rather than asked to derive it
+        from refs its own clone may not carry.
+
+        :param target: The writer node whose diff is wanted.
+        :returns: Sorted repo-relative paths, or ``[]`` if undecidable.
+        """
+        target_stage = self._stage_by_id.get(target)
+        if target_stage is None:
+            return []
+        try:
+            return sorted(
+                self._wt.node_diff_files(
+                    self._run_id, target, against=self._seed_ref(target_stage)
+                )
+            )
+        except click.ClickException:
+            # Never fail a review on a git hiccup; the reviewer still
+            # has the tree and the rest of its instruction.
+            return []
 
     def _judge_scope_clause(self) -> str:
         """
