@@ -614,11 +614,13 @@ _REVIEW_TURN_ATTEMPTS = 2
 #: acknowledged Anthropic incident, spending the whole budget while
 #: the incident had another hour to run.
 #:
-#: Deliberately in minutes rather than seconds, and deliberately flat
-#: rather than exponential: with two attempts there is nothing to
-#: grow, and a wait long enough to outlast a blip is the entire
-#: mechanism. The cost when the fault was NOT the provider is one
-#: idle minute against a whole stage.
+#: Long enough to outlast a blip rather than to ride out an incident:
+#: a minute and a half is the difference between two attempts and one
+#: attempt with extra steps, and no wait short of abandoning the run
+#: would have covered today's outage. Flat rather than exponential
+#: because with two attempts there is nothing to grow. The cost when
+#: the fault was NOT the provider is 90 idle seconds against a whole
+#: stage.
 _REVIEW_RETRY_BACKOFF_S = 90.0
 
 #: Asked of a reviewer that finished its turn without stating a verdict.
