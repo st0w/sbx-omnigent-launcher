@@ -5012,10 +5012,20 @@ class PipelineRunner:
         # Claiming prior work on the FIRST increment sends an agent
         # hunting for artifacts that cannot exist, and a careful one
         # then (rightly) refuses to build against the missing baseline.
+        #
+        # But `_active_is_first` is a POSITION in this run's row list,
+        # not a claim about the tree, and the two came apart the moment
+        # a campaign ran against a repo with earlier modules already
+        # merged. On `ingestion-m3-1` every m3a agent was told the tree
+        # was at base state while m0, m0b, m1 and m2 sat in it — handed
+        # to reviewers vetting a module whose brief is "mirror the [m2]
+        # pattern". So say only what the position proves: no earlier
+        # ROW of this run has been built. The tree speaks for itself.
         prior = (
-            'Nothing has been built yet — this is the first increment, '
-            'so the repo is at its base state; do not go looking for '
-            'earlier work.'
+            'It is the FIRST increment, so none of the increments '
+            'below has been built yet; do not go looking for their '
+            'artifacts. Anything already in your worktree is earlier, '
+            'separate work — treat it as frozen and build against it.'
             if self._active_is_first
             else 'Earlier increments are already implemented in your '
             'worktree; later ones come afterwards.'
@@ -7468,10 +7478,14 @@ class PipelineRunner:
                 'pull their scope into yours:\n'
                 f'{self._module_table(sub)}\n\n'
                 + (
-                    'This is the FIRST module: the repo is at its base '
-                    'state and nothing has been built yet, so design '
-                    'from the brief rather than looking for existing '
-                    'artifacts.'
+                    'This is the FIRST module of this run: no '
+                    'earlier module of this run has been built, so '
+                    'design from the brief rather than looking for '
+                    'artifacts of the modules below. Anything already '
+                    'committed in your worktree is earlier, separate '
+                    'work — treat it as a fixed contract, and a '
+                    'genuine need to change it is a halt-and-escalate '
+                    'to the human, never a silent edit.'
                     if self._active_is_first
                     else 'The artifacts from prior modules are already '
                     'implemented and FROZEN in your worktree — design '

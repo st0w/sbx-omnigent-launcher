@@ -5999,8 +5999,8 @@ class TestPerModule(_Base):
             sc.message_for_label('m1-plan'),
         )
         self.assertIn('FIRST module', m0)
-        self.assertNotIn('FROZEN', m0)
-        self.assertIn('FROZEN', m1)
+        self.assertNotIn('already implemented and FROZEN', m0)
+        self.assertIn('already implemented and FROZEN', m1)
 
     def test_first_module_builders_not_told_prior_work_exists(self) -> None:
         _, sc, _ = self._per_module()
@@ -6008,9 +6008,45 @@ class TestPerModule(_Base):
             sc.message_for_label('m0-tests'),
             sc.message_for_label('m1-tests'),
         )
-        self.assertIn('Nothing has been built yet', m0)
+        self.assertIn('FIRST increment', m0)
         self.assertNotIn('Earlier increments are already', m0)
         self.assertIn('Earlier increments are already', m1)
+
+    def test_no_role_is_told_the_repo_is_at_its_base_state(self) -> None:
+        # `_active_is_first` means "first row of THIS run", not "nothing
+        # has ever been built here". A per-module campaign runs against
+        # a repo whose earlier modules are merged and frozen: on
+        # `ingestion-m3-1` every m3a agent was told the tree was at base
+        # state while m0, m0b, m1 and m2 sat in it. The planner caught
+        # the contradiction and said so in its first line; the reviewers
+        # were handed it while vetting a module whose whole brief is
+        # "mirror the [m2] pattern".
+        #
+        # Nothing may assert the tree's contents from row position. The
+        # true statement — no EARLIER ROW of this run has been built —
+        # is what the first-row branch is for.
+        _, sc, _ = self._per_module()
+        for label in ('m0-plan', 'm0-tests', 'm1-plan', 'm1-tests'):
+            with self.subTest(label=label):
+                msg = sc.message_for_label(label)
+                self.assertNotIn('base state', msg)
+                self.assertNotIn('Nothing has been built yet', msg)
+
+    def test_the_first_row_still_scopes_itself_to_rows_not_the_tree(
+        self,
+    ) -> None:
+        # The regression the first-row branch exists to stop: telling
+        # row 0 that prior work is in its worktree sends it hunting for
+        # artifacts of rows that genuinely do not exist, and a careful
+        # agent then rightly refuses to build against a missing
+        # baseline. Keep that guarantee — bound to the ROWS, which the
+        # runner knows, not to the tree, which it does not.
+        _, sc, _ = self._per_module()
+        for label in ('m0-plan', 'm0-tests'):
+            with self.subTest(label=label):
+                msg = sc.message_for_label(label)
+                self.assertIn('FIRST', msg)
+                self.assertNotIn('already implemented and FROZEN', msg)
 
     def test_config_modules_not_overridden_by_planner_subtasks(self) -> None:
         # A per-module planner does NOT re-chunk: even if its output
