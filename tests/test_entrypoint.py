@@ -15,6 +15,7 @@ import unittest
 from typing import ClassVar
 from unittest import mock
 
+from sbx_omnigent._compat import load_agy_bridge
 from sbx_omnigent.entrypoint import (
     _BUILTIN_AGENT_DIRS_ENV,
     _NO_SWARM_AGENTS_ENV,
@@ -213,9 +214,13 @@ class TestAgyEnterprisePatch(unittest.TestCase):
                 _as_bool(bad, 'x')
 
     def test_patch_forces_enterprise_true(self) -> None:
-        from omnigent import (  # noqa: PLC0415
-            antigravity_native_bridge as bridge,
-        )
+        # Resolved through the shim, not a fixed module path: the
+        # bridge moved when Omnigent regrouped its top-level modules,
+        # and a test that names one path would only prove the patch
+        # works on one release.
+        bridge = load_agy_bridge()
+        if bridge is None:
+            self.skipTest('this Omnigent ships no agy bridge')
 
         state = bridge._AGY_ONBOARDING_COMPLETE_STATE
         original = state.get('enterpriseOnboardingComplete')
@@ -227,11 +232,20 @@ class TestAgyEnterprisePatch(unittest.TestCase):
             state['enterpriseOnboardingComplete'] = original
 
     def test_patch_no_op_when_bridge_missing(self) -> None:
-        # Simulate older Omnigent: import raises -> best-effort no-op.
-        with mock.patch.dict(
-            'sys.modules', {'omnigent.antigravity_native_bridge': None}
+        # An Omnigent with no agy bridge under ANY known path ->
+        # best-effort no-op rather than a failed startup.
+        with mock.patch(
+            'sbx_omnigent.entrypoint.load_agy_bridge', return_value=None
         ):
             install_agy_enterprise_onboarding_patch()  # must not raise
+
+    def test_patch_resolves_the_bridge_through_the_shim(self) -> None:
+        # Guard against a future edit hard-coding a module path again.
+        with mock.patch(
+            'sbx_omnigent.entrypoint.load_agy_bridge', return_value=None
+        ) as loader:
+            install_agy_enterprise_onboarding_patch()
+        loader.assert_called_once_with()
 
 
 if __name__ == '__main__':
@@ -295,4 +309,3 @@ class TestHostConfigReachesTheSandbox(unittest.TestCase):
                     }
                 },
             })
-

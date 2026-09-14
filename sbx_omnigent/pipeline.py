@@ -33,7 +33,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 import yaml
-from omnigent.model_override import model_family_mismatch
+
+from sbx_omnigent._compat import model_family_mismatch
 
 #: Shipped role prompt templates live here (Path-relative, like the
 #: packaged ``agents/`` bundles — works for the editable install).

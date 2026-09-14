@@ -38,6 +38,7 @@ from omnigent.server.managed_hosts import (
 )
 
 from sbx_omnigent import pipeline
+from sbx_omnigent._compat import load_agy_bridge
 from sbx_omnigent.launcher import (
     DEFAULT_EGRESS_ALLOW,
     DEFAULT_HOST_IMAGE,
@@ -244,14 +245,18 @@ def install_agy_enterprise_onboarding_patch() -> None:
     mirroring :func:`install_sbx_provider`), reflecting that the
     account's enterprise onboarding is genuinely already done.
 
-    Best-effort: a no-op if the agy bridge module or the seed constant
-    is absent (older Omnigent), so it never breaks startup.
+    Best-effort and increasingly redundant: Omnigent releases after
+    the subpackage regroup seed the marker themselves (the isolated
+    ``--gemini_dir`` seeder writes ``enterpriseOnboardingComplete:
+    true`` in its synthetic fallback, and prefers the real-home
+    marker this launcher already writes with the account's true
+    value). Flipping the constant there is harmless — nothing on the
+    live launch path reads it any more — so the call stays rather
+    than becoming a version check. A no-op when the bridge module or
+    the seed constant is absent, so it never breaks startup.
     """
-    try:
-        from omnigent import (  # noqa: PLC0415
-            antigravity_native_bridge as bridge,
-        )
-    except ImportError:
+    bridge = load_agy_bridge()
+    if bridge is None:
         return
     state = getattr(bridge, '_AGY_ONBOARDING_COMPLETE_STATE', None)
     if isinstance(state, dict):
