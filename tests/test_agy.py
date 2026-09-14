@@ -290,6 +290,28 @@ class TestSpawnHarvester(unittest.TestCase):
         self.assertTrue(seen['kwargs']['start_new_session'])
         self.assertTrue(log.exists())  # log created up front
 
+    def test_parent_does_not_keep_the_log_handle(self) -> None:
+        # The child is handed its OWN dup of the log fd while popen
+        # runs, so the parent's copy is dead weight the moment popen
+        # returns — and the harvester is spawned from a long-lived
+        # runner, so holding it leaks one fd per spawn (and surfaces
+        # as a ResourceWarning in this suite).
+        #
+        # Both halves are asserted on purpose: closing the handle
+        # BEFORE handing it over would satisfy "no leak" while giving
+        # the child a dead fd and sending the harvester's output
+        # nowhere.
+        seen = {}
+
+        def fake_popen(argv, **kwargs):
+            seen['stdout'] = kwargs['stdout']
+            seen['open_during_spawn'] = not kwargs['stdout'].closed
+            return 'proc'
+
+        spawn_harvester(log_path=self.root / 'h.log', popen=fake_popen)
+        self.assertTrue(seen['open_during_spawn'])
+        self.assertTrue(seen['stdout'].closed)
+
 
 class TestWaitForFreshSwap(unittest.TestCase):
     """The runner waits for the first refresh before provisioning."""
