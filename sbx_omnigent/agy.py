@@ -357,20 +357,28 @@ def spawn_harvester(
     — a harvester that inherits a live stdin is precisely what hangs the
     in-box poke (see the stdin note above).
 
+    The log handle is closed in THIS process once the child has been
+    spawned. ``popen`` gives the child its own dup of the descriptor
+    before it returns, so the parent's copy is dead weight from that
+    point — and the harvester is started from a long-lived runner, so
+    keeping it would leak one descriptor per spawn. Closing it does
+    not shorten the child's: the harvester keeps writing to the file
+    for its whole life.
+
     :param log_path: Output file; ``None`` uses :data:`HARVEST_LOG`.
     :param popen: Process launcher (injected in tests).
     :returns: The running child.
     """
     log = log_path or HARVEST_LOG
     log.parent.mkdir(parents=True, exist_ok=True)
-    handle = log.open('a', encoding='utf-8')
-    return popen(
-        [sys.executable, '-m', 'sbx_omnigent.agy', 'harvest'],
-        stdout=handle,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    with log.open('a', encoding='utf-8') as handle:
+        return popen(
+            [sys.executable, '-m', 'sbx_omnigent.agy', 'harvest'],
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
 
 def wait_for_fresh_swap(
