@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sbx_omnigent import agy
+from sbx_omnigent import _compat, agy
 
 
 class TestSeedBuilders(unittest.TestCase):
@@ -152,6 +152,39 @@ class TestSettingsAndBridge(unittest.TestCase):
         self.assertIn('_do_ent = True', patch)
         self.assertIn('_do_settings = True', patch)
         self.assertIn(agy.BRIDGE_PATCH_OK_MARKER, patch)
+
+    def test_bridge_patch_tries_every_known_bridge_path(self) -> None:
+        # The host image's Omnigent may sit on either side of the
+        # subpackage regroup, and the script runs INSIDE the VM where
+        # this process cannot probe which. So it tries them all.
+        patch = agy.build_bridge_patch_script(
+            enterprise=True, seed_settings=True
+        )
+        for module_path in _compat.AGY_BRIDGE_MODULES:
+            self.assertIn(module_path, patch)
+
+    def test_bridge_patch_module_list_is_not_a_second_copy(self) -> None:
+        # One source of truth: a future move edits _compat only.
+        patch = agy.build_bridge_patch_script(
+            enterprise=True, seed_settings=True
+        )
+        self.assertIn(repr(_compat.AGY_BRIDGE_MODULES), patch)
+
+    def test_bridge_patch_prefers_the_current_path(self) -> None:
+        patch = agy.build_bridge_patch_script(
+            enterprise=True, seed_settings=True
+        )
+        first, second = _compat.AGY_BRIDGE_MODULES[:2]
+        self.assertLess(patch.index(first), patch.index(second))
+
+    def test_bridge_patch_still_reports_a_skip_reason(self) -> None:
+        # A VM whose omnigent has no bridge at all must still print
+        # the marker — the launcher greps for it — and say why.
+        patch = agy.build_bridge_patch_script(
+            enterprise=True, seed_settings=True
+        )
+        self.assertIn("'skip'", patch)
+        self.assertIn('_why', patch)
 
     def test_bridge_patch_flags_reflect_args(self) -> None:
         patch = agy.build_bridge_patch_script(

@@ -9,6 +9,7 @@ Pure-logic coverage — no live ``sbx``: the mount-sentinel parser, the
 
 from __future__ import annotations
 
+import inspect
 import os
 import shutil
 import tempfile
@@ -20,6 +21,7 @@ from unittest import mock
 import click
 
 from sbx_omnigent import launcher as launcher_mod
+from sbx_omnigent._compat import repo_workspace
 from sbx_omnigent.launcher import _MOUNT_SENTINEL_PREFIX, SbxLauncher
 
 
@@ -526,6 +528,259 @@ class TestEgressScoping(unittest.TestCase):
                 repo_url=None,
             )
         ae.assert_called_once_with('box', 'http://host.docker.internal:6767')
+
+
+class TestStartHostRepoSequenceShape(unittest.TestCase):
+    """The ``repos=`` call shape newer Omnigent releases send.
+
+    Same routing decisions as the legacy per-field shape — these
+    tests exist so the two shapes cannot drift apart.
+    """
+
+    def setUp(self) -> None:
+        self.root = tempfile.mkdtemp(prefix='wt-root-')
+        self.swarm = os.path.join(self.root, 'swarm-a')
+        os.mkdir(self.swarm)
+        self.real = os.path.realpath(self.swarm)
+        self.launcher = SbxLauncher(worktree_root=self.root)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _run(self, **kwargs: object) -> str:
+        defaults: dict[str, object] = {
+            'token': 't',
+            'host_id': 'h',
+            'host_name': 'n',
+            'server_url': 'http://x:6767',
+        }
+        defaults.update(kwargs)
+        return self.launcher.start_host('box', **defaults)  # type: ignore[arg-type]
+
+    def test_sentinel_rw_mounts_worktree(self) -> None:
+        repo = repo_workspace(_sentinel(self.swarm), 'rw', 'swarm-a')
+        with (
+            mock.patch.object(self.launcher, '_create_sandbox') as cs,
+            mock.patch.object(self.launcher, '_launch_host') as lh,
+            mock.patch.object(self.launcher, '_seed_claude_settings'),
+        ):
+            ws = self._run(repos=(repo,))
+        cs.assert_called_once_with('box', [self.real])
+        lh.assert_called_once()
+        self.assertEqual(ws, self.real)
+
+    def test_sentinel_ro_adds_scratch_and_ro_suffix(self) -> None:
+        repo = repo_workspace(_sentinel(self.swarm), 'ro', 'swarm-a')
+        with (
+            mock.patch.object(self.launcher, '_create_sandbox') as cs,
+            mock.patch.object(self.launcher, '_launch_host'),
+            mock.patch.object(
+                self.launcher, '_make_scratch', return_value='/scratch'
+            ),
+            mock.patch.object(self.launcher, '_seed_claude_settings'),
+        ):
+            ws = self._run(repos=(repo,))
+        cs.assert_called_once_with('box', ['/scratch', f'{self.real}:ro'])
+        self.assertEqual(ws, self.real)
+
+    def test_non_sentinel_delegates(self) -> None:
+        repo = repo_workspace('git@github.com:org/repo.git', 'main', 'repo')
+        with (
+            mock.patch.object(self.launcher, '_create_sandbox') as cs,
+            mock.patch.object(
+                self.launcher, '_make_scratch', return_value='/scratch'
+            ),
+            mock.patch(
+                'sbx_omnigent.launcher.ExecModelHostLauncher.start_host',
+                return_value='/root/workspace/repo',
+            ) as base,
+        ):
+            ws = self._run(repos=(repo,))
+        cs.assert_called_once_with('box', ['/scratch'])
+        base.assert_called_once()
+        self.assertEqual(ws, '/root/workspace/repo')
+
+    def test_empty_sequence_is_an_empty_workspace(self) -> None:
+        with (
+            mock.patch.object(self.launcher, '_create_sandbox') as cs,
+            mock.patch.object(
+                self.launcher, '_make_scratch', return_value='/scratch'
+            ),
+            mock.patch(
+                'sbx_omnigent.launcher.ExecModelHostLauncher.start_host',
+                return_value='/root/workspace',
+            ),
+        ):
+            ws = self._run(repos=())
+        cs.assert_called_once_with('box', ['/scratch'])
+        self.assertEqual(ws, '/root/workspace')
+
+    def test_several_repos_refused_rather_than_silently_dropped(self) -> None:
+        # This launcher does not declare ``multi_repo``, so the server
+        # never sends more than one. A direct caller that does must
+        # hear about it: cloning the first and discarding the rest
+        # would hand the agent a workspace it cannot do the job in.
+        repos = (
+            repo_workspace('git@github.com:org/a.git', None, 'a'),
+            repo_workspace('git@github.com:org/b.git', None, 'b'),
+        )
+        with self.assertRaises(click.ClickException) as caught:
+            self._run(repos=repos)
+        self.assertIn('one repository', str(caught.exception))
+
+    def test_both_call_shapes_together_is_refused(self) -> None:
+        repo = repo_workspace('git@github.com:org/a.git', None, 'a')
+        with self.assertRaises(click.ClickException) as caught:
+            self._run(repos=(repo,), repo_url='git@github.com:org/b.git')
+        self.assertIn('not both', str(caught.exception))
+
+
+def _upstream_repos_start_host(
+    self: object,
+    sandbox_id: str,
+    *,
+    token: str,
+    host_id: str,
+    host_name: str,
+    server_url: str,
+    repos: object = (),
+    host_config: object = None,
+    on_stage: object = None,
+) -> str:
+    """Omnigent's post-multi-repo ``start_host``, transcribed.
+
+    Copied verbatim from ``ExecModelHostLauncher.start_host`` on
+    Omnigent main so the delegation can be BOUND against it here,
+    while the installed Omnigent still declares the older shape.
+    Binding is the thing that actually breaks on a mismatch, so it
+    is what the test asserts — not a mock that accepts anything.
+    """
+    return '/ws'
+
+
+class TestDelegationBindsToUpstreamSignature(unittest.TestCase):
+    """What we send upward must bind to the new base's parameters."""
+
+    def _sent(self, **kwargs: object) -> dict[str, object]:
+        launcher = SbxLauncher()
+        with (
+            mock.patch.object(launcher, '_create_sandbox'),
+            mock.patch.object(
+                launcher, '_make_scratch', return_value='/scratch'
+            ),
+            mock.patch(
+                'sbx_omnigent.launcher.base_start_host_takes_repos',
+                return_value=True,
+            ),
+            mock.patch(
+                'sbx_omnigent.launcher.ExecModelHostLauncher.start_host',
+                return_value='/ws',
+            ) as base,
+        ):
+            launcher.start_host(
+                'box',
+                token='t',
+                host_id='h',
+                host_name='n',
+                server_url='http://x:6767',
+                **kwargs,  # type: ignore[arg-type]
+            )
+        return dict(base.call_args.kwargs)
+
+    def _assert_binds(self, sent: dict[str, object]) -> None:
+        signature = inspect.signature(_upstream_repos_start_host)
+        # ``self`` and the positional sandbox id the real call carries.
+        signature.bind(object(), 'box', **sent)
+
+    def test_repos_caller_binds(self) -> None:
+        repo = repo_workspace('git@github.com:org/repo.git', 'main', 'repo')
+        self._assert_binds(self._sent(repos=(repo,)))
+
+    def test_legacy_caller_binds(self) -> None:
+        self._assert_binds(
+            self._sent(
+                repo_url='git@github.com:org/repo.git',
+                repo_branch='main',
+                repo_name='repo',
+            )
+        )
+
+    def test_empty_workspace_binds(self) -> None:
+        self._assert_binds(self._sent(repos=()))
+
+    def test_no_legacy_field_leaks_into_the_new_shape(self) -> None:
+        sent = self._sent(repo_url='git@github.com:org/repo.git')
+        for legacy in ('repo_url', 'repo_branch', 'repo_name'):
+            self.assertNotIn(legacy, sent)
+
+
+class TestBaseDelegationShape(unittest.TestCase):
+    """Delegation upward uses the shape the INSTALLED base declares."""
+
+    def setUp(self) -> None:
+        self.launcher = SbxLauncher()
+
+    def _delegate(self, *, takes_repos: bool, **kwargs: object) -> mock.Mock:
+        """Run the non-sentinel path and return the base-class mock."""
+        with (
+            mock.patch.object(self.launcher, '_create_sandbox'),
+            mock.patch.object(
+                self.launcher, '_make_scratch', return_value='/scratch'
+            ),
+            mock.patch(
+                'sbx_omnigent.launcher.base_start_host_takes_repos',
+                return_value=takes_repos,
+            ),
+            mock.patch(
+                'sbx_omnigent.launcher.ExecModelHostLauncher.start_host',
+                return_value='/ws',
+            ) as base,
+        ):
+            self.launcher.start_host(
+                'box',
+                token='t',
+                host_id='h',
+                host_name='n',
+                server_url='http://x:6767',
+                **kwargs,  # type: ignore[arg-type]
+            )
+        return base
+
+    def test_legacy_caller_reaches_a_repos_base(self) -> None:
+        base = self._delegate(
+            takes_repos=True,
+            repo_url='git@github.com:org/repo.git',
+            repo_branch='main',
+            repo_name='repo',
+        )
+        sent = base.call_args.kwargs
+        self.assertNotIn('repo_url', sent)
+        self.assertEqual(len(sent['repos']), 1)
+        self.assertEqual(sent['repos'][0].url, 'git@github.com:org/repo.git')
+        self.assertEqual(sent['repos'][0].branch, 'main')
+        self.assertEqual(sent['repos'][0].repo_name, 'repo')
+
+    def test_repos_caller_reaches_a_legacy_base(self) -> None:
+        repo = repo_workspace('git@github.com:org/repo.git', 'main', 'repo')
+        base = self._delegate(takes_repos=False, repos=(repo,))
+        sent = base.call_args.kwargs
+        self.assertNotIn('repos', sent)
+        self.assertEqual(sent['repo_url'], 'git@github.com:org/repo.git')
+        self.assertEqual(sent['repo_branch'], 'main')
+        self.assertEqual(sent['repo_name'], 'repo')
+
+    def test_repos_pass_through_untouched_to_a_repos_base(self) -> None:
+        repo = repo_workspace('git@github.com:org/repo.git', 'main', 'repo')
+        base = self._delegate(takes_repos=True, repos=(repo,))
+        self.assertIs(base.call_args.kwargs['repos'][0], repo)
+
+    def test_empty_workspace_reaches_a_repos_base_as_empty(self) -> None:
+        base = self._delegate(takes_repos=True, repo_url=None)
+        self.assertEqual(tuple(base.call_args.kwargs['repos']), ())
+
+    def test_empty_workspace_reaches_a_legacy_base_as_none(self) -> None:
+        base = self._delegate(takes_repos=False, repos=())
+        self.assertIsNone(base.call_args.kwargs['repo_url'])
 
 
 if __name__ == '__main__':

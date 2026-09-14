@@ -42,9 +42,15 @@ from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 from sbx_omnigent import agy, claude, codex
 from sbx_omnigent import swarm as swarm_mod
+from sbx_omnigent._compat import (
+    base_start_host_takes_repos,
+    repo_workspace,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
+
+    from sbx_omnigent._compat import RepoWorkspaceLike
 
 _logger = logging.getLogger(__name__)
 
@@ -180,6 +186,100 @@ DEFAULT_EGRESS_ALLOW: tuple[str, ...] = (
     # disclosed, not their integrity.
     'deb.debian.org:80',
 )
+
+
+def _normalize_repo_request(
+    repos: Sequence[RepoWorkspaceLike],
+    repo_url: str | None,
+    repo_branch: str | None,
+    repo_name: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    """
+    Collapse either ``start_host`` call shape to one repository.
+
+    Omnigent replaced ``start_host``'s ``repo_url`` / ``repo_branch``
+    / ``repo_name`` keywords with a single ``repos`` sequence. Both
+    are accepted so one launcher build serves either release; the
+    whole of :meth:`SbxLauncher.start_host` below sees only the
+    triple, and the mount sentinel is found through either shape.
+
+    :param repos: The multi-repo sequence, empty when unused.
+    :param repo_url: Legacy workspace — the mount sentinel, a clone
+        URL, or ``None`` for an empty workspace.
+    :param repo_branch: Legacy branch, or the sentinel's mode.
+    :param repo_name: Legacy clone directory name.
+    :returns: ``(url, branch, name)``, each ``None`` for an empty
+        workspace.
+    :raises click.ClickException: If both shapes are supplied at
+        once, or if more than one repository is requested.
+    """
+    if repos and repo_url is not None:
+        raise click.ClickException(
+            'start_host takes either `repos` or `repo_url`, not both — '
+            'this launcher accepts each shape so it can serve Omnigent '
+            'releases on both sides of the multi-repo change, but a '
+            'caller sending both leaves it no way to know which wins.'
+        )
+    if len(repos) > 1:
+        # Refused, never truncated: this provider does not declare the
+        # `multi_repo` capability, so the server rejects a multi-repo
+        # request before it reaches here. A direct caller that gets
+        # past that must hear about it — cloning the first repo and
+        # dropping the rest hands the agent a workspace it cannot do
+        # the job in, and nothing downstream would report why.
+        raise click.ClickException(
+            f'the sbx provider clones one repository per session, got '
+            f'{len(repos)}. It does not declare the `multi_repo` '
+            f'capability, so the server should never ask for more.'
+        )
+    if repos:
+        only = repos[0]
+        return only.url, only.branch, only.repo_name
+    return repo_url, repo_branch, repo_name
+
+
+def _base_repo_kwargs(
+    repos: Sequence[RepoWorkspaceLike],
+    repo_url: str | None,
+    repo_branch: str | None,
+    repo_name: str | None,
+) -> dict[str, object]:
+    """
+    Build the repository arguments the INSTALLED base class takes.
+
+    The delegated (clone-in-VM) path calls up into Omnigent's own
+    bootstrap, so it must pass the shape that Omnigent's
+    ``start_host`` actually declares — which differs across the
+    multi-repo change. Probed, not assumed: see
+    :func:`~sbx_omnigent._compat.base_start_host_takes_repos`.
+
+    :param repos: The sequence as received, empty when the caller
+        used the legacy keywords.
+    :param repo_url: Normalized clone URL, or ``None``.
+    :param repo_branch: Normalized branch, or ``None``.
+    :param repo_name: Normalized clone directory name, or ``None``.
+    :returns: Keyword arguments to splat into ``super().start_host``.
+    """
+    if not base_start_host_takes_repos():
+        return {
+            'repo_url': repo_url,
+            'repo_branch': repo_branch,
+            'repo_name': repo_name,
+        }
+    if repos:
+        # Pass the caller's own records up untouched — the common
+        # case on a current Omnigent, and nothing here improves them.
+        return {'repos': repos}
+    if repo_url is None:
+        return {'repos': ()}
+    # A legacy caller met a current base. Omnigent derives the clone
+    # directory from the URL's last segment; mirror that rather than
+    # letting a `None` reach the base and clone into a path named
+    # after it.
+    name = repo_name or repo_url.rstrip('/').rsplit('/', 1)[-1].removesuffix(
+        '.git'
+    )
+    return {'repos': (repo_workspace(repo_url, repo_branch, name),)}
 
 
 def _retain_host_process(proc: subprocess.Popen) -> None:
@@ -423,6 +523,7 @@ class SbxLauncher(ExecModelHostLauncher):
         host_id: str,
         host_name: str,
         server_url: str,
+        repos: Sequence[RepoWorkspaceLike] = (),
         repo_url: str | None = None,
         repo_branch: str | None = None,
         repo_name: str | None = None,
@@ -449,11 +550,24 @@ class SbxLauncher(ExecModelHostLauncher):
         exactly as before (the box is now created here rather than in
         :meth:`provision`, which is transparent to them).
 
+        Two call shapes are accepted, because Omnigent changed this
+        signature: newer releases pass ``repos`` (a sequence of
+        repository records), older ones the ``repo_url`` /
+        ``repo_branch`` / ``repo_name`` triple. They are collapsed to
+        one repository by :func:`_normalize_repo_request` before any
+        routing decision, so the sentinel is found through either,
+        and the delegated path calls up in whichever shape the
+        installed base declares.
+
         :param sandbox_id: The id reserved by :meth:`provision`.
         :param token: Launch token the host authenticates with.
         :param host_id: Server-chosen host identity.
         :param host_name: Server-chosen host display name.
         :param server_url: URL the host dials back to.
+        :param repos: Repositories to materialize, newer Omnigent's
+            shape. At most one (this provider does not declare
+            ``multi_repo``); empty for an empty workspace. Mutually
+            exclusive with *repo_url*.
         :param repo_url: The session workspace as surfaced by
             ``parse_repo_workspace`` — the mount sentinel triggers the
             bind-mount path; anything else is delegated upstream.
@@ -468,8 +582,12 @@ class SbxLauncher(ExecModelHostLauncher):
         :returns: The in-sandbox workspace path — the mounted worktree
             for a sentinel, else whatever the base bootstrap returns.
         :raises click.ClickException: On a bad sentinel, a mount path
-            outside ``worktree_root``, or a failed sandbox command.
+            outside ``worktree_root``, a failed sandbox command, or
+            both call shapes supplied at once.
         """
+        repo_url, repo_branch, repo_name = _normalize_repo_request(
+            repos, repo_url, repo_branch, repo_name
+        )
         if repo_url is None or not repo_url.startswith(_MOUNT_SENTINEL_PREFIX):
             # Non-sentinel: materialize the box with a throwaway scratch
             # mount (what provision used to do), then run the inherited
@@ -486,11 +604,11 @@ class SbxLauncher(ExecModelHostLauncher):
                 host_id=host_id,
                 host_name=host_name,
                 server_url=server_url,
-                repo_url=repo_url,
-                repo_branch=repo_branch,
-                repo_name=repo_name,
                 host_config=host_config,
                 on_stage=on_stage,
+                **_base_repo_kwargs(  # type: ignore[arg-type]
+                    repos, repo_url, repo_branch, repo_name
+                ),
             )
 
         path, mode, credential = self._parse_mount_sentinel(

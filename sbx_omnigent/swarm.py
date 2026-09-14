@@ -33,9 +33,9 @@ from pathlib import Path
 
 import click
 import yaml
-from omnigent.reasoning_effort import CODEX_EFFORTS
 
 from sbx_omnigent import agy, codex
+from sbx_omnigent._compat import CODEX_EFFORTS
 from sbx_omnigent.swarm_session import (
     SwarmSessionClient,
     SwarmSessionError,
@@ -1024,9 +1024,9 @@ def _launch_args_for(
 
     Codex additionally carries its reasoning effort here, because that
     is the only channel that reaches it — see
-    :data:`_CODEX_EFFORT_CONFIG_KEY`. An effort outside codex\'s own
-    ladder is DROPPED rather than passed: the value is interpolated into
-    a ``-c key=value`` config expression, so an unvalidated one
+    :data:`_CODEX_EFFORT_CONFIG_KEY`. An effort outside codex's own
+    ladder is DROPPED rather than passed: the value is interpolated
+    into a ``-c key=value`` config expression, so an unvalidated one
     would reach the CLI as config syntax. Claude and agy ignore
     *effort* here — Claude gets ``--effort`` from Omnigent\'s own
     launch path (verified: the session transcript records
