@@ -13,20 +13,53 @@ three separate days:
 
 ## Known-good set
 
-Recorded from a live microVM on **2026-08-19**, image
-`ghcr.io/omnigent-ai/omnigent-host:dev-adcf83cc`:
+Recorded from a fresh microVM on **2026-09-14**, image
+`ghcr.io/omnigent-ai/omnigent-host:v0.13.0`, read immediately after creation —
+before any in-VM self-update could run:
 
 | CLI | Version |
 | --- | --- |
-| `@anthropic-ai/claude-code` | 2.1.235 |
-| `@openai/codex` | 0.148.0 |
-| `agy` (Antigravity CLI) | 1.1.15 |
+| `@anthropic-ai/claude-code` | 2.1.266 |
+| `@openai/codex` | 0.153.4 |
+| `agy` (Antigravity CLI) | 1.1.16 |
+
+Models confirmed on that image — one real turn each, with the launcher's launch
+read-back reporting no mismatch against the pane:
+
+| Harness | Model | Effort | Pane showed |
+| --- | --- | --- | --- |
+| `claude-native` | `claude-fable-5-1` | `xhigh` | `Fable 5.1 with xhigh effort` |
+| `codex-native` | `gpt-6-astra` | `xhigh` | `model: gpt-6-astra xhigh` |
 
 Read the set out of any running agent VM with:
 
 ```bash
-sbx exec <sandbox> -- sh -lc 'claude --version; codex --version; agy --version'
+sbx exec <sandbox> -- sh -lc '{ claude --version; codex --version; agy --version; } 2>/dev/null'
 ```
+
+The `2>/dev/null` is not tidiness: codex prints a Node
+`[UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental` line on stderr, and
+without the redirect it lands where the version line should be.
+
+### Read it from a guest, never from the host
+
+The workstation's CLIs are not the guest's, and the difference is not cosmetic.
+On 2026-09-14 the host had codex **0.148.0** while the v0.13.0 guest had
+**0.153.4** — and only the guest's codex knew `gpt-6-astra`. Asking the host
+reported a model as unavailable that every agent VM could run. That includes the
+server's `/v1/hosts/<host-id>/harnesses/<harness>/model-options`, which proxies to
+whichever host it names: point it at the workstation and it answers for the
+workstation.
+
+### Previous sets
+
+Add a row whenever the image changes; never overwrite one. The difference between
+rows is what a run that wedges right after an upgrade gets compared against.
+
+| Recorded | Image | claude | codex | agy |
+| --- | --- | --- | --- | --- |
+| 2026-09-14 | `omnigent-host:v0.13.0` | 2.1.266 | 0.153.4 | 1.1.16 |
+| 2026-08-19 | `omnigent-host:dev-adcf83cc` (local build) | 2.1.235 | 0.148.0 | 1.1.15 |
 
 ## Pinning the image is necessary but NOT sufficient
 
