@@ -1475,6 +1475,90 @@ def parse_dispositions(text: str | None) -> dict[int, Disposition]:
     return out
 
 
+#: The verifier's conclusions about BLOCKING claims, under a header of
+#: their own so they cannot be confused with the numbered non-blocking
+#: list above. `BLOCKING-` prefixes the word, so
+#: :data:`_DISPOSITIONS_HEADER_RE` (anchored at line start) never
+#: matches this line and each block stops cleanly at the other's header.
+_BLOCKING_DISPOSITIONS_HEADER_RE = re.compile(
+    r'^[ \t]*#{0,6}[ \t]*\*{0,2}[ \t]*'
+    r'BLOCKING-DISPOSITIONS[ \t]*:?[ \t]*\*{0,2}[ \t]*$',
+    re.MULTILINE | re.IGNORECASE,
+)
+
+#: ``- B1.2: absent — the winner coerces the timestamp``. Two numbers,
+#: because a blocking report is prose: the verifier numbers the REPORT
+#: it was given and each CLAIM it found inside it, so an id stays stable
+#: without asking a reviewer to adopt a marker it has never used. The
+#: ``B`` is optional — the header already says which block this is.
+_BLOCKING_ITEM_RE = re.compile(
+    r'^[ \t]*(?:[-*•]|\d+[.)])?[ \t]*'
+    r'B?(?P<report>\d+)[ \t]*\.[ \t]*(?P<claim>\d+)[ \t]*[:.)][ \t]*'
+    r'(?P<phrase>.+)$'
+)
+
+
+def parse_blocking_dispositions(
+    text: str | None,
+) -> dict[tuple[int, int], Disposition]:
+    """
+    Parse a verifier's ``BLOCKING-DISPOSITIONS:`` block.
+
+    Same protocol as :func:`parse_dispositions` — last header wins, the
+    first non-item line ends the block, an unreadable verdict is skipped
+    rather than guessed at — but keyed by ``(report, claim)`` because
+    the verifier enumerates the claims itself.
+
+    Fails CLOSED, unlike its non-blocking sibling: a claim with no
+    conclusion is not filed. A blocking finding was relayed to the
+    writer and usually fixed, so filing every unconcluded one would
+    bury the tracker in issues that are already closed. The caller
+    surfaces the gap instead (see
+    :meth:`PipelineRunner._file_blocking_summary`).
+
+    :param text: The verifier's reply.
+    :returns: ``(report, claim)`` to conclusion; missing keys mean the
+        verifier said nothing about that claim.
+    """
+    out: dict[tuple[int, int], Disposition] = {}
+    if not text:
+        return out
+    matches = list(_BLOCKING_DISPOSITIONS_HEADER_RE.finditer(text))
+    if not matches:
+        return out
+    for line in text[matches[-1].end():].splitlines():
+        if not line.strip():
+            continue
+        item = _BLOCKING_ITEM_RE.match(line)
+        if item is None:
+            break
+        found = _verdict_in(item.group('phrase'))
+        if found is None:
+            continue
+        verdict, reason = found
+        key = (int(item.group('report')), int(item.group('claim')))
+        out[key] = Disposition(verdict=verdict, reason=reason)
+    return out
+
+
+def report_names_nothing(text: str | None) -> bool:
+    """
+    Whether a BLOCKING reply carries no finding anyone could act on.
+
+    A verdict line and nothing else is the one review a writer cannot
+    answer and a verifier cannot check. It used to be recorded exactly
+    as a good block: a verdict, and empty lists beside it.
+
+    :param text: The reviewer's reply.
+    :returns: ``True`` when nothing but the verdict survives.
+    """
+    body = _VERDICT_RE.sub('', text or '')
+    # Markdown scaffolding is not content: a lone "### Blocking
+    # findings" heading over an empty section names nothing either.
+    stripped = re.sub(r'[#*_`\-\u2014\u2013:\s]+', ' ', body)
+    return len(stripped.strip()) < 40
+
+
 def _strings(value: object) -> tuple[str, ...]:
     """
     The string items of a persisted list, dropping anything else.
@@ -1735,6 +1819,17 @@ class ReviewRecord:
     #: The writer node this vote was cast against. Two candidates are
     #: reviewed per chunk, so a finding is meaningless without it.
     target: str | None = None
+    #: The report behind a BLOCKING verdict, verbatim. Empty for an
+    #: approval, whose observations are already sorted into the three
+    #: sections above.
+    #:
+    #: Blocking findings have no marker — a reviewer writes prose under
+    #: a heading — so there is nothing to lift into a list. Keeping the
+    #: report whole is what lets triage read it later; the alternative
+    #: was a new required marker, which is the channel #15 showed to be
+    #: lossy. Additive with an empty default, so state written before
+    #: it restores as "no report" and RUN_STATE_VERSION does not move.
+    blocking_report: str = ''
 
     def filed_findings(self) -> list[tuple[int, str]]:
         """
@@ -1792,6 +1887,7 @@ class ReviewRecord:
             'later_increment': list(self.later_increment),
             'premises': list(self.premises),
             'target': self.target,
+            'blocking_report': self.blocking_report,
         }
 
     @classmethod
@@ -1832,6 +1928,11 @@ class ReviewRecord:
             later_increment=_strings(raw.get('later_increment')),
             premises=_strings(raw.get('premises')),
             target=target if isinstance(target, str) else None,
+            blocking_report=(
+                raw['blocking_report']
+                if isinstance(raw.get('blocking_report'), str)
+                else ''
+            ),
         )
 
 
@@ -1979,6 +2080,31 @@ def finding_id(rec: ReviewRecord, index: int) -> str:
     )
 
 
+def _blocking_id_prefix(rec: ReviewRecord) -> str:
+    """The id every blocking claim from one vote shares."""
+    return (
+        f'{rec.chunk or "-"}/{rec.target or "-"}/'
+        f'{rec.reviewer}/r{rec.round_no}#B'
+    )
+
+
+def blocking_finding_id(rec: ReviewRecord, claim: int) -> str:
+    """
+    A stable, positional id for one BLOCKING claim.
+
+    Shaped like :func:`finding_id` and deliberately distinct from it:
+    the ``B`` says this came from a verdict that stopped a branch, so
+    the two can never collide in the tracker even though both are
+    positional within the same vote.
+
+    :param rec: The vote the claim was blocked on.
+    :param claim: 1-based position within that report, as the verifier
+        enumerated it.
+    :returns: e.g. ``m3b/m3b-impl-a/bugs/r1#B2``.
+    """
+    return f'{_blocking_id_prefix(rec)}{claim}'
+
+
 #: Label applied to every filed finding, so triage state can live on
 #: the issue rather than in a `Status:` line somebody has to parse. A
 #: repo without it makes `gh` refuse the whole call, so
@@ -2066,6 +2192,58 @@ def render_finding_issue(
         'archived and never read again. Triage it as you would any '
         'other issue; closing it is how the pipeline learns not to '
         'raise it again.',
+        '',
+        finding_marker(ident),
+    ]
+    return f'{where}{head}', '\n'.join(body)
+
+
+def render_blocking_issue(
+    rec: ReviewRecord,
+    claim: str,
+    ident: str,
+    *,
+    run_id: str,
+    report_doc: str | None = None,
+) -> tuple[str, str]:
+    """
+    One surviving BLOCKING claim as a GitHub issue.
+
+    The claim is the VERIFIER's sentence, not the reviewer's paragraph:
+    a blocking report is prose, and the verifier is what turned it into
+    one checkable statement about the code that shipped.
+
+    :param rec: The vote it was blocked on.
+    :param claim: The claim, as the verifier restated it.
+    :param ident: Its positional id, from :func:`blocking_finding_id`.
+    :param run_id: The campaign that raised it.
+    :param report_doc: Repo path of the full reviewer report.
+    :returns: ``(title, body)``.
+    """
+    head = _issue_title_text(claim)
+    where = f'[{rec.chunk}] ' if rec.chunk else ''
+    raised = f'`{rec.target}`' if rec.target else 'an unknown candidate'
+    body = [
+        claim.strip(),
+        '',
+        '---',
+        '',
+        f'**Raised as BLOCKING** against {raised} by `{rec.reviewer}`, '
+        f'review round {rec.round_no}.',
+        '**Still present:** a verification pass read that report '
+        'against the code that shipped and concluded this claim still '
+        'reproduces.',
+    ]
+    if report_doc:
+        body.append(f'**Full report:** `{report_doc}`')
+    body += [
+        f'**Campaign:** `{run_id}`',
+        '',
+        'A blocking finding is normally closed by the writer it '
+        'blocked. This one is filed because the shipping code still '
+        'has it — which is what happens when the defect was fixed on '
+        'the candidate that was blocked and the judge selected its '
+        'competitor.',
         '',
         finding_marker(ident),
     ]
@@ -2743,6 +2921,11 @@ class PipelineRunner:
         #: means "no conclusion", which files the finding — the gate's
         #: fail-open rule lives in that absence rather than in a flag.
         self._dispositions: dict[str, Disposition] = {}
+        #: Blocking-claim id -> the claim as the verifier restated it.
+        #: Held beside the dispositions because a blocking claim has no
+        #: text of its own anywhere else: the reviewer wrote a report,
+        #: and the verifier is what turns it into one sentence.
+        self._blocking_claims: dict[str, str] = {}
         #: Node ids pre-warmed during planning — disposed at campaign
         #: start (their un-namespaced VMs are replaced per chunk).
         self._prewarmed: set[str] = set()
@@ -3032,6 +3215,14 @@ class PipelineRunner:
             for ident, raw in (state.get('dispositions') or {}).items()
             if isinstance(raw, dict)
         }
+        # Absent before blocking claims were verified. Empty restores
+        # the old behaviour — no blocking claim files — so
+        # RUN_STATE_VERSION stays put.
+        self._blocking_claims = {
+            ident: text
+            for ident, text in (state.get('blocking_claims') or {}).items()
+            if isinstance(ident, str) and isinstance(text, str)
+        }
         self._reviews = [
             rec
             for rec in (
@@ -3182,6 +3373,7 @@ class PipelineRunner:
                 ident: {'verdict': d.verdict, 'reason': d.reason}
                 for ident, d in self._dispositions.items()
             },
+            'blocking_claims': dict(self._blocking_claims),
             'completed_chunks': sorted(self._completed_chunks),
             # Which writers already cleared a review gate IN THIS RUN.
             # Held in memory it was lost on --resume, and the judge was
@@ -4115,6 +4307,18 @@ class PipelineRunner:
         except PipelineRunError:
             target = None
         sections = FindingSections.of(fallback)
+        # A blocking report is kept WHOLE. Its findings are prose under
+        # whatever heading the reviewer chose, so there is no list to
+        # lift — and the three sections above are explicitly the
+        # non-blocking ones, which left the record of a block empty.
+        blocking_report = fallback.strip() if verdict == 'BLOCKING' else ''
+        if blocking_report and report_names_nothing(blocking_report):
+            click.echo(
+                f'[review] {stage_id}-{reviewer}: BLOCKING, but the '
+                f'report named nothing — no finding, file or line for '
+                f'the writer to address or a verifier to check. Its '
+                f'reply is in the run directory.'
+            )
         record = ReviewRecord(
             chunk=self._active_subtask.id if self._active_subtask else None,
             stage=stage_id,
@@ -4127,6 +4331,7 @@ class PipelineRunner:
             later_increment=sections.later_increment,
             premises=sections.premises,
             target=target,
+            blocking_report=blocking_report,
         )
         # Reviewers of a stage vote concurrently, and the round
         # number below is derived by WALKING this list.
@@ -4811,11 +5016,14 @@ class PipelineRunner:
         :param report_doc: Repo path of the full reviewer reports.
         """
         records = [r for r in self._chunk_reviews() if r.findings]
-        if not records:
-            return
         if self._config.publish.mode == 'pr' and self._publish_repo:
-            self._file_findings_as_issues(records, report_doc)
-        else:
+            if records:
+                self._file_findings_as_issues(records, report_doc)
+            # Separately: a record can carry blocking claims and no
+            # non-blocking findings at all, which is exactly the vote
+            # that stopped a branch.
+            self._file_blocking_findings(report_doc)
+        elif records:
             self._commit_findings_ledger(winner, report_doc)
 
     def _file_findings_as_issues(
@@ -4923,7 +5131,7 @@ class PipelineRunner:
             f'{count} {name}' for name, count in sorted(by_verdict.items())
         )
         lines = [
-            f'A verification pass read {len(withheld)} non-blocking '
+            f'A verification pass read {len(withheld)} reviewer '
             f'finding(s) against the code that shipped for `{chunk}` and '
             f'concluded each needed no issue of its own: {tally}.',
             '',
@@ -4964,6 +5172,159 @@ class PipelineRunner:
         click.echo(
             f'[findings] withheld {len(withheld)} finding(s) — {tally}; '
             f'summarised in one issue with the reason for each.'
+        )
+
+    def _file_blocking_findings(self, report_doc: str | None) -> None:
+        """
+        File the blocking claims that survive against shipping code.
+
+        A blocking finding is routed nowhere today: the pipeline
+        assumes the loop-back fix turn closed it, which is true of the
+        branch that was blocked and false for its competitor. When the
+        judge selects the competitor, a defect a reviewer reproduced
+        ships and reaches no tracker.
+
+        Three outcomes, and each is visible:
+
+        - ``reproduces`` — filed, with the same dedup marker and
+          positional id every finding carries.
+        - any other verdict — collected into the existing withheld
+          summary, with the verifier's reason.
+        - a report the verifier concluded nothing about — named in one
+          summary issue, because a blocking finding is usually already
+          fixed and filing each one would bury the tracker.
+
+        :param report_doc: Repo path of the full reviewer reports.
+        """
+        if not self._publish_repo:
+            return
+        reports = self._pending_blocking_reports()
+        if not reports:
+            return
+        seen = self._wt.issue_bodies_text(self._publish_repo)
+        if seen is None:
+            click.echo(
+                '[findings] could not read the issue tracker; filing no '
+                'blocking claims rather than risking duplicates. They '
+                'are in the reviewer report on the branch.'
+            )
+            return
+        to_file, withheld, unconcluded = self._sort_blocking_claims(
+            reports, seen
+        )
+        for rec, ident, claim in to_file:
+            title, body = render_blocking_issue(
+                rec, claim, ident,
+                run_id=self._run_id, report_doc=report_doc,
+            )
+            url = self._wt.create_issue(
+                self._publish_repo, title=title, body=body,
+                label=_FINDING_LABEL,
+            )
+            if url:
+                self._filed_findings.append((url, title))
+        if withheld:
+            self._file_triage_summary(withheld, report_doc)
+        if unconcluded:
+            self._file_blocking_summary(unconcluded, report_doc)
+        if to_file:
+            click.echo(
+                f'[findings] filed {len(to_file)} blocking claim(s) that '
+                f'still reproduce against the code that shipped.'
+            )
+
+    def _sort_blocking_claims(
+        self, reports: list[tuple[ReviewRecord, str]], seen: str
+    ) -> tuple[
+        list[tuple[ReviewRecord, str, str]],
+        list[tuple[ReviewRecord, str, str, Disposition]],
+        list[ReviewRecord],
+    ]:
+        """
+        Sort verified blocking claims by what happens to each.
+
+        :param reports: ``(record, report)`` for each BLOCKING vote.
+        :param seen: Every issue body already in the tracker.
+        :returns: ``(to_file, withheld, unconcluded)`` — claims that
+            still reproduce, claims a verdict kept out with its reason,
+            and the votes whose report got no conclusion at all.
+        """
+        to_file: list[tuple[ReviewRecord, str, str]] = []
+        withheld: list[tuple[ReviewRecord, str, str, Disposition]] = []
+        unconcluded: list[ReviewRecord] = []
+        for rec, _text in reports:
+            claims = self._blocking_claims_for(rec)
+            if not claims:
+                unconcluded.append(rec)
+                continue
+            for ident, claim in claims:
+                verdict = self._dispositions.get(ident)
+                # Already filed, or recorded with no verdict at all:
+                # neither files, and neither is news to anyone.
+                if verdict is None or finding_marker(ident) in seen:
+                    continue
+                if verdict.files:
+                    to_file.append((rec, ident, claim))
+                else:
+                    withheld.append((rec, ident, claim, verdict))
+        return to_file, withheld, unconcluded
+
+    def _file_blocking_summary(
+        self, unconcluded: list[ReviewRecord], report_doc: str | None
+    ) -> None:
+        """
+        One issue naming every blocking report nobody concluded on.
+
+        The gap this closes is a silent one: without it, a verifier
+        that skipped a report leaves exactly the same trace as one that
+        checked it and found nothing.
+
+        :param unconcluded: The votes whose reports got no conclusion.
+        :param report_doc: Repo path of the full reviewer reports.
+        """
+        assert self._publish_repo is not None
+        chunk = unconcluded[0].chunk or self._run_id
+        lines = [
+            f'{len(unconcluded)} reviewer(s) BLOCKED a candidate in '
+            f'`{chunk}`, and the verification pass reached no '
+            f'conclusion about their reports against the code that '
+            f'shipped.',
+            '',
+            'A blocking finding is relayed to the writer it blocked and '
+            'is usually fixed there, so this is not evidence of a '
+            'defect. It is the one case the pipeline cannot tell apart '
+            'from a fix that never happened — including a fix that '
+            'landed on one candidate while the judge selected the '
+            'other.',
+            '',
+        ]
+        for rec in unconcluded:
+            lines.append(
+                f'- `{rec.reviewer}` blocked `{rec.target or chunk}` in '
+                f'round {rec.round_no} (ids `{_blocking_id_prefix(rec)}*`)'
+            )
+        lines.append('')
+        if report_doc:
+            lines.append(
+                f'The reports themselves are in `{report_doc}`, with '
+                f'every finding whether filed or not.'
+            )
+        url = self._wt.create_issue(
+            self._publish_repo,
+            title=(
+                f'[{chunk}] {len(unconcluded)} blocking report(s) '
+                f'reached no conclusion'
+            ),
+            body='\n'.join(lines),
+            label=_FINDING_LABEL,
+        )
+        if url:
+            self._filed_findings.append(
+                (url, f'[{chunk}] blocking reports summary')
+            )
+        click.echo(
+            f'[findings] {len(unconcluded)} blocking report(s) were not '
+            f'concluded on; summarised in one issue.'
         )
 
     def _commit_findings_ledger(
@@ -5468,7 +5829,9 @@ class PipelineRunner:
     # ── node executors ────────────────────────────────────────────
 
     def _verify_instruction(
-        self, pending: list[tuple[ReviewRecord, int, str]]
+        self,
+        pending: list[tuple[ReviewRecord, int, str]],
+        reports: list[tuple[ReviewRecord, str]] | None = None,
     ) -> str:
         """
         Ask for a conclusion on each raised finding, against the tree.
@@ -5478,8 +5841,30 @@ class PipelineRunner:
         transcription task with a silent failure mode — a mistyped id
         re-files the finding it was meant to close.
 
+        Blocking reports are asked about in the same turn, under their
+        own header. They arrive as prose rather than a list, so the
+        verifier enumerates the claims itself instead of a reviewer
+        hitting a marker exactly.
+
         :param pending: ``(record, index, text)`` in presentation order.
+        :param reports: ``(record, report)`` for each BLOCKING vote.
         :returns: The turn's instruction.
+        """
+        parts: list[str] = []
+        if pending:
+            parts.append(self._findings_block(pending))
+        if reports:
+            parts.append(self._blocking_block(reports))
+        return '\n\n'.join(parts)
+
+    def _findings_block(
+        self, pending: list[tuple[ReviewRecord, int, str]]
+    ) -> str:
+        """
+        The numbered non-blocking findings and their answer format.
+
+        :param pending: ``(record, index, text)`` in presentation order.
+        :returns: One section of the verifier's turn.
         """
         listing = '\n'.join(
             f'{position}. [raised by {rec.reviewer} in round '
@@ -5523,6 +5908,47 @@ class PipelineRunner:
             'entirely and it is filed, which is the same safe outcome.'
         )
 
+    def _blocking_block(
+        self, reports: list[tuple[ReviewRecord, str]]
+    ) -> str:
+        """
+        The blocking reports and the per-claim answer format.
+
+        :param reports: ``(record, report)`` in presentation order.
+        :returns: One section of the verifier's turn.
+        """
+        listing = '\n\n'.join(
+            f'Report {position} — `{rec.reviewer}` blocked '
+            f'`{rec.target or "this module"}` in round {rec.round_no}:\n\n'
+            f'{text.strip()}'
+            for position, (rec, text) in enumerate(reports, start=1)
+        )
+        return (
+            'Separately: these reviewers BLOCKED a candidate in this '
+            'module. Each report was relayed to the writer it blocked, '
+            'and that writer usually fixed it — but its COMPETITOR was '
+            'never told, and the judge may well have selected the '
+            'competitor. So every claim below is an open question '
+            'about the code in your mount, whichever branch it was '
+            'first raised against.\n\n'
+            f'{listing}\n\n'
+            'Read each report, and for EVERY distinct claim it makes, '
+            'add one line to a `BLOCKING-DISPOSITIONS:` block at the '
+            'end of your reply:\n\n'
+            '`- B<report>.<claim>: <verdict> — <the claim in one '
+            'sentence>, and what you checked`\n\n'
+            'Number the claims yourself, in the order the report makes '
+            'them: `B1.1`, `B1.2`, then `B2.1`. Use the same five '
+            'verdicts as above, against THE CODE IN YOUR MOUNT.\n\n'
+            'Only `reproduces` is filed, and the sentence you write '
+            'becomes the issue somebody reads — so state the defect '
+            'itself, with the file and line, rather than pointing back '
+            'at the report. `absent` is the ordinary outcome for a '
+            'claim the writer fixed, and saying so costs nothing. A '
+            'claim you say nothing about is NOT filed, so a report you '
+            'skip is a defect nobody sees again.'
+        )
+
     def _pending_findings(self) -> list[tuple[ReviewRecord, int, str]]:
         """
         What this chunk's reviewers raised that would be filed.
@@ -5538,6 +5964,51 @@ class PipelineRunner:
             for rec in self._chunk_reviews()
             for index, text in rec.filed_findings()
         ]
+
+    def _pending_blocking_reports(
+        self,
+    ) -> list[tuple[ReviewRecord, str]]:
+        """
+        The reports behind this chunk's BLOCKING votes.
+
+        EVERY candidate, not only the one that lost. A blocking finding
+        is assumed closed by the loop-back fix turn, which is true of
+        the branch that was blocked and says nothing about its sibling —
+        and the winner's own earlier blocks are worth re-checking too,
+        because a fix turn that made the symptom go away rather than
+        the cause looks identical from here.
+
+        A report that named nothing is left out: there is no claim in
+        it for a verifier to check, and it was already reported when
+        the vote was recorded.
+
+        :returns: ``(record, report)`` in review order.
+        """
+        return [
+            (rec, rec.blocking_report)
+            for rec in self._chunk_reviews()
+            if rec.blocking_report
+            and not report_names_nothing(rec.blocking_report)
+        ]
+
+    def _blocking_claims_for(
+        self, rec: ReviewRecord
+    ) -> list[tuple[str, str]]:
+        """
+        The verified claims from one blocking vote, in claim order.
+
+        :param rec: The vote to collect for.
+        :returns: ``(id, claim)`` pairs, empty when the verifier
+            concluded nothing about this report.
+        """
+        prefix = _blocking_id_prefix(rec)
+        found: list[tuple[int, str, str]] = []
+        for ident, claim in self._blocking_claims.items():
+            if not ident.startswith(prefix):
+                continue
+            tail = ident[len(prefix):]
+            found.append((int(tail) if tail.isdigit() else 0, ident, claim))
+        return [(ident, claim) for _n, ident, claim in sorted(found)]
 
     def _run_verify(self, stage: pipeline.PipelineStage) -> None:
         """
@@ -5557,7 +6028,8 @@ class PipelineRunner:
         :param stage: The stage declaring ``verifies:``.
         """
         pending = self._pending_findings()
-        if not pending:
+        reports = self._pending_blocking_reports()
+        if not pending and not reports:
             self._completed.add(stage.id)
             return
         agent = stage.run[0]
@@ -5566,17 +6038,29 @@ class PipelineRunner:
             replace=self._resume,
         )
         session = self._create_session(agent, wt, 'ro', stage.id)
-        out = self._drive(session, self._verify_instruction(pending))
+        out = self._drive(
+            session, self._verify_instruction(pending, reports)
+        )
         self._nodes[stage.id] = NodeResult(
             stage.id, 'verify', worktree=wt, session=session, output=out
         )
         verdicts = parse_dispositions(out)
         kept = self._record_dispositions(pending, verdicts)
-        click.echo(
-            f'[verify] {stage.id}: {len(pending)} finding(s) checked, '
-            f'{kept} to file, {len(pending) - kept} withheld with a '
-            f'recorded reason.'
-        )
+        if pending:
+            click.echo(
+                f'[verify] {stage.id}: {len(pending)} finding(s) checked, '
+                f'{kept} to file, {len(pending) - kept} withheld with a '
+                f'recorded reason.'
+            )
+        if reports:
+            claims = self._record_blocking_dispositions(
+                reports, parse_blocking_dispositions(out)
+            )
+            click.echo(
+                f'[verify] {stage.id}: {len(reports)} blocking report(s) '
+                f'read against the shipping code, {claims} claim(s) that '
+                f'still reproduce.'
+            )
 
     def _record_dispositions(
         self,
@@ -5597,6 +6081,42 @@ class PipelineRunner:
                 kept += 1
             if verdict is not None:
                 self._dispositions[finding_id(rec, index)] = verdict
+        return kept
+
+    def _record_blocking_dispositions(
+        self,
+        reports: list[tuple[ReviewRecord, str]],
+        verdicts: dict[tuple[int, int], Disposition],
+    ) -> int:
+        """
+        Store one conclusion per blocking claim the verifier named.
+
+        Unlike :meth:`_record_dispositions`, a claim with no conclusion
+        is NOT recorded and never files: the claims exist only because
+        the verifier enumerated them, so "no conclusion" means it never
+        found one to enumerate. The reports it skipped are surfaced as
+        a single issue at publish instead.
+
+        :param reports: What the verifier was shown, in the order shown.
+        :param verdicts: Its conclusions, by ``(report, claim)``.
+        :returns: How many claims still reproduce against this code.
+        """
+        kept = 0
+        by_report: dict[int, ReviewRecord] = {
+            position: rec
+            for position, (rec, _text) in enumerate(reports, start=1)
+        }
+        for (report_no, claim_no), verdict in sorted(verdicts.items()):
+            rec = by_report.get(report_no)
+            if rec is None:
+                # A number the verifier invented. Dropping it is right:
+                # it names no report anybody can attribute it to.
+                continue
+            ident = blocking_finding_id(rec, claim_no)
+            self._dispositions[ident] = verdict
+            self._blocking_claims[ident] = verdict.reason
+            if verdict.files:
+                kept += 1
         return kept
 
     def _run_reader(self, stage: pipeline.PipelineStage) -> None:

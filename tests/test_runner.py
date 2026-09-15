@@ -4402,6 +4402,341 @@ class TestTheVerificationGate(_Base):
         self.assertIn('s-triage', runner._released)
 
 
+#: What a blocking reviewer actually writes: numbered prose under a
+#: heading, with no marker the section parser knows.
+_BLOCKING_REPORT = (
+    '### Blocking findings\n\n'
+    '1. `SessionCredentials` is a plain dataclass, so `repr()` prints '
+    'the access key verbatim.\n'
+    '2. A null required timestamp is classified `success` and lands in '
+    'the success-only table.\n\n'
+    'VERDICT: BLOCKING'
+)
+
+
+class TestABlockingReportIsKeptOnTheRecord(_Base):
+    """
+    A BLOCKING vote used to record nothing but the verdict.
+
+    The parser reads `DEFECTS:` / `LATER-INCREMENT:` / `PREMISES:`,
+    which are the NON-BLOCKING blocks; a reviewer that blocks writes
+    prose under a heading. So the structured record was empty for
+    exactly the votes that stopped a branch, and anyone reading the
+    state saw a block that named nothing.
+    """
+
+    def _runner(self, **kw):
+        cfg = self._cfg(_PER_MODULE)
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0, **kw,
+        )
+        runner._subtasks = list(cfg.subtasks)
+        runner._active_subtask = cfg.subtasks[0]
+        return runner
+
+    def test_the_report_behind_a_block_is_recorded(self) -> None:
+        runner = self._runner()
+        runner._record_review(
+            'review', 'bugs', 1, 'BLOCKING', 'sess-1', _BLOCKING_REPORT
+        )
+        self.assertIn(
+            'prints the access key', runner._reviews[0].blocking_report
+        )
+
+    def test_an_approval_records_no_blocking_report(self) -> None:
+        # An approved vote's non-blocking findings already have a home;
+        # carrying its text here would double-file every one of them.
+        runner = self._runner()
+        runner._record_review(
+            'review', 'bugs', 1, 'APPROVED', 'sess-1',
+            'FINDINGS:\n- a minor thing\n\nVERDICT: APPROVED',
+        )
+        self.assertEqual(runner._reviews[0].blocking_report, '')
+
+    def test_it_survives_a_resume(self) -> None:
+        rec = R.ReviewRecord(
+            chunk='m0', stage='review', reviewer='bugs', round_no=1,
+            verdict='BLOCKING', target='impl-a',
+            blocking_report=_BLOCKING_REPORT,
+        )
+        back = R.ReviewRecord.from_dict(rec.as_dict())
+        self.assertEqual(back.blocking_report, _BLOCKING_REPORT)
+
+    def test_state_written_before_the_field_still_loads(self) -> None:
+        # Additive with an empty default, so an in-flight run stays
+        # resumable and RUN_STATE_VERSION does not move.
+        raw = R.ReviewRecord(
+            chunk='m0', stage='review', reviewer='bugs', round_no=1,
+            verdict='BLOCKING', target='impl-a',
+        ).as_dict()
+        raw.pop('blocking_report', None)
+        back = R.ReviewRecord.from_dict(raw)
+        self.assertEqual(back.blocking_report, '')
+
+    def test_a_block_that_names_nothing_is_said_out_loud(self) -> None:
+        # The other half of the same bug: a BLOCKING verdict carrying
+        # no report is the one a writer cannot act on, and it was
+        # recorded as silently as a good one.
+        runner = self._runner()
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            runner._record_review(
+                'review', 'bugs', 1, 'BLOCKING', 'sess-1',
+                'VERDICT: BLOCKING',
+            )
+        said = ' '.join(str(c.args[0]) for c in echo.call_args_list)
+        self.assertIn('named nothing', said)
+
+
+class TestBlockingFindingsReachTheVerifier(_Base):
+    """
+    Triage saw only the non-blocking half of what reviewers raised.
+
+    A blocking finding is assumed resolved by the loop-back fix turn.
+    That holds for the branch that was blocked and not for its sibling,
+    so a defect one reviewer reproduced can ship in the candidate the
+    judge selects, unfiled.
+    """
+
+    def _runner(self, **kw):
+        cfg = self._cfg(_PER_MODULE)
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0, **kw,
+        )
+        runner._subtasks = list(cfg.subtasks)
+        runner._active_subtask = cfg.subtasks[0]
+        runner._reviews = [
+            R.ReviewRecord(
+                chunk='m0', stage='review-a', reviewer='bugs', round_no=1,
+                verdict='BLOCKING', target='impl-a',
+                blocking_report=_BLOCKING_REPORT,
+            ),
+            R.ReviewRecord(
+                chunk='m0', stage='review-b', reviewer='bugs', round_no=1,
+                verdict='APPROVED', target='impl-b',
+                findings=('impl-b skips pagination',),
+                defects=('impl-b skips pagination',),
+            ),
+            R.ReviewRecord(
+                chunk='m1', stage='review-a', reviewer='bugs', round_no=1,
+                verdict='BLOCKING', target='impl-a',
+                blocking_report='### Blocking findings\n\n1. other chunk',
+            ),
+        ]
+        return runner
+
+    def test_a_block_on_any_candidate_is_put_to_the_verifier(self) -> None:
+        # Including the candidate that lost: its reviewer is the only
+        # one that ever reproduced the defect.
+        reports = self._runner()._pending_blocking_reports()
+        self.assertEqual([rec.target for rec, _text in reports], ['impl-a'])
+
+    def test_another_chunk_s_blocks_are_not_included(self) -> None:
+        reports = self._runner()._pending_blocking_reports()
+        self.assertTrue(all(rec.chunk == 'm0' for rec, _t in reports))
+
+    def test_an_approved_vote_contributes_no_report(self) -> None:
+        reports = self._runner()._pending_blocking_reports()
+        self.assertNotIn('impl-b', [rec.target for rec, _t in reports])
+
+    def test_the_verifier_is_asked_about_the_reports(self) -> None:
+        runner = self._runner()
+        instruction = runner._verify_instruction(
+            runner._pending_findings(), runner._pending_blocking_reports()
+        )
+        self.assertIn('BLOCKING-DISPOSITIONS:', instruction)
+        self.assertIn('Report 1', instruction)
+        self.assertIn('prints the access key', instruction)
+
+    def test_the_non_blocking_findings_are_still_asked_about(self) -> None:
+        runner = self._runner()
+        instruction = runner._verify_instruction(
+            runner._pending_findings(), runner._pending_blocking_reports()
+        )
+        self.assertIn('DISPOSITIONS:', instruction)
+        self.assertIn('skips pagination', instruction)
+
+    def test_claims_are_stored_against_a_stable_id(self) -> None:
+        runner = self._runner()
+        reports = runner._pending_blocking_reports()
+        kept = runner._record_blocking_dispositions(
+            reports,
+            {
+                (1, 1): R.Disposition(
+                    R.DISPOSITION_FILED, 'repr still prints the key'
+                ),
+                (1, 2): R.Disposition(
+                    R.DISPOSITION_ABSENT, 'fixed in round 2'
+                ),
+            },
+        )
+        self.assertEqual(kept, 1)
+        ident = R.blocking_finding_id(reports[0][0], 1)
+        self.assertEqual(
+            runner._dispositions[ident].verdict, R.DISPOSITION_FILED
+        )
+        self.assertIn('repr still prints', runner._blocking_claims[ident])
+
+    def test_a_report_with_no_conclusions_keeps_its_claims_unfiled(
+        self,
+    ) -> None:
+        # Fail-open for a blocking report is NOT "file everything": most
+        # were fixed in a later round. It is one summary issue, so the
+        # gap is visible without N issues nobody can action.
+        runner = self._runner()
+        reports = runner._pending_blocking_reports()
+        self.assertEqual(runner._record_blocking_dispositions(reports, {}), 0)
+        self.assertEqual(runner._blocking_claims, {})
+
+
+class TestParseBlockingDispositions(unittest.TestCase):
+    """The verifier answers per claim, under its own header."""
+
+    def test_claims_are_read_by_report_and_number(self) -> None:
+        got = R.parse_blocking_dispositions(
+            'BLOCKING-DISPOSITIONS:\n'
+            '- B1.1: reproduces — repr prints the key in the winner\n'
+            '- B1.2: absent — the winner coerces the timestamp\n'
+        )
+        self.assertEqual(got[(1, 1)].verdict, R.DISPOSITION_FILED)
+        self.assertIn('repr prints the key', got[(1, 1)].reason)
+        self.assertEqual(got[(1, 2)].verdict, R.DISPOSITION_ABSENT)
+
+    def test_the_B_prefix_is_optional(self) -> None:
+        got = R.parse_blocking_dispositions(
+            'BLOCKING-DISPOSITIONS:\n- 2.1: reproduces — still there\n'
+        )
+        self.assertEqual(got[(2, 1)].verdict, R.DISPOSITION_FILED)
+
+    def test_no_header_yields_nothing(self) -> None:
+        self.assertEqual(R.parse_blocking_dispositions('nothing here'), {})
+
+    def test_an_unreadable_verdict_is_skipped_not_guessed(self) -> None:
+        got = R.parse_blocking_dispositions(
+            'BLOCKING-DISPOSITIONS:\n'
+            '- B1.1: mumble — no idea\n'
+            '- B1.2: reproduces — still there\n'
+        )
+        self.assertNotIn((1, 1), got)
+        self.assertEqual(got[(1, 2)].verdict, R.DISPOSITION_FILED)
+
+
+class TestBlockingClaimsAreFiled(_Base):
+    """
+    What triage concluded about a blocking claim, in the tracker.
+
+    A claim that reproduces against the shipping code is the case this
+    whole path exists for: a reviewer blocked on it, the sibling
+    candidate shipped with it, and nothing filed it.
+    """
+
+    def _runner(self):
+        # A tracker to file INTO: blocking claims reach issues, and a
+        # `local` pipeline has nowhere to put them but the reviewer
+        # report already on the branch.
+        cfg = self._cfg(_PER_MODULE.replace('publish: local', 'publish: pr'))
+        wt = FakeWT()
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=wt,
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0, publish_repo='https://gh/org/proj',
+        )
+        runner._subtasks = list(cfg.subtasks)
+        runner._active_subtask = cfg.subtasks[0]
+        runner._reviews = [
+            R.ReviewRecord(
+                chunk='m0', stage='review-a', reviewer='bugs', round_no=1,
+                verdict='BLOCKING', target='impl-a',
+                blocking_report=_BLOCKING_REPORT,
+            )
+        ]
+        return runner, wt
+
+    def _conclude(self, runner, verdict, reason, claim=1):
+        rec = runner._pending_blocking_reports()[0][0]
+        runner._record_blocking_dispositions(
+            [(rec, rec.blocking_report)],
+            {(1, claim): R.Disposition(verdict, reason)},
+        )
+        return rec
+
+    def test_a_claim_that_reproduces_becomes_an_issue(self) -> None:
+        runner, wt = self._runner()
+        self._conclude(
+            runner, R.DISPOSITION_FILED, 'repr prints the key in impl-b'
+        )
+        runner._file_blocking_findings('docs/plans/m0-reviews.md')
+        titles = [i['title'] for i in wt.issues]
+        self.assertEqual(len(titles), 1, titles)
+        self.assertIn('repr prints the key', titles[0])
+
+    def test_the_issue_says_it_was_raised_as_blocking(self) -> None:
+        runner, wt = self._runner()
+        self._conclude(runner, R.DISPOSITION_FILED, 'still there')
+        runner._file_blocking_findings('docs/plans/m0-reviews.md')
+        body = wt.issues[0]['body']
+        self.assertIn('BLOCKING', body)
+        self.assertIn('`bugs`', body)
+        self.assertIn('impl-a', body)
+
+    def test_the_body_carries_the_dedup_marker(self) -> None:
+        runner, wt = self._runner()
+        rec = self._conclude(runner, R.DISPOSITION_FILED, 'still there')
+        runner._file_blocking_findings('docs/plans/m0-reviews.md')
+        self.assertIn(
+            R.finding_marker(R.blocking_finding_id(rec, 1)),
+            wt.issues[0]['body'],
+        )
+
+    def test_a_claim_already_filed_is_not_filed_again(self) -> None:
+        runner, wt = self._runner()
+        rec = self._conclude(runner, R.DISPOSITION_FILED, 'still there')
+        wt.issue_bodies = R.finding_marker(R.blocking_finding_id(rec, 1))
+        runner._file_blocking_findings('docs/plans/m0-reviews.md')
+        self.assertEqual(wt.issues, [])
+
+    def test_a_claim_that_is_absent_is_withheld_with_its_reason(
+        self,
+    ) -> None:
+        # The common case: the winner already fixed it. It must not
+        # file, and the reason must survive.
+        runner, wt = self._runner()
+        self._conclude(runner, R.DISPOSITION_ABSENT, 'fixed in round 2')
+        runner._file_blocking_findings('docs/plans/m0-reviews.md')
+        titles = [i['title'] for i in wt.issues]
+        self.assertEqual(len(titles), 1, titles)
+        self.assertIn('withheld', titles[0])
+        self.assertIn('fixed in round 2', wt.issues[0]['body'])
+
+    def test_a_report_triage_never_concluded_on_is_summarised_once(
+        self,
+    ) -> None:
+        runner, wt = self._runner()
+        runner._file_blocking_findings('docs/plans/m0-reviews.md')
+        titles = [i['title'] for i in wt.issues]
+        self.assertEqual(len(titles), 1, titles)
+        self.assertIn('no conclusion', titles[0].lower())
+        self.assertIn('docs/plans/m0-reviews.md', wt.issues[0]['body'])
+
+    def test_an_unreadable_tracker_files_nothing(self) -> None:
+        runner, wt = self._runner()
+        wt.issue_bodies = None
+        self._conclude(runner, R.DISPOSITION_FILED, 'still there')
+        runner._file_blocking_findings('docs/plans/m0-reviews.md')
+        self.assertEqual(wt.issues, [])
+
+    def test_publish_routes_blocking_claims_too(self) -> None:
+        # A record with no non-blocking findings at all used to return
+        # early, so its blocking claims never reached the tracker.
+        runner, wt = self._runner()
+        self._conclude(runner, R.DISPOSITION_FILED, 'still there')
+        runner._publish_findings('build', 'docs/plans/m0-reviews.md')
+        self.assertTrue(wt.issues)
+
+
 class TestParseDispositions(unittest.TestCase):
     """
     A verifier's conclusions, and the rule that it FAILS OPEN.
