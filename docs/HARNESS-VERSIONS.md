@@ -23,8 +23,9 @@ before any in-VM self-update could run:
 | `@openai/codex` | 0.153.4 |
 | `agy` (Antigravity CLI) | 1.1.16 |
 
-Models confirmed on that image — one real turn each, with the launcher's launch
-read-back reporting no mismatch against the pane:
+Models confirmed on that image — one real turn each. The launch read-back checked
+the codex row and found no mismatch. Read-back does not check a Claude model, so
+the Claude row was confirmed by reading the captured pane's banner by hand:
 
 | Harness | Model | Effort | Pane showed |
 | --- | --- | --- | --- |
