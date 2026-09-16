@@ -14,14 +14,17 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import click
 
+from sbx_omnigent import worktrees
 from sbx_omnigent.worktrees import (
     WorktreeManager,
     _pr_create_command,
     _repo_name,
     _validate_name,
+    clone_copy_command,
     github_slug,
     looks_like_auth_failure,
 )
@@ -639,7 +642,8 @@ class TestWarmBuildCache(unittest.TestCase):
             raise click.ClickException('copy died midway')
 
         self.mgr._run = boom
-        self.assertEqual(self.mgr.seed_build_cache(fresh), [])
+        with mock.patch.object(worktrees.click, 'echo'):
+            self.assertEqual(self.mgr.seed_build_cache(fresh), [])
         self.assertFalse(os.path.exists(os.path.join(fresh, 'target')))
 
     def test_a_failed_refresh_keeps_the_previous_cache_intact(self) -> None:
@@ -649,11 +653,140 @@ class TestWarmBuildCache(unittest.TestCase):
             raise click.ClickException('copy died midway')
 
         self.mgr._run = boom
-        self.assertEqual(self.mgr.refresh_build_cache(self._node('c')), [])
+        with mock.patch.object(worktrees.click, 'echo'):
+            self.assertEqual(
+                self.mgr.refresh_build_cache(self._node('c')), []
+            )
         cache = os.path.join(self.can, '_buildcache', 'proj')
         self.assertEqual(sorted(os.listdir(cache)), ['target'])
         with open(os.path.join(cache, 'target', 'artifact')) as fh:
             self.assertEqual(fh.read(), 'compiled')
+
+
+class TestTheBuildCacheCopyWorksOnLinux(unittest.TestCase):
+    """GNU cp has no ``-c``, so the cache never worked on Linux (#60).
+
+    ``cp -Rc`` failed on every call there, and both failures were
+    swallowed: no warm cache and no sign of it."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix='wt-cache-linux-')
+        self.can = os.path.join(self.tmp, 'can')
+        self.calls: list[list[str]] = []
+        self.mgr = WorktreeManager(
+            canonical_root=self.can,
+            worktree_root=os.path.join(self.tmp, 'wt'),
+            build_cache=('target',),
+            build_cache_key='proj',
+            run=self._record,
+        )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _record(self, cmd, **kw):
+        self.calls.append(list(cmd))
+        return ''
+
+    def _built(self, name: str) -> str:
+        path = os.path.join(self.tmp, name, 'target')
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, 'artifact'), 'w') as fh:
+            fh.write('compiled')
+        return os.path.dirname(path)
+
+    def test_macos_clones_with_c(self) -> None:
+        self.assertEqual(
+            clone_copy_command('s', 'd', platform='darwin'),
+            ['cp', '-Rc', 's', 'd'],
+        )
+
+    def test_linux_uses_reflink_auto(self) -> None:
+        # Clones on a reflink filesystem, copies anywhere else.
+        self.assertEqual(
+            clone_copy_command('s', 'd', platform='linux'),
+            ['cp', '-R', '--reflink=auto', 's', 'd'],
+        )
+
+    def test_another_platform_gets_a_plain_copy(self) -> None:
+        # Neither flag is portable to, say, a BSD cp.
+        self.assertEqual(
+            clone_copy_command('s', 'd', platform='freebsd14'),
+            ['cp', '-R', 's', 'd'],
+        )
+
+    def test_refresh_and_seed_use_the_platform_command(self) -> None:
+        with mock.patch.object(worktrees.sys, 'platform', 'linux'), \
+                mock.patch.object(worktrees.click, 'echo'):
+            self.mgr.refresh_build_cache(self._built('a'))
+            # The recording runner copies nothing, so put the entry
+            # where a real refresh would have.
+            os.makedirs(
+                os.path.join(self.can, '_buildcache', 'proj', 'target', 'x')
+            )
+            self.mgr.seed_build_cache(os.path.join(self.tmp, 'b'))
+        self.assertEqual(len(self.calls), 2)
+        for cmd in self.calls:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(cmd[:3], ['cp', '-R', '--reflink=auto'])
+
+    def _failing(self):
+        def boom(cmd, **kw):
+            raise click.ClickException("cp: invalid option -- 'c'")
+
+        self.mgr._run = boom
+
+    def test_a_failed_seed_is_reported_once(self) -> None:
+        os.makedirs(
+            os.path.join(self.can, '_buildcache', 'proj', 'target', 'x')
+        )
+        self._failing()
+        with mock.patch.object(worktrees.click, 'echo') as echo:
+            for node in ('b', 'c'):
+                self.mgr.seed_build_cache(os.path.join(self.tmp, node))
+        said = [str(c.args[0]) for c in echo.call_args_list]
+        self.assertEqual(len(said), 1, said)
+        self.assertIn('[build-cache]', said[0])
+        self.assertIn("'target'", said[0])
+        self.assertIn("invalid option -- 'c'", said[0])
+
+    def test_a_failed_refresh_is_reported_once(self) -> None:
+        self._failing()
+        with mock.patch.object(worktrees.click, 'echo') as echo:
+            for node in ('a', 'b'):
+                self.mgr.refresh_build_cache(self._built(node))
+        said = [str(c.args[0]) for c in echo.call_args_list]
+        self.assertEqual(len(said), 1, said)
+        self.assertIn('refresh', said[0])
+
+    def test_seed_and_refresh_failures_are_reported_separately(
+        self,
+    ) -> None:
+        os.makedirs(
+            os.path.join(self.can, '_buildcache', 'proj', 'target', 'x')
+        )
+        self._failing()
+        with mock.patch.object(worktrees.click, 'echo') as echo:
+            self.mgr.seed_build_cache(os.path.join(self.tmp, 'b'))
+            self.mgr.refresh_build_cache(self._built('a'))
+        self.assertEqual(echo.call_count, 2)
+
+    def test_a_working_cache_says_nothing(self) -> None:
+        # A real copy, on whatever platform runs the suite.
+        mgr = WorktreeManager(
+            canonical_root=self.can,
+            worktree_root=os.path.join(self.tmp, 'wt'),
+            build_cache=('target',),
+            build_cache_key='proj',
+        )
+        with mock.patch.object(worktrees.click, 'echo') as echo:
+            self.assertEqual(
+                mgr.refresh_build_cache(self._built('a')), ['target']
+            )
+            fresh = os.path.join(self.tmp, 'b')
+            os.makedirs(fresh)
+            self.assertEqual(mgr.seed_build_cache(fresh), ['target'])
+        echo.assert_not_called()
 
 
 class TestDisposeNodeWorktrees(unittest.TestCase):
