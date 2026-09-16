@@ -2823,6 +2823,13 @@ class PipelineRunner:
         #: forfeited candidate is excluded from judging: comparing a
         #: vetted branch against an unvetted one is not a choice.
         self._forfeited: set[str] = set()
+        #: Review rounds spent per stage, THIS PROCESS.
+        #:
+        #: Deliberately not in the run state. The cap bounds the
+        #: branch, and a resume is a deliberate human act that buys
+        #: another budget — persisting this would reverse that. See
+        #: :meth:`_spend_review_round`.
+        self._review_rounds: dict[str, int] = {}
         #: Sessions a PREVIOUS attempt of this run left behind, read
         #: from its state on resume. For DISPOSAL ONLY — never driven,
         #: never treated as live (see :meth:`_dispose_stale_sessions`).
@@ -4124,6 +4131,29 @@ class PipelineRunner:
                 if r.stage == stage_id
             ]
         return max(prior, default=0) + 1
+
+    def _spend_review_round(self, stage_id: str) -> int:
+        """
+        Charge one round to a review stage's budget, and report it.
+
+        Separate from :meth:`_next_review_round`, which derives the
+        RECORDED number from the records themselves and therefore
+        survives a resume. This one must not: the budget bounds the
+        branch within a run, and a resume starts fresh.
+
+        It is also not a local, which is the defect. Held in a local,
+        the budget was reset by anything that re-entered
+        ``_run_review`` — a parallel sibling failing, a gate retry —
+        while the recorded number kept climbing. One branch reached
+        six recorded rounds against a cap of three.
+
+        :param stage_id: The review stage being charged.
+        :returns: How many rounds that stage has now spent.
+        """
+        with self._lock:
+            spent = self._review_rounds.get(stage_id, 0) + 1
+            self._review_rounds[stage_id] = spent
+        return spent
 
     def _sandbox_for_session(self, session: str) -> str | None:
         """
@@ -7080,14 +7110,16 @@ class PipelineRunner:
 
     def _run_review(self, stage: pipeline.PipelineStage) -> None:
         target = self._review_target(stage)
-        # Local budget only. The RECORDED round number must not come
-        # from it: a gate failure re-enters this method with a fresh
-        # budget, and reusing the local count labelled every re-review
-        # "round 1" — six of them on one branch, which reads as six
-        # independent first rounds instead of one block and the
-        # re-reviews that followed. It also collided the run-dir
+        # The budget is charged to the STAGE, not to this call: a
+        # gate failure re-enters here, and held in a local the count
+        # started over while the recorded number kept climbing.
+        #
+        # The RECORDED number still comes from the records instead
+        # (`_next_review_round`). Deriving it from the budget labelled
+        # every re-review "round 1" — six of them on one branch, which
+        # reads as six independent first rounds rather than one block
+        # and the re-reviews that followed — and collided the run-dir
         # filenames, so each re-review overwrote the last.
-        rounds = 0
         silent_rounds = 0
         while True:
             outputs: dict[str, str] = {}
@@ -7184,9 +7216,11 @@ class PipelineRunner:
                 self._nodes[stage.id] = NodeResult(
                     stage.id, 'review', verdict='BLOCKING'
                 )
-                raise _Blocked(stage.id, rounds + 1)
+                raise _Blocked(
+                    stage.id, self._review_rounds.get(stage.id, 0) + 1
+                )
             self._halt_on_dispute(stage, outputs, blocking)
-            rounds += 1
+            rounds = self._spend_review_round(stage.id)
             if rounds > self._max_rounds or not stage.on_block:
                 self._nodes[stage.id] = NodeResult(
                     stage.id, 'review', verdict='BLOCKING'
