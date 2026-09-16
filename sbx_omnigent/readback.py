@@ -13,6 +13,9 @@ on the agent's screen (TASKS.md #27, #28, #34, #35):
   DEFAULT. The value was accepted, persisted, and returned by the API.
 * ``--model gemini-3.7-flash-high`` on agy → Gemini 3.6 Flash served the
   turn. The flag was accepted without error.
+* a Claude model or effort the banner does not confirm (#59) — no
+  live substitution seen yet, but the banner is the only place the
+  served model is stated, and nothing else read it.
 * a retired ``--model`` on codex → the TUI sat in a migration picker and
   every turn died at the timeout.
 
@@ -41,6 +44,26 @@ _CLAUDE_MODES = {
     'plan': re.compile(r'\bplan mode on\b', re.I),
     'bypassPermissions': re.compile(r'\bbypass permissions on\b', re.I),
 }
+
+#: Claude's banner names the SERVED model and effort, e.g.
+#: ``Fable 5.1 with xhigh effort · Claude API``. The trailing ``·`` is
+#: what makes it the banner: the welcome line under it names the model
+#: too (``Fable 5.1 writes better code...``), but that is copy about the
+#: model, not a statement of which one is serving.
+_CLAUDE_BANNER = re.compile(
+    r'\b(?P<name>(?:Fable|Opus|Sonnet|Haiku)\s+\d+(?:\.\d+)?)'
+    r'(?:\s+with\s+(?P<effort>[a-z]+)\s+effort)?\s+·',
+    re.I,
+)
+
+#: A pinned Claude model id: family, major, optional minor, optional
+#: snapshot date — ``claude-haiku-4-5-20251001`` is Haiku 4.5. Anything
+#: else (an alias, a ``[1m]`` suffix, a gateway-prefixed id) has no
+#: banner name we can derive without guessing.
+_CLAUDE_MODEL_ID = re.compile(
+    r'^claude-(?P<family>fable|opus|sonnet|haiku)-(?P<major>\d+)'
+    r'(?:-(?P<minor>\d{1,2}))?(?:-\d{8})?$'
+)
 
 #: Codex prints ``model: <slug> <effort>`` in its session header and
 #: repeats it in the status bar. ``default`` is codex's own word for
@@ -87,6 +110,40 @@ def claude_permission_mode(pane: str) -> str | None:
         if rx.search(pane):
             return mode
     return None
+
+
+def claude_model_effort(pane: str) -> tuple[str | None, str | None]:
+    """
+    The model and effort Claude's banner reports.
+
+    :param pane: Captured pane text.
+    :returns: ``(name, effort)``, e.g. ``('Fable 5.1', 'xhigh')``. Both
+        are ``None`` when the banner is out of view — it scrolls away in
+        a long session — and the effort is ``None`` when the banner
+        names none.
+    """
+    m = _CLAUDE_BANNER.search(pane)
+    if m is None:
+        return None, None
+    return m.group('name'), m.group('effort')
+
+
+def claude_display_name(model: str) -> str | None:
+    """
+    The name Claude's banner prints for a pinned model id.
+
+    :param model: A model id, e.g. ``'claude-fable-5-1'``.
+    :returns: e.g. ``'Fable 5.1'``, or ``None`` for an id with no
+        derivable name. An alias means whatever Claude Code currently
+        maps it to, so there is nothing honest to compare against.
+    """
+    m = _CLAUDE_MODEL_ID.match(model)
+    if m is None:
+        return None
+    version = m.group('major')
+    if m.group('minor'):
+        version = f'{version}.{m.group("minor")}'
+    return f'{m.group("family").capitalize()} {version}'
 
 
 def codex_model_effort(pane: str) -> tuple[str | None, str | None]:
@@ -147,7 +204,9 @@ def launch_mismatches(
         return _agy_mismatches(pane, model)
     if harness in ('codex-native', 'codex', 'native-codex'):
         return _codex_mismatches(pane, model, effort)
-    return _claude_mismatches(pane, permission_mode)
+    return _claude_mismatches(
+        pane, permission_mode=permission_mode, model=model, effort=effort
+    )
 
 
 def _agy_mismatches(pane: str, model: str | None) -> list[str]:
@@ -182,15 +241,35 @@ def _codex_mismatches(
     return out
 
 
-def _claude_mismatches(pane: str, requested: str | None) -> list[str]:
-    """Claude downgrades a mode its model cannot support, in silence."""
-    if not requested:
-        return []
-    got = claude_permission_mode(pane)
-    if got is None or got == requested:
-        return []
-    return [
-        f'permission mode: asked for {requested!r}, pane reports '
-        f'{got!r}. An unattended agent in a prompting mode blocks on '
-        f'the first tool call and never returns.'
-    ]
+def _claude_mismatches(
+    pane: str,
+    *,
+    permission_mode: str | None,
+    model: str | None,
+    effort: str | None,
+) -> list[str]:
+    """Claude downgrades what its model cannot support, in silence.
+
+    Each check stands alone, so one mismatch never hides another.
+    """
+    out: list[str] = []
+    got_mode = claude_permission_mode(pane)
+    if permission_mode and got_mode and got_mode != permission_mode:
+        out.append(
+            f'permission mode: asked for {permission_mode!r}, pane reports '
+            f'{got_mode!r}. An unattended agent in a prompting mode blocks '
+            f'on the first tool call and never returns.'
+        )
+    got_name, got_effort = claude_model_effort(pane)
+    want_name = claude_display_name(model) if model else None
+    if want_name and got_name and _fold(got_name) != _fold(want_name):
+        out.append(
+            f'model: asked for {model!r} ({want_name}), pane reports '
+            f'{got_name!r}.'
+        )
+    if effort and got_effort and _fold(got_effort) != _fold(effort):
+        out.append(
+            f'reasoning effort: asked for {effort!r}, pane reports '
+            f'{got_effort!r}.'
+        )
+    return out
