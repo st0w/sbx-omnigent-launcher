@@ -6354,6 +6354,7 @@ class PipelineRunner:
         :returns: The recorded (un-driven) :class:`NodeResult`.
         """
         agent = stage.run[0]
+        self._require_seed(stage)
         wt = self._wt.create_node_worktree(
             self._run_id, stage.id, from_node=self._seed_from(stage),
             replace=self._resume,
@@ -7483,6 +7484,7 @@ class PipelineRunner:
             raise PipelineRunError(
                 f'judge {stage.id!r} has no writer candidates in needs'
             )
+        self._require_one_contract(stage, candidates)
         wt = self._wt.create_judge_worktree(
             self._run_id, stage.id, candidates, replace=self._resume
         )
@@ -7569,6 +7571,99 @@ class PipelineRunner:
         self._last_branch_node = stage.id
 
     # ── wiring helpers ────────────────────────────────────────────
+
+    def _branch_producing_needs(
+        self, stage: pipeline.PipelineStage
+    ) -> list[str]:
+        """
+        The stages *stage* declares a need on that produce a branch.
+
+        Read from the DECLARED pipeline, not from the nodes that have
+        run: the bug this serves is precisely a node being absent, so
+        asking the run what exists answers the wrong question.
+
+        :param stage: The stage whose needs to classify.
+        :returns: Ids of needed writer/judge stages, in declared order.
+        """
+        return [
+            need
+            for need in stage.needs
+            if (needed := self._stage_by_id.get(need)) is not None
+            and self._stage_kind(needed) in ('writer', 'judge')
+        ]
+
+    def _require_seed(self, stage: pipeline.PipelineStage) -> None:
+        """
+        Refuse to cut a writer that has lost the branch it inherits.
+
+        ``_seed_from`` returns ``None`` for two different situations:
+        this writer legitimately starts from the base branch, and the
+        writer it inherits from is missing. They are indistinguishable
+        to the caller, and the second silently substitutes
+        ``base_branch`` — which for a competing implementation means
+        building with none of the frozen tests its rival is held to.
+        The judge then compares work done under two contracts and
+        reports it as a choice.
+
+        There is no case where cutting a competing implementation from
+        an unfrozen base is what was wanted, so this refuses instead.
+
+        :param stage: The writer stage about to be provisioned.
+        :raises PipelineRunError: When a needed writer/judge branch
+            cannot be resolved.
+        """
+        if self._seed_from(stage) is not None:
+            return
+        missing = self._branch_producing_needs(stage)
+        if not missing:
+            return
+        raise PipelineRunError(
+            f'writer {stage.id!r} inherits from '
+            f'{", ".join(repr(n) for n in missing)}, and no branch for '
+            f'it can be resolved. Cutting from the base branch instead '
+            f'would build this stage without anything its upstream '
+            f'produced — for a competing writer, without the frozen '
+            f'tests its rival is held to — so the run stops here. A '
+            f'resume whose state lost that node is the usual cause.'
+        )
+
+    def _require_one_contract(
+        self, stage: pipeline.PipelineStage, candidates: list[str]
+    ) -> None:
+        """
+        Refuse to judge candidates built against different contracts.
+
+        A branch that does not contain its seed is not a worse
+        implementation of the same thing — it is an implementation of
+        something else, and picking between the two produces a record
+        that reads like a judgement.
+
+        Only candidates with a resolvable seed are checked: writers
+        that legitimately cut from base have no shared contract to
+        compare, which is the ordinary two-writer race.
+
+        :param stage: The judge stage.
+        :param candidates: The competing writer nodes.
+        :raises PipelineRunError: When a candidate lacks its seed.
+        """
+        for cand in candidates:
+            cand_stage = self._stage_by_id.get(cand)
+            if cand_stage is None:
+                continue
+            seed = self._seed_from(cand_stage)
+            if seed is None or seed not in self._nodes:
+                continue
+            if self._wt.branch_contains(
+                self._run_id, cand, ancestor=seed
+            ):
+                continue
+            raise PipelineRunError(
+                f'judge {stage.id!r} cannot compare {cand!r}: its '
+                f'branch does not contain {seed!r}, so it was built '
+                f'without the contract its rivals were held to. '
+                f'Judging it would compare two different contracts '
+                f'and record the result as a choice.'
+            )
 
     def _seed_from(self, stage: pipeline.PipelineStage) -> str | None:
         """The upstream WRITER branch a node's worktree is cut from."""

@@ -919,6 +919,43 @@ class WorktreeManager:
             return None
         return out.strip() or None
 
+    def branch_contains(
+        self, run_id: str, node_id: str, *, ancestor: str
+    ) -> bool:
+        """
+        Whether a node's hub branch already holds another node's tip.
+
+        The question behind "was this writer built against the frozen
+        contract": a candidate whose branch does not contain the tests
+        node's commit implements a different contract, however good its
+        code is.
+
+        Answered in the HUB, which is the authority every other
+        consumer reads — a node's own clone can be ahead of it.
+
+        FALSE when the answer cannot be established: a missing branch,
+        an unreadable run, a git error. "Unknown" must never read as
+        "the contract is present", because the whole point is to
+        refuse on the strength of a positive check.
+
+        :param run_id: Pipeline run id.
+        :param node_id: The node whose branch is inspected.
+        :param ancestor: The node whose tip must be contained.
+        :returns: Whether *ancestor*'s tip is reachable from *node_id*.
+        """
+        repo = self._run_repo(run_id)
+        if not os.path.isdir(repo):
+            return False
+        try:
+            self._run([
+                'git', '-C', repo, 'merge-base', '--is-ancestor',
+                self.node_branch(run_id, ancestor),
+                self.node_branch(run_id, node_id),
+            ])
+        except click.ClickException:
+            return False
+        return True
+
     def node_branch_exists(self, run_id: str, node_id: str) -> bool:
         """
         Whether a node's branch is already on the run's hub.
@@ -1054,7 +1091,33 @@ class WorktreeManager:
                 raise click.ClickException(f'node worktree exists: {path}')
             self._remove_under_root(path)
         branch = self.node_branch(run_id, node_id)
-        if replace and self.node_branch_exists(run_id, node_id):
+        stale = (
+            replace
+            and from_node is not None
+            and self.node_branch_exists(run_id, node_id)
+            and not self.branch_contains(
+                run_id, node_id, ancestor=from_node
+            )
+        )
+        if stale:
+            # The node's own branch PREDATES its seed, so inheriting it
+            # would drop everything the seed carries — for a competing
+            # writer, the frozen test suite it is supposed to be held
+            # to. A writer pre-warmed during planning is cut while its
+            # seed is still at base, so this is what a resume finds
+            # whenever the run ended before that writer was driven.
+            #
+            # The seed wins. Whatever the old branch held was written
+            # against a contract that no longer applies, and the
+            # alternative is a candidate the judge cannot compare.
+            click.echo(
+                f'[worktree] {node_id}: its branch does not contain '
+                f'{from_node!r}, so it predates the contract it builds '
+                f'against — re-cutting from {from_node!r} instead of '
+                f'inheriting it.'
+            )
+            start = f'origin/{self.node_branch(run_id, from_node)}'
+        elif replace and self.node_branch_exists(run_id, node_id):
             # Resuming a node that already ran: its branch may carry a
             # partial commit from the attempt that failed. Cut from that
             # branch so the agent picks up its own prior work instead of
