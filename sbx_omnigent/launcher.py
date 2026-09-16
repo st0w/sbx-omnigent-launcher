@@ -24,6 +24,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, ClassVar
 from urllib.parse import urlparse
 
@@ -186,6 +187,26 @@ DEFAULT_EGRESS_ALLOW: tuple[str, ...] = (
     # disclosed, not their integrity.
     'deb.debian.org:80',
 )
+
+#: The :data:`DEFAULT_EGRESS_ALLOW` entries that exist only to cover
+#: gaps in sbx's own shipped bundles, each with the failure it
+#: prevents. An explicit ``sbx.egress_allow`` replaces the default, so
+#: a custom list loses these without a word; server startup names any
+#: it omits (#40).
+SBX_BUNDLE_GAP_HOSTS: Mapping[str, str] = {
+    '**.astral.sh': (
+        "uv's installer redirects to releases.astral.sh, so without it "
+        'uv never installs and a verify gate that needs uv cannot run'
+    ),
+    'api.osv.dev': (
+        'uv audit and cargo audit cannot reach their advisory database, '
+        'and reviewers report that they could not verify'
+    ),
+    'deb.debian.org:80': (
+        "every apt call is denied (the image's apt sources are plain "
+        'http), so an agent cannot install a toolchain'
+    ),
+}
 
 
 def _normalize_repo_request(

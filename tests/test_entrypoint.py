@@ -271,8 +271,14 @@ class TestHostConfigReachesTheSandbox(unittest.TestCase):
     def test_a_providers_block_is_threaded_through_verbatim(self) -> None:
         host_config = {
             'providers': {
-                'claude': {'kind': 'subscription', 'cli': 'claude'},
-                'codex': {'kind': 'subscription', 'cli': 'codex'},
+                # `default:` is what makes launch routing use an entry
+                # (#34); without it both would be written and ignored.
+                'claude': {
+                    'kind': 'subscription', 'cli': 'claude', 'default': True
+                },
+                'codex': {
+                    'kind': 'subscription', 'cli': 'codex', 'default': True
+                },
             }
         }
         cfg = _build_sbx_config({**self._RAW, 'host_config': host_config})
