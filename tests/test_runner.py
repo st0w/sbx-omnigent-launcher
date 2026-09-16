@@ -9954,6 +9954,80 @@ class TestReviewerMustVerify(_Base):
                 self.assertIn('premise your approval', body)
 
 
+class TestAReviewerIsToldHowToDisputeTheContract(_Base):
+    """A reviewer who finds the CONTRACT wrong must be able to say so.
+
+    `_halt_on_dispute` stops the run on a blocking reviewer's
+    `DISPUTED:` line, but implementation reviewers met the line only in
+    wording written for writers, and refactor reviewers never met it. A
+    reviewer that does not know the line falls back to BLOCKING, which
+    re-drives a writer who cannot change the contract until the rounds
+    run out (#48)."""
+
+    #: What every reviewer surface must carry, and the bar a dispute
+    #: has to clear to be worth a human's ruling.
+    _MUST_SAY = (
+        'DISPUTED:',            # the exact marker
+        'VERDICT: BLOCKING',    # only a blocking dispute halts
+        'file:line',            # both artifacts, located
+        'quote',                # each requirement, verbatim
+        'which one is wrong',
+        'satisfy both',
+        'tests stage',          # never re-driven to settle it
+    )
+
+    def _runner(self, source):
+        cfg = self._cfg(source)
+        return R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+
+    def _implementation_review(self) -> str:
+        r = self._runner(_COMPETE_REVIEWED)
+        return r._review_instruction(r._stage_by_id['review-a'])
+
+    def _refactor_review(self) -> str:
+        r = self._runner(_JUDGE_REFACTOR)
+        r._nodes['refactor'] = R.NodeResult(
+            'refactor', 'writer', branch='b/refactor'
+        )
+        return r._refactor_review_instruction(r._stage_by_id['review-r'])
+
+    def _surfaces(self):
+        return {
+            'implementation review': self._implementation_review(),
+            'refactor review': self._refactor_review(),
+            'security-reviewer.md': pipeline.template_prompt(
+                'security-reviewer'
+            ),
+            'bug-reviewer.md': pipeline.template_prompt('bug-reviewer'),
+        }
+
+    def test_every_reviewer_surface_explains_the_dispute(self) -> None:
+        for surface, text in self._surfaces().items():
+            for phrase in self._MUST_SAY:
+                with self.subTest(surface=surface, phrase=phrase):
+                    self.assertIn(phrase, text)
+
+    def test_the_refactor_reviewer_hears_it_for_the_first_time(
+        self,
+    ) -> None:
+        # The implementation review inherits the writers' paragraph
+        # through the task block; the refactor review never did.
+        self.assertNotIn('UNATTENDED', self._refactor_review())
+        self.assertIn('DISPUTED:', self._refactor_review())
+
+    def test_no_surface_would_halt_a_run_if_quoted_back(self) -> None:
+        # The parser matches a line that STARTS with the marker. A
+        # reviewer that echoes its instructions must not halt the run,
+        # so the marker only ever appears mid-sentence.
+        for surface, text in self._surfaces().items():
+            with self.subTest(surface=surface):
+                self.assertEqual(R.parse_disputes(text), ())
+
+
 class TestAReviewerDoesNotReRunTheGate(_Base):
     """
     A reviewer gets the whole task, success criteria included. When one

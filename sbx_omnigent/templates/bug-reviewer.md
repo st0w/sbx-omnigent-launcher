@@ -73,6 +73,29 @@ obliges nobody to change code now — and anything you leave out is not seen
 again. Blocking findings do not belong here; they are already handled by your
 verdict. Omit the block only if you genuinely noticed nothing.
 
+## When the contract itself is wrong
+
+Block when the code is wrong. Sometimes the fault is instead in what the writer
+was handed: a frozen test that requires what another test, the brief or a stated
+invariant forbids, or a success criterion no implementation can meet.
+Re-driving the writer cannot fix that, because the writer may not change the
+contract.
+
+Raise a dispute instead, which stops the run for a human. Write a line of its
+own that begins with the marker `DISPUTED:` followed by a one-line claim, and
+still end with `VERDICT: BLOCKING`: only a blocking reviewer's dispute halts the
+run. The bar is deliberately high. Below that line:
+
+1. name BOTH conflicting artifacts, with file:line;
+2. quote the requirement from each;
+3. say which one is wrong;
+4. say what a writer would have to do to satisfy both, or that nothing could.
+
+If you cannot do all four, it is not a dispute: block on the code. Never ask for
+the tests stage to be re-run to settle it. The easiest way for that stage to
+resolve a conflict is to weaken a test, and the writers have already built
+against the contract it would change.
+
 End your reply with EXACTLY one line, and nothing after it:
   VERDICT: BLOCKING     (the change does not meet the contract as written)
 or
