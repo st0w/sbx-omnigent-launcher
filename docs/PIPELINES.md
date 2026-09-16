@@ -320,6 +320,25 @@ commit made just before publish — so the approved design travels with the code
 the PR. Override the path with the top-level **`plan_artifact:`** key. Skipped
 when `publish: none` (nothing is published).
 
+### A candidate whose review cannot converge
+
+When competing writers each have their own review stage, a review that spends
+its round budget without consensus **withdraws its candidate** instead of ending
+the run. The rest of the field carries on to the judge. This holds whether the
+reviews are top-level stages, as in `examples/full-cadre` and
+`examples/per-module`, or grouped under `parallel:`. A withdrawn candidate is
+never judged.
+
+- **One candidate left:** it is selected without booting a judge, and the
+  selection is recorded as **uncontested**, not as a judgment.
+- **More than one left:** the judge chooses among them as usual.
+- **None left:** the run ends `blocked` at the review that withdrew the last
+  candidate.
+
+Either way the selection record and the pull request name each withdrawn
+candidate, its review, and how many rounds it took. A review with no competing
+candidate, such as the final review of a refactor, still blocks the run at once.
+
 ### The judge's selection, and the implementation that lost
 
 A judge picks ONE candidate and only that branch publishes. Two artifacts keep

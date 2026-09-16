@@ -1859,6 +1859,11 @@ class JudgePick:
     :param retained: ``(node, bundle-path)`` for each candidate that did
         NOT win and was preserved, so the record says where the losing
         implementation actually lives.
+    :param forfeited: ``(candidate, review stage, rounds)`` for each
+        candidate withdrawn before judging because its review reached no
+        consensus. Without it a reduced field reads as a full one (#47).
+    :param uncontested: Only one candidate was left, so no judge ran and
+        *stated* is ``None``. Not a judgment, and not a failed one.
     """
 
     chunk: str | None
@@ -1868,6 +1873,8 @@ class JudgePick:
     stated: str | None
     reasoning: str = ''
     retained: tuple[tuple[str, str], ...] = ()
+    forfeited: tuple[tuple[str, str, int], ...] = ()
+    uncontested: bool = False
 
     @property
     def honored(self) -> bool:
@@ -1884,6 +1891,8 @@ class JudgePick:
             'stated': self.stated,
             'reasoning': self.reasoning,
             'retained': [list(pair) for pair in self.retained],
+            'forfeited': [list(entry) for entry in self.forfeited],
+            'uncontested': self.uncontested,
         }
 
     @classmethod
@@ -1916,7 +1925,33 @@ class JudgePick:
                 for pair in raw.get('retained') or []
                 if isinstance(pair, (list, tuple)) and len(pair) == 2
             ),
+            # Both absent from state written before #47, which restores
+            # an ordinary contested pick.
+            forfeited=tuple(
+                (entry[0], entry[1], entry[2])
+                for entry in raw.get('forfeited') or []
+                if isinstance(entry, (list, tuple))
+                and len(entry) == 3
+                and isinstance(entry[0], str)
+                and isinstance(entry[1], str)
+                and type(entry[2]) is int
+            ),
+            uncontested=raw.get('uncontested') is True,
         )
+
+
+def _withdrawn(pick: JudgePick) -> str:
+    """
+    Name each candidate withdrawn before *pick*, with why.
+
+    :param pick: The selection.
+    :returns: e.g. ```impl-a` (`review-a`, no consensus after 2
+        round(s))``, or ``''`` when nothing was withdrawn.
+    """
+    return ', '.join(
+        f'`{cand}` (`{review}`, no consensus after {rounds} round(s))'
+        for cand, review, rounds in pick.forfeited
+    )
 
 
 @dataclass(frozen=True)
@@ -2111,6 +2146,8 @@ def render_judge_decision(
     ]
     for pick in picks:
         stated = f'`{pick.stated}`' if pick.stated else '_none stated_'
+        if pick.uncontested:
+            stated = '_uncontested, no judge ran_'
         cands = ', '.join(f'`{c}`' for c in pick.candidates)
         parts.append(
             f'| `{pick.stage}` | {cands} '
@@ -2121,7 +2158,20 @@ def render_judge_decision(
             '', '---', '',
             f'## `{pick.stage}` — selected `{pick.selected}`',
         ]
-        if not pick.honored:
+        if pick.uncontested:
+            parts += [
+                '',
+                f'> **Uncontested.** `{pick.selected}` was the only '
+                f'candidate left, so no judge ran. Withdrawn: '
+                f'{_withdrawn(pick)}.',
+            ]
+        elif pick.forfeited:
+            parts += [
+                '',
+                f'> **A reduced field.** Withdrawn before judging: '
+                f'{_withdrawn(pick)}.',
+            ]
+        if not pick.uncontested and not pick.honored:
             # The runner substitutes the first candidate when the judge
             # never stated a usable SELECT. That is a fallback, not a
             # decision, and a series that silently counted it as one
@@ -2133,7 +2183,10 @@ def render_judge_decision(
                 f'candidates, so the runner fell back to the first one. '
                 f'Read this as an ABSENT decision, not a preference.',
             ]
-        parts += ['', pick.reasoning.strip() or '_The judge said nothing._']
+        if not pick.uncontested:
+            parts += [
+                '', pick.reasoning.strip() or '_The judge said nothing._'
+            ]
         if pick.retained:
             parts += [
                 '',
@@ -2603,10 +2656,21 @@ def _pr_selection_lines(
         beat = (
             f' over {", ".join(f"`{c}`" for c in others)}' if others else ''
         )
-        if pick.honored:
+        if pick.uncontested:
+            parts.append(
+                f'- `{pick.stage}`: `{pick.selected}` was selected '
+                f'uncontested, with no judge: every other candidate '
+                f'was withdrawn — {_withdrawn(pick)}.'
+            )
+        elif pick.honored:
+            withdrawn = (
+                f' Withdrawn before judging: {_withdrawn(pick)}.'
+                if pick.forfeited
+                else ''
+            )
             parts.append(
                 f'- `{pick.stage}`: the judge chose '
-                f'`{pick.selected}`{beat}.'
+                f'`{pick.selected}`{beat}.{withdrawn}'
             )
         else:
             parts.append(
@@ -2969,6 +3033,9 @@ class PipelineRunner:
         #: forfeited candidate is excluded from judging: comparing a
         #: vetted branch against an unvetted one is not a choice.
         self._forfeited: set[str] = set()
+        #: Each withdrawn candidate's ``(review stage, rounds)``, so the
+        #: selection records the reduced field it was made from (#47).
+        self._forfeits: dict[str, tuple[str, int]] = {}
         #: Harness CLI versions each session's VM had installed, by
         #: session label: ``{'runs': cli, 'versions': {cli: version}}``.
         #: Persisted, so a wedged run can still be compared with the
@@ -3183,12 +3250,12 @@ class PipelineRunner:
                 else:
                     # The planner runs ONCE (+ proposes the chunk list).
                     for stage in planner:
-                        self._exec_stage(stage)
+                        self._exec_top_level(stage)
                     if self._is_campaign(build):
                         self._run_campaign(build, per_module=False)
                     else:
                         for stage in build:
-                            self._exec_stage(stage)
+                            self._exec_top_level(stage)
                         self._verify_publish_target()
                         self._publish()
                 finished = True
@@ -3284,7 +3351,7 @@ class PipelineRunner:
                 if st.run or st.parallel:
                     self._stage_by_id[st.id] = st
             for st in staged:
-                self._exec_stage(st)
+                self._exec_top_level(st)
             winner = self._resolve_campaign_winner(sub.id)
             # Gate BEFORE the thread advances: a chunk that cannot pass
             # verification must not become the base every later module
@@ -4761,6 +4828,9 @@ class PipelineRunner:
         stated: str | None,
         reasoning: str,
         retained: tuple[tuple[str, str], ...] = (),
+        *,
+        forfeited: tuple[tuple[str, str, int], ...] = (),
+        uncontested: bool = False,
     ) -> None:
         """
         Record a judge's choice before its session is disposed.
@@ -4782,6 +4852,9 @@ class PipelineRunner:
             that fails in between still explains itself.
         :param retained: ``(node, bundle-path)`` for each preserved
             loser, so the record says where the losing code lives.
+        :param forfeited: ``(candidate, review, rounds)`` for each
+            candidate withdrawn before judging.
+        :param uncontested: Only one candidate was left; no judge ran.
         """
         pick = JudgePick(
             chunk=self._active_subtask.id if self._active_subtask else None,
@@ -4791,6 +4864,8 @@ class PipelineRunner:
             stated=stated,
             reasoning=reasoning,
             retained=retained,
+            forfeited=forfeited,
+            uncontested=uncontested,
         )
         self._picks.append(pick)
         self._wt.write_run_artifact(
@@ -4798,6 +4873,9 @@ class PipelineRunner:
             f'judging/{stage_id}.md',
             render_judge_decision([pick], title=f'Judging — {stage_id}'),
         )
+        if pick.uncontested:
+            # _select_uncontested has already said why.
+            return
         if pick.honored:
             click.echo(
                 f'[judge] {stage_id}: selected {selected} from '
@@ -5839,6 +5917,7 @@ class PipelineRunner:
             self._forfeited.add(exc.stage_id)
             if target:
                 self._forfeited.add(target)
+                self._forfeits[target] = (exc.stage_id, exc.rounds)
             click.echo(
                 f'[forfeit] {exc.stage_id}: no consensus after '
                 f'{exc.rounds} round(s), so '
@@ -5849,6 +5928,87 @@ class PipelineRunner:
                 f'the selection.'
             )
         return True
+
+    def _exec_top_level(self, stage: pipeline.PipelineStage) -> None:
+        """
+        Run a top-level stage; a blocked review may forfeit a candidate.
+
+        :param stage: A stage from the pipeline's top-level list.
+        :raises _Blocked: When the blocked review has no rival candidate
+            left to carry the run.
+        """
+        try:
+            self._exec_stage(stage)
+        except _Blocked as exc:
+            if stage.parallel or self._stage_kind(stage) != 'review':
+                raise
+            if not self._forfeit_to_a_judge(stage, exc):
+                raise
+
+    def _forfeit_to_a_judge(
+        self, stage: pipeline.PipelineStage, exc: _Blocked
+    ) -> bool:
+        """
+        Withdraw a top-level review's candidate if a judge has rivals.
+
+        The forfeit used to be reached only for reviews grouped under
+        ``parallel:``, while both shipped race examples declare their
+        reviews as top-level stages. One candidate that could not
+        converge then ended the whole run, and its rival's review never
+        started (#47).
+
+        Reviews run in order here, so whether a rival clears is not yet
+        known. The candidate is withdrawn and the run continues. A
+        candidate is only ever withdrawn while a rival remains, so the
+        review that would withdraw the last one finds no rival and
+        blocks the run itself, and a judge is never left with none.
+
+        :param stage: The top-level review stage that blocked.
+        :param exc: Its ``_Blocked``.
+        :returns: Whether the run may continue without the candidate.
+        """
+        target = stage.on_block
+        if not target:
+            return False
+        rivals = self._rival_candidates(target)
+        if not rivals:
+            return False
+        with self._lock:
+            self._forfeited.update((stage.id, target))
+            self._forfeits[target] = (stage.id, exc.rounds)
+        click.echo(
+            f'[forfeit] {stage.id}: no consensus after {exc.rounds} '
+            f'round(s), so {target} is withdrawn. The judge still has '
+            f'{", ".join(rivals)}; if none of them clears review, the run '
+            f'blocks. The reduced field is recorded with the selection.'
+        )
+        return True
+
+    def _rival_candidates(self, target: str) -> list[str]:
+        """
+        Candidates still competing with *target* at any judge.
+
+        Read from the DECLARED pipeline: a rival whose review has not
+        run yet still counts.
+
+        :param target: The writer node being withdrawn.
+        :returns: Rival writer ids not already withdrawn, in order.
+        """
+        rivals: list[str] = []
+        for judge in self._stage_by_id.values():
+            if self._stage_kind(judge) != 'judge' or target not in judge.needs:
+                continue
+            for need in judge.needs:
+                declared = self._stage_by_id.get(need)
+                if (
+                    need != target
+                    and need not in self._forfeited
+                    and need not in rivals
+                    and declared is not None
+                    and self._stage_kind(declared) == 'writer'
+                ):
+                    rivals.append(need)
+        return rivals
 
     def _exec_stage(self, stage: pipeline.PipelineStage) -> None:
         if stage.parallel:
@@ -5869,7 +6029,7 @@ class PipelineRunner:
                 # blocked sibling from the recorded verdicts rather
                 # than that one exception.
                 blocked = [exc] + [
-                    _Blocked(sub.id, 0)
+                    _Blocked(sub.id, self._review_rounds.get(sub.id, 0))
                     for sub in stage.parallel
                     if sub.id != exc.stage_id
                     and (node := self._nodes.get(sub.id)) is not None
@@ -7818,11 +7978,19 @@ class PipelineRunner:
 
     def _run_judge(self, stage: pipeline.PipelineStage) -> None:
         candidates = self._judge_candidates(stage)
+        forfeited = tuple(
+            (need, *self._forfeits[need])
+            for need in stage.needs
+            if need in self._forfeits
+        )
         if not candidates:
             raise PipelineRunError(
                 f'judge {stage.id!r} has no writer candidates in needs'
             )
         self._require_one_contract(stage, candidates)
+        if forfeited and len(candidates) == 1:
+            self._select_uncontested(stage, candidates[0], forfeited)
+            return
         wt = self._wt.create_judge_worktree(
             self._run_id, stage.id, candidates, replace=self._resume
         )
@@ -7891,7 +8059,10 @@ class PipelineRunner:
         # branches live only there, and the run directory holds the only
         # copy — teardown deletes it (TASKS.md #32).
         retained = self._retain_losers(candidates, sel)
-        self._record_pick(stage.id, candidates, sel, stated, out, retained)
+        self._record_pick(
+            stage.id, candidates, sel, stated, out, retained,
+            forfeited=forfeited,
+        )
         # Publish the winner as the judge node's OWN hub branch, so a
         # downstream stage can seed `from:` the judge (refactor the
         # winner, review it) — a judge otherwise leaves no branch to
@@ -7905,6 +8076,45 @@ class PipelineRunner:
             session=session,
             output=out,
             selected=sel,
+        )
+        self._last_branch_node = stage.id
+
+    def _select_uncontested(
+        self,
+        stage: pipeline.PipelineStage,
+        selected: str,
+        forfeited: tuple[tuple[str, str, int], ...],
+    ) -> None:
+        """
+        Select the one candidate left, without booting a judge.
+
+        A judge VM choosing between one candidate buys nothing, and its
+        record would read as a judgment. Recorded as uncontested, with
+        the candidates that were withdrawn (#47).
+
+        :param stage: The judge stage.
+        :param selected: The only candidate left.
+        :param forfeited: ``(candidate, review, rounds)`` per forfeit.
+        """
+        withdrawn = ', '.join(
+            f'{cand} ({review}, {rounds} round(s))'
+            for cand, review, rounds in forfeited
+        )
+        click.echo(
+            f'[judge] {stage.id}: {selected} is the only candidate left '
+            f'after {withdrawn} withdrew, so no judge turn runs. '
+            f'Recorded as UNCONTESTED, not as a judgment.'
+        )
+        self._record_pick(
+            stage.id, [selected], selected, None, '',
+            forfeited=forfeited, uncontested=True,
+        )
+        self._wt.alias_node_branch(self._run_id, stage.id, selected)
+        self._nodes[stage.id] = NodeResult(
+            stage.id,
+            'judge',
+            branch=self._nodes[selected].branch,
+            selected=selected,
         )
         self._last_branch_node = stage.id
 

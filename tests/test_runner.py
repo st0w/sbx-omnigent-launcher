@@ -3349,6 +3349,273 @@ def _rec(reviewer='bugs', target='impl-a', round_no=1, findings=(),
     )
 
 
+#: Three candidates reviewed as ordinary TOP-LEVEL stages, as the
+#: shipped examples declare them, then refactored after the pick.
+_THREE_REVIEWED = """\
+name: race3
+repo: https://github.com/org/proj.git
+publish:
+  branch: refactor
+task: |
+  implement it
+agents:
+  ca: {template: coder, model: claude-sonnet-5}
+  cb: {template: coder, model: claude-sonnet-5}
+  cc: {template: coder, model: claude-sonnet-5}
+  sec: {template: security-reviewer, model: claude-fable-5}
+  jg: {template: judge, model: claude-opus-4-8}
+  rf: {template: refactoring, model: claude-sonnet-5}
+stages:
+  - id: impl
+    parallel:
+      - {id: impl-a, run: ca, write: true}
+      - {id: impl-b, run: cb, write: true}
+      - {id: impl-c, run: cc, write: true}
+  - {id: review-a, run: [sec], needs: [impl-a], on_block: impl-a}
+  - {id: review-b, run: [sec], needs: [impl-b], on_block: impl-b}
+  - {id: review-c, run: [sec], needs: [impl-c], on_block: impl-c}
+  - id: pick
+    run: jg
+    needs: [impl-a, impl-b, impl-c]
+    selects: branch
+  - {id: refactor, run: rf, write: true, from: pick, needs: [pick]}
+"""
+
+
+class TestATopLevelBlockedReviewForfeits(_Base):
+    """A candidate's blocked review withdraws THAT candidate (#47).
+
+    The forfeit used to be reached only for reviews grouped under
+    `parallel:`. Both shipped race examples declare `review-a` and
+    `review-b` as top-level stages, so one candidate that could not
+    converge ended the whole run and the other was never reviewed."""
+
+    def _race(self, text, replies, **kw):
+        sc = FakeSC(dict(replies))
+        with mock.patch.object(R.click, 'echo') as echo:
+            result, _sc, wt = self._run(
+                text, dict(replies), sc=sc, max_review_rounds=1, **kw
+            )
+        said = [str(c.args[0]) for c in echo.call_args_list if c.args]
+        driven = {sc._label.get(sid) for sid, _m in sc.sent}
+        return result, wt, said, driven
+
+    def _two(self, review_a, review_b):
+        return self._race(
+            _COMPETE_REVIEWED,
+            {
+                'impl-a': 'A', 'impl-b': 'B',
+                'review-a-sec': review_a, 'review-b-sec': review_b,
+                'pick': 'SELECT: impl-a',
+            },
+        )
+
+    def test_the_sibling_review_still_runs(self) -> None:
+        _r, _wt, _said, driven = self._two(
+            'VERDICT: BLOCKING', 'VERDICT: APPROVED'
+        )
+        self.assertIn('review-b-sec', driven)
+
+    def test_the_run_completes_with_the_survivor(self) -> None:
+        result, wt, _said, _driven = self._two(
+            'VERDICT: BLOCKING', 'VERDICT: APPROVED'
+        )
+        self.assertEqual(result.status, 'completed')
+        self.assertIn(('pick', 'impl-b'), wt.aliases)
+
+    def test_one_survivor_is_selected_without_a_judge(self) -> None:
+        # Booting a VM to choose between one candidate buys nothing,
+        # and its record would read as a judgment.
+        result, _wt, _said, driven = self._two(
+            'VERDICT: BLOCKING', 'VERDICT: APPROVED'
+        )
+        self.assertNotIn('pick', driven)
+        self.assertEqual(result.nodes['pick'].selected, 'impl-b')
+
+    def test_an_uncontested_pick_is_recorded_as_one(self) -> None:
+        _r, wt, _said, _driven = self._two(
+            'VERDICT: BLOCKING', 'VERDICT: APPROVED'
+        )
+        pick = wt.states[-1]['judge_picks'][0]
+        self.assertTrue(pick['uncontested'])
+        self.assertIsNone(pick['stated'])
+        self.assertEqual(pick['selected'], 'impl-b')
+        # 1 round re-drives impl-a; the second block exceeds the cap.
+        self.assertEqual(pick['forfeited'], [['impl-a', 'review-a', 2]])
+
+    def test_the_selection_record_says_uncontested(self) -> None:
+        _r, wt, _said, _driven = self._two(
+            'VERDICT: BLOCKING', 'VERDICT: APPROVED'
+        )
+        doc = wt.artifacts['judging/pick.md']
+        self.assertIn('Uncontested', doc)
+        self.assertIn('`impl-a`', doc)
+        self.assertIn('`review-a`', doc)
+        # Never presented as a judge's failure to decide.
+        self.assertNotIn("Not the judge's stated choice", doc)
+
+    def test_the_pull_request_says_uncontested(self) -> None:
+        _r, wt, _said, _driven = self._two(
+            'VERDICT: BLOCKING', 'VERDICT: APPROVED'
+        )
+        body = wt.pr_bodies[-1]
+        self.assertIn('uncontested', body)
+        self.assertIn('`impl-a`', body)
+        self.assertNotIn('no decision', body)
+
+    def test_the_console_names_the_withdrawn_candidate(self) -> None:
+        _r, _wt, said, _driven = self._two(
+            'VERDICT: BLOCKING', 'VERDICT: APPROVED'
+        )
+        forfeit = [ln for ln in said if ln.startswith('[forfeit]')]
+        self.assertEqual(len(forfeit), 1, said)
+        self.assertIn('impl-a', forfeit[0])
+
+    def test_every_candidate_blocking_still_blocks_the_run(self) -> None:
+        result, wt, _said, driven = self._two(
+            'VERDICT: BLOCKING', 'VERDICT: BLOCKING'
+        )
+        self.assertEqual(result.status, 'blocked')
+        # review-a withdrew impl-a; review-b then had no rival left, so
+        # the run stops where it actually ended.
+        self.assertEqual(result.blocked_stage, 'review-b')
+        # Both candidates got their review before the run gave up.
+        self.assertIn('review-b-sec', driven)
+        self.assertNotIn('pick', driven)
+        self.assertIsNone(wt.published)
+
+    def test_the_second_candidate_blocking_also_forfeits(self) -> None:
+        result, wt, _said, _driven = self._two(
+            'VERDICT: APPROVED', 'VERDICT: BLOCKING'
+        )
+        self.assertEqual(result.status, 'completed')
+        self.assertIn(('pick', 'impl-a'), wt.aliases)
+
+    def test_two_survivors_are_judged_and_the_forfeit_recorded(
+        self,
+    ) -> None:
+        result, wt, _said, driven = self._race(
+            _THREE_REVIEWED,
+            {
+                'impl-a': 'A', 'impl-b': 'B', 'impl-c': 'C',
+                'review-a-sec': 'VERDICT: BLOCKING',
+                'review-b-sec': 'VERDICT: APPROVED',
+                'review-c-sec': 'VERDICT: APPROVED',
+                'pick': 'SELECT: impl-c', 'refactor': 'R',
+            },
+        )
+        self.assertEqual(result.status, 'completed')
+        self.assertIn('pick', driven)
+        pick = wt.states[-1]['judge_picks'][0]
+        self.assertFalse(pick['uncontested'])
+        self.assertEqual(pick['candidates'], ['impl-b', 'impl-c'])
+        self.assertEqual(pick['forfeited'], [['impl-a', 'review-a', 2]])
+        doc = wt.artifacts['judging/pick.md']
+        self.assertIn('`review-a`', doc)
+
+    def test_a_stage_after_an_uncontested_pick_still_runs(self) -> None:
+        result, wt, _said, driven = self._race(
+            _THREE_REVIEWED,
+            {
+                'impl-a': 'A', 'impl-b': 'B', 'impl-c': 'C',
+                'review-a-sec': 'VERDICT: BLOCKING',
+                'review-b-sec': 'VERDICT: BLOCKING',
+                'review-c-sec': 'VERDICT: APPROVED',
+                'refactor': 'R',
+            },
+        )
+        self.assertEqual(result.status, 'completed')
+        self.assertIn('refactor', driven)
+        self.assertEqual(wt.node_from['refactor'], 'pick')
+        pick = wt.states[-1]['judge_picks'][0]
+        self.assertEqual(
+            pick['forfeited'],
+            [['impl-a', 'review-a', 2], ['impl-b', 'review-b', 2]],
+        )
+
+    def test_a_review_with_no_competitor_blocks_at_once(self) -> None:
+        # Nothing downstream judges refactor, so there is no field for
+        # it to forfeit from: the run stops where it always did.
+        text = _THREE_REVIEWED + (
+            '  - {id: review-r, run: [sec], needs: [refactor], '
+            'on_block: refactor}\n'
+        )
+        result, _wt, _said, _driven = self._race(
+            text,
+            {
+                'impl-a': 'A', 'impl-b': 'B', 'impl-c': 'C',
+                'review-a-sec': 'VERDICT: APPROVED',
+                'review-b-sec': 'VERDICT: APPROVED',
+                'review-c-sec': 'VERDICT: APPROVED',
+                'pick': 'SELECT: impl-c', 'refactor': 'R',
+                'review-r-sec': 'VERDICT: BLOCKING',
+            },
+        )
+        self.assertEqual(result.status, 'blocked')
+        self.assertEqual(result.blocked_stage, 'review-r')
+
+
+    def test_a_non_writer_the_judge_needs_is_no_rival(self) -> None:
+        # The planner is in the judge's needs, but it is not a
+        # candidate: withdrawing impl-a would leave nothing to judge.
+        text = """\
+name: solo
+repo: https://github.com/org/proj.git
+publish:
+  branch: pick
+task: |
+  implement it
+agents:
+  plan: {template: planner, model: claude-sonnet-5}
+  ca: {template: coder, model: claude-sonnet-5}
+  sec: {template: security-reviewer, model: claude-fable-5}
+  jg: {template: judge, model: claude-opus-4-8}
+stages:
+  - {id: plan, run: plan}
+  - {id: impl-a, run: ca, write: true, needs: [plan]}
+  - {id: review-a, run: [sec], needs: [impl-a], on_block: impl-a}
+  - {id: pick, run: jg, needs: [plan, impl-a], selects: branch}
+"""
+        result, _wt, said, _driven = self._race(
+            text,
+            {'plan': 'P', 'impl-a': 'A', 'review-a-sec': 'VERDICT: BLOCKING'},
+        )
+        self.assertEqual(result.status, 'blocked')
+        self.assertEqual(result.blocked_stage, 'review-a')
+        self.assertFalse([ln for ln in said if ln.startswith('[forfeit]')])
+
+
+class TestJudgePickRecordsTheField(unittest.TestCase):
+    def _pick(self, **kw):
+        base = {
+            'chunk': None, 'stage': 'pick', 'candidates': ('impl-b',),
+            'selected': 'impl-b', 'stated': None,
+        }
+        return R.JudgePick(**{**base, **kw})
+
+    def test_forfeits_and_uncontested_survive_a_round_trip(self) -> None:
+        pick = self._pick(
+            forfeited=(('impl-a', 'review-a', 3),), uncontested=True
+        )
+        self.assertEqual(R.JudgePick.from_dict(pick.as_dict()), pick)
+
+    def test_a_pick_from_older_state_is_contested_with_no_forfeits(
+        self,
+    ) -> None:
+        raw = self._pick(stated='impl-b').as_dict()
+        del raw['forfeited'], raw['uncontested']
+        pick = R.JudgePick.from_dict(raw)
+        self.assertEqual(pick.forfeited, ())
+        self.assertFalse(pick.uncontested)
+
+    def test_a_malformed_forfeit_is_dropped(self) -> None:
+        raw = self._pick().as_dict()
+        raw['forfeited'] = [['impl-a', 'review-a', 'three'], 'junk',
+                            ['impl-c', 'review-c', 2]]
+        pick = R.JudgePick.from_dict(raw)
+        self.assertEqual(pick.forfeited, (('impl-c', 'review-c', 2),))
+
+
 class TestTheFindingsLedgerIsAppendOnly(unittest.TestCase):
     """
     The ledger is a HUMAN-EDITED artifact: a person annotates status and
@@ -11360,6 +11627,7 @@ class BlockedReviewForfeitsOneCandidate(unittest.TestCase):
         runner._nodes = {}
         runner._stage_by_id = {}
         runner._forfeited = set()
+        runner._forfeits = {}
         return runner
 
     def test_a_cleared_sibling_lets_the_run_continue(self) -> None:
@@ -11378,6 +11646,8 @@ class BlockedReviewForfeitsOneCandidate(unittest.TestCase):
         self.assertTrue(proceed)
         # The blocked review AND the candidate it was vetting withdraw.
         self.assertEqual(runner._forfeited, {'review-b', 'impl-b'})
+        # And the selection can say so, with the rounds it took (#47).
+        self.assertEqual(runner._forfeits, {'impl-b': ('review-b', 4)})
 
     def test_no_cleared_sibling_still_stops_the_run(self) -> None:
         # Nothing was vetted, so there is nothing to judge. The caller
