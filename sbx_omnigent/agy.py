@@ -969,6 +969,9 @@ def _looks_like_relogin(text: str) -> bool:
     signals = (
         'unauthenticated', 'invalid_grant', 'invalid_token', '401',
         'login', 'reauth', 'expired or revoked', 'permission_denied',
+        # agy >= 1.1 words a dead login as "Please sign in to view
+        # available models", which matched none of the above (#26).
+        'sign in',
     )
     return any(s in low for s in signals)
 
