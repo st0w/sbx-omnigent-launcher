@@ -124,6 +124,12 @@ class FakeWT:
         #: ordered ('settle'|'commit', node_id) events, to assert a
         #: writer's worktree is settled BEFORE it is committed.
         self.events: list[tuple[str, str]] = []
+        #: (node_id, ancestor) -> whether the node's branch holds it.
+        #: Default True: a candidate carries its seed unless a test
+        #: says otherwise.
+        self.contains: dict[tuple[str, str], bool] = {}
+        #: Every branch_contains question asked, in order.
+        self.contains_queries: list[tuple[str, str]] = []
 
     def node_is_dirty(self, run_id, node_id) -> bool:
         return node_id in self.dirty_nodes
@@ -156,6 +162,10 @@ class FakeWT:
     def reseed_node_worktree(self, run_id, node_id, from_node) -> str:
         self.reseeds.append((node_id, from_node))
         return f'/wt/{run_id}/nodes/{node_id}'
+
+    def branch_contains(self, run_id, node_id, *, ancestor) -> bool:
+        self.contains_queries.append((node_id, ancestor))
+        return self.contains.get((node_id, ancestor), True)
 
     def refresh_build_cache(self, path) -> list[str]:
         self.cache_refreshed.append(path)
@@ -5647,6 +5657,137 @@ class TestCompetingWriters(_Base):
         self.assertNotIn('Task:\nimplement parse_ports', rf_msg)
         # the refactored branch (reviewed) is what ships.
         self.assertEqual(wt.published[0], 'refactor')
+
+
+class TestAWriterMustHaveTheSeedItNeeds(_Base):
+    """
+    A writer whose upstream branch cannot be resolved was cut from
+    `base_branch` in silence.
+
+    `_seed_from` returns None both for "this writer legitimately starts
+    from base" and for "the writer I inherit from is missing", and the
+    caller cannot tell those apart. The second is the one that matters:
+    a competing implementation cut from base carries none of the frozen
+    tests, so the judge compares work done under two different
+    contracts with nothing saying so.
+    """
+
+    def _runner(self, text):
+        cfg = self._cfg(text)
+        wt = FakeWT()
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=wt,
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        return runner, wt
+
+    def _stage(self, runner, stage_id):
+        return runner._stage_by_id[stage_id]
+
+    def test_an_unresolvable_writer_seed_raises(self) -> None:
+        runner, wt = self._runner(_TDD)
+        with self.assertRaises(R.PipelineRunError) as caught:
+            runner._provision_writer(self._stage(runner, 'build'))
+        said = str(caught.exception)
+        self.assertIn('build', said)
+        self.assertIn('tests', said)
+        # And nothing was cut: refusing has to come BEFORE the clone,
+        # or the wrong tree already exists.
+        self.assertEqual(wt.node_from, {})
+
+    def test_the_error_says_what_it_would_have_done(self) -> None:
+        runner, _wt = self._runner(_TDD)
+        with self.assertRaises(R.PipelineRunError) as caught:
+            runner._provision_writer(self._stage(runner, 'build'))
+        self.assertIn('base', str(caught.exception).lower())
+
+    def test_a_writer_with_no_writer_upstream_still_cuts_from_base(
+        self,
+    ) -> None:
+        # Two competing writers with no `needs` at all: cutting from
+        # base is the whole design, and must not raise.
+        runner, wt = self._runner(_COMPETE)
+        runner._provision_writer(self._stage(runner, 'impl-a'))
+        self.assertIsNone(wt.node_from['impl-a'])
+
+    def test_a_writer_that_needs_only_a_reader_cuts_from_base(self) -> None:
+        # `needs: [plan]` is a planner, which produces no branch. This
+        # is the case the guard must never mistake for the bug.
+        runner, wt = self._runner(_LINEAR)
+        runner._nodes['plan'] = R.NodeResult('plan', 'reader')
+        runner._provision_writer(self._stage(runner, 'build'))
+        self.assertIsNone(wt.node_from['build'])
+
+    def test_a_resolved_seed_provisions_normally(self) -> None:
+        runner, wt = self._runner(_TDD)
+        runner._nodes['tests'] = R.NodeResult(
+            'tests', 'writer', branch='pl/r1/tests'
+        )
+        runner._provision_writer(self._stage(runner, 'build'))
+        self.assertEqual(wt.node_from['build'], 'tests')
+
+
+class TestAJudgeComparesOneContract(_Base):
+    """
+    Two candidates are only comparable if they were built against the
+    same frozen suite. A branch that does not carry its seed is not a
+    worse implementation — it is an implementation of a different
+    contract, and judging it produces a result that reads like a
+    choice.
+    """
+
+    def _runner(self, wt=None):
+        cfg = self._cfg(_TDD_JUDGE)
+        wt = wt if wt is not None else FakeWT()
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({'pick': 'SELECT: impl-a'}),
+            worktree_manager=wt, run_id='r1',
+            agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        for node in ('tests', 'impl-a', 'impl-b'):
+            runner._nodes[node] = R.NodeResult(
+                node, 'writer', branch=f'pl/r1/{node}'
+            )
+        return runner, wt
+
+    def test_a_candidate_missing_its_seed_stops_the_judge(self) -> None:
+        wt = FakeWT()
+        wt.contains[('impl-b', 'tests')] = False
+        runner, _wt = self._runner(wt)
+        with self.assertRaises(R.PipelineRunError) as caught:
+            runner._run_judge(runner._stage_by_id['pick'])
+        said = str(caught.exception)
+        self.assertIn('impl-b', said)
+        self.assertIn('tests', said)
+        # It must refuse BEFORE building the comparison tree.
+        self.assertEqual(wt.judges, {})
+
+    def test_candidates_that_share_the_seed_are_judged(self) -> None:
+        runner, wt = self._runner()
+        runner._run_judge(runner._stage_by_id['pick'])
+        self.assertEqual(wt.judges['pick'], ['impl-a', 'impl-b'])
+        self.assertIn(('impl-a', 'tests'), wt.contains_queries)
+        self.assertIn(('impl-b', 'tests'), wt.contains_queries)
+
+    def test_a_candidate_cut_from_base_is_not_questioned(self) -> None:
+        # _COMPETE's writers have no seed at all, so there is no
+        # contract to compare against and nothing to check.
+        cfg = self._cfg(_COMPETE)
+        wt = FakeWT()
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({'pick': 'SELECT: impl-a'}),
+            worktree_manager=wt, run_id='r1',
+            agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        for node in ('impl-a', 'impl-b'):
+            runner._nodes[node] = R.NodeResult(
+                node, 'writer', branch=f'pl/r1/{node}'
+            )
+        runner._run_judge(runner._stage_by_id['pick'])
+        self.assertEqual(wt.contains_queries, [])
 
 
 _TDD = """\

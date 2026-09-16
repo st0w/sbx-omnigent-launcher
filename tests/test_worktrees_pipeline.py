@@ -233,6 +233,71 @@ class TestPipelineWorktrees(unittest.TestCase):
         ).strip()
         self.assertEqual(ahead, '1')
 
+    def test_a_recut_keeps_its_own_work_when_it_holds_the_seed(
+        self,
+    ) -> None:
+        # The resume case this inheritance exists for: the node's
+        # branch is its seed plus its own partial commit, so re-cutting
+        # from that branch keeps the work the failed attempt did.
+        self.mgr.create_run('run1', self.repo)
+        tests = self.mgr.create_node_worktree('run1', 'tests')
+        (Path(tests) / 'test_x.py').write_text('t\n', encoding='utf-8')
+        self.mgr.commit_node('run1', 'tests', message='tests')
+        impl = self.mgr.create_node_worktree(
+            'run1', 'impl-a', from_node='tests'
+        )
+        (Path(impl) / 'partial.py').write_text('half\n', encoding='utf-8')
+        self.mgr.commit_node('run1', 'impl-a', message='partial')
+        again = self.mgr.create_node_worktree(
+            'run1', 'impl-a', from_node='tests', replace=True
+        )
+        self.assertIn('partial.py', _files(again))
+        self.assertIn('test_x.py', _files(again))
+
+    def test_a_recut_refuses_a_branch_that_predates_its_seed(self) -> None:
+        # A writer pre-warmed during planning is cut while its seed is
+        # still at base. If the run ends before it is driven, its
+        # branch holds NONE of the frozen tests — and a resume that
+        # inherited that branch would build against no contract at all,
+        # with nothing saying so.
+        self.mgr.create_run('run1', self.repo)
+        tests = self.mgr.create_node_worktree('run1', 'tests')
+        # impl-a is cut BEFORE tests commits: its branch is base.
+        self.mgr.create_node_worktree('run1', 'impl-a')
+        (Path(tests) / 'test_x.py').write_text('t\n', encoding='utf-8')
+        self.mgr.commit_node('run1', 'tests', message='tests')
+        again = self.mgr.create_node_worktree(
+            'run1', 'impl-a', from_node='tests', replace=True
+        )
+        # The seed wins: a stale branch is not a reason to drop the
+        # contract the competitor is held to.
+        self.assertIn('test_x.py', _files(again))
+
+    def test_branch_contains_reports_the_seed_honestly(self) -> None:
+        self.mgr.create_run('run1', self.repo)
+        tests = self.mgr.create_node_worktree('run1', 'tests')
+        (Path(tests) / 'test_x.py').write_text('t\n', encoding='utf-8')
+        self.mgr.commit_node('run1', 'tests', message='tests')
+        self.mgr.create_node_worktree('run1', 'holds', from_node='tests')
+        self.mgr.create_node_worktree('run1', 'lacks')
+        self.assertTrue(
+            self.mgr.branch_contains('run1', 'holds', ancestor='tests')
+        )
+        self.assertFalse(
+            self.mgr.branch_contains('run1', 'lacks', ancestor='tests')
+        )
+
+    def test_branch_contains_is_false_for_a_branch_that_is_not_there(
+        self,
+    ) -> None:
+        # Unknowable is not the same as true: a missing branch must
+        # never read as "the contract is present".
+        self.mgr.create_run('run1', self.repo)
+        self.mgr.create_node_worktree('run1', 'tests')
+        self.assertFalse(
+            self.mgr.branch_contains('run1', 'ghost', ancestor='tests')
+        )
+
     def test_reseed_missing_worktree_raises(self) -> None:
         self.mgr.create_run('run1', self.repo)
         with self.assertRaises(click.ClickException):
