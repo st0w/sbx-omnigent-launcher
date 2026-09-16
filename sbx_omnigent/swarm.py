@@ -29,6 +29,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -1068,16 +1069,47 @@ def _detect_agy_bindings(
     :returns: The subset of *bound_ids* resolving to an agy agent, in
         input order, deduplicated.
     """
+    return _bindings_on(agents, bound_ids, agy.AGY_HARNESSES)
+
+
+def _detect_codex_bindings(
+    agents: list[dict[str, object]], bound_ids: list[str]
+) -> list[str]:
+    """
+    Return the bound agent refs that use a Codex harness.
+
+    :param agents: Catalog dicts, each ``{id, name, harness}``.
+    :param bound_ids: Agent refs bound to this swarm (ids or names).
+    :returns: The subset of *bound_ids* resolving to a Codex agent, in
+        input order, deduplicated.
+    """
+    return _bindings_on(agents, bound_ids, codex.CODEX_HARNESSES)
+
+
+def _bindings_on(
+    agents: list[dict[str, object]],
+    bound_ids: list[str],
+    harnesses: frozenset[str],
+) -> list[str]:
+    """
+    Return the bound agent refs whose catalog harness is in *harnesses*.
+
+    :param agents: Catalog dicts, each ``{id, name, harness}``.
+    :param bound_ids: Agent refs bound to this swarm (ids or names).
+    :param harnesses: The harness ids to keep.
+    :returns: Matching refs, in input order, deduplicated. An
+        unresolvable ref is ignored.
+    """
     harness_by_ref = _harness_by_ref(agents)
     seen: set[str] = set()
-    agy_bound: list[str] = []
+    bound: list[str] = []
     for ref in bound_ids:
         if ref in seen:
             continue
         seen.add(ref)
-        if harness_by_ref.get(ref) in agy.AGY_HARNESSES:
-            agy_bound.append(ref)
-    return agy_bound
+        if harness_by_ref.get(ref) in harnesses:
+            bound.append(ref)
+    return bound
 
 
 def _guard_agy_bindings(
@@ -1104,6 +1136,44 @@ def _guard_agy_bindings(
         'running token harvester (`omni-sbx-agy harvest`). Once both are '
         'in place, re-run with --agy (or set OMNI_SBX_AGY_ENABLED=1).'
     )
+
+
+def _preflight_codex_bindings(
+    agents: list[dict[str, object]],
+    bound_ids: list[str],
+    *,
+    path: Path | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """
+    Refuse to start a swarm with a Codex agent on a dead credential.
+
+    The same check the pipeline runner makes before provisioning
+    (:func:`codex.preflight`), which ``start`` never ran: a swarm with a
+    Codex agent found out on its first turn, as a startup timeout,
+    after its microVMs were already spent (#26). It reads the host
+    token's expiry; it cannot see a refresh token the server has
+    already rejected.
+
+    :param agents: The built-in agent catalog. An empty list (the
+        lookup failed) detects nothing, as for the agy guard.
+    :param bound_ids: Agent refs bound to this swarm.
+    :param path: Override for the host credential file (tests).
+    :param now: Override for the clock (tests).
+    :returns: A warning to show when the token expires soon, else
+        ``None``. A swarm with no Codex agent is never checked.
+    :raises click.ClickException: If a Codex agent is bound and there is
+        no usable credential; the message names the re-login command.
+    """
+    names = _detect_codex_bindings(agents, bound_ids)
+    if not names:
+        return None
+    try:
+        return codex.preflight(path=path, now=now)
+    except codex.CodexAuthError as exc:
+        raise click.ClickException(
+            f'Codex agent(s) {", ".join(names)} are bound, but {exc}'
+        ) from exc
 
 
 def _read_message(message: str | None, message_file: str | None) -> str:
@@ -1239,6 +1309,10 @@ def _start(
         catalog = []
     if not _agy_ack_enabled(agy_ack):
         _guard_agy_bindings(catalog, bound_ids)
+    warning = _preflight_codex_bindings(catalog, bound_ids)
+    if warning:
+        # stderr: stdout carries the registry entry as JSON.
+        click.echo(f'[preflight] {warning}', err=True)
     # Per-agent model/effort come from each bound agent's bundle
     # config.yaml and ride the session-create body (model_override /
     # reasoning_effort) — the Polly pin that reaches native harnesses.

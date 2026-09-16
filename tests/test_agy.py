@@ -436,6 +436,20 @@ class TestHarvesterPoke(unittest.TestCase):
         with self.assertRaises(AgyReloginNeeded):
             h.poke()
 
+    def test_agy_asking_to_sign_in_is_relogin(self) -> None:
+        # #26: agy's current wording for a dead login, verbatim from the
+        # harvest log. It matched none of the older signals, so the
+        # harvester logged a generic `cycle failed` for every cycle.
+        proc = FakeProc(
+            0,
+            'AGY_POKE_FAIL 1 Fetching available models... Error: Please '
+            'sign in to view available models. Launch the CLI without '
+            'arguments to sign in.',
+        )
+        h = _quiet(run=RecordingRunner([proc]))
+        with self.assertRaises(AgyReloginNeeded):
+            h.poke()
+
     def test_transient_failure_is_retryable(self) -> None:
         proc = FakeProc(0, 'AGY_POKE_FAIL 1 connection reset by peer')
         h = _quiet(run=RecordingRunner([proc]))
