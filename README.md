@@ -1019,7 +1019,9 @@ at runtime inside the VM, so pinning the image is not enough on its own.
 [`docs/HARNESS-VERSIONS.md`](./docs/HARNESS-VERSIONS.md) records the known-good
 set to compare a wedged run against, and the one operational rule worth
 remembering: **a run that times out on the FIRST turn of a harness gets its pane
-read before anything else is investigated.**
+read before anything else is investigated.** The runner records the versions each
+session's VM had in the run state, and prints a `[versions]` warning when one
+differs from that set or changes during a run.
 
 Update Omnigent as usual:
 

@@ -572,6 +572,14 @@ class _Base(unittest.TestCase):
         backoff = mock.patch.object(R, '_REVIEW_RETRY_BACKOFF_S', 0.0)
         backoff.start()
         self.addCleanup(backoff.stop)
+        # Never `sbx exec` into a real VM. A test that resolves a
+        # sandbox name would otherwise read the versions out of
+        # whatever box on this machine answers to it (#17).
+        versions = mock.patch.object(
+            R.harness_versions, 'read_versions', return_value={}
+        )
+        self.read_versions = versions.start()
+        self.addCleanup(versions.stop)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
@@ -8355,6 +8363,173 @@ class TestLaunchIsVerified(_Base):
         self.assertNotIn('[launch]', said)
 
 
+_KNOWN_GOOD = dict(R.harness_versions.KNOWN_GOOD)
+
+
+class TestHarnessVersionsAreRecorded(_Base):
+    """Which CLI versions a run used must outlive its VMs (#17).
+
+    They self-update inside the VM, and a wedged run could not be
+    compared with the known-good set because nothing wrote them down."""
+
+    def _run_on_vm(self, versions, *, sc=None, pane_text=''):
+        sc = sc if sc is not None else FakeSC(dict(_LINEAR_REPLIES))
+        sc.default_host_id = 'h1'
+        sc.host_names['h1'] = 'managed-h1'
+        if callable(versions):
+            self.read_versions.side_effect = versions
+        else:
+            self.read_versions.return_value = versions
+        with mock.patch.object(
+            R.pane, 'capture_pane', return_value=pane_text
+        ):
+            with mock.patch.object(R.click, 'echo') as echo:
+                try:
+                    result, _sc, wt = self._run(
+                        _LINEAR, dict(_LINEAR_REPLIES), sc=sc
+                    )
+                except R.PipelineRunError:
+                    result, wt = None, None
+        lines = [str(c.args[0]) for c in echo.call_args_list if c.args]
+        return result, wt, [ln for ln in lines if '[versions]' in ln]
+
+    def test_each_session_records_its_versions(self) -> None:
+        _r, wt, _said = self._run_on_vm(_KNOWN_GOOD)
+        recorded = wt.states[-1]['harness_versions']
+        self.assertEqual(
+            recorded['build'], {'runs': 'claude', 'versions': _KNOWN_GOOD}
+        )
+        self.assertEqual(
+            recorded['plan'], {'runs': 'agy', 'versions': _KNOWN_GOOD}
+        )
+        self.assertEqual(
+            {c.args[0] for c in self.read_versions.call_args_list},
+            {'managed-h1'},
+        )
+
+    def test_a_session_is_read_once(self) -> None:
+        # One exec per VM, at its first turn, not one per turn.
+        sc = FakeSC(dict(_LINEAR_REPLIES))
+        self._run_on_vm(_KNOWN_GOOD, sc=sc)
+        self.assertEqual(self.read_versions.call_count, len(sc._label))
+
+    def test_a_session_with_no_vm_reads_nothing(self) -> None:
+        _r, _sc, wt = self._run(_LINEAR, dict(_LINEAR_REPLIES))
+        self.read_versions.assert_not_called()
+        self.assertEqual(wt.states[-1]['harness_versions'], {})
+
+    def test_an_unreadable_vm_records_nothing(self) -> None:
+        _r, wt, said = self._run_on_vm({})
+        self.assertEqual(wt.states[-1]['harness_versions'], {})
+        self.assertEqual(said, [])
+
+    def test_the_known_good_set_is_silent(self) -> None:
+        _r, _wt, said = self._run_on_vm(_KNOWN_GOOD)
+        self.assertEqual(said, [])
+
+    def test_a_version_off_the_known_good_set_is_reported_once(
+        self,
+    ) -> None:
+        # build and review-sec both run claude; twice would be noise.
+        _r, _wt, said = self._run_on_vm(
+            {**_KNOWN_GOOD, 'claude': '2.1.999'}
+        )
+        self.assertEqual(len(said), 1, said)
+        self.assertIn('claude 2.1.999', said[0])
+        self.assertIn(_KNOWN_GOOD['claude'], said[0])
+        self.assertIn(R.harness_versions.KNOWN_GOOD_RECORDED, said[0])
+
+    def test_only_the_cli_a_session_runs_is_compared(self) -> None:
+        # No agent in this pipeline runs codex, so its version is
+        # recorded but not worth a warning.
+        _r, wt, said = self._run_on_vm({**_KNOWN_GOOD, 'codex': '0.0.1'})
+        self.assertEqual(said, [])
+        build = wt.states[-1]['harness_versions']['build']
+        self.assertEqual(build['versions']['codex'], '0.0.1')
+
+    def test_a_change_between_sessions_is_reported(self) -> None:
+        calls: list[str] = []
+
+        def versions(sandbox):
+            calls.append(sandbox)
+            claude = '2.1.266' if len(calls) <= 2 else '2.1.270'
+            return {**_KNOWN_GOOD, 'claude': claude}
+
+        _r, _wt, said = self._run_on_vm(versions)
+        joined = '\n'.join(said)
+        self.assertIn('review-sec: claude 2.1.270', joined)
+        self.assertIn('build ran 2.1.266', joined)
+
+    def test_a_failed_turn_pane_names_the_versions(self) -> None:
+        sc = FakeSC(dict(_LINEAR_REPLIES))
+        sc.fail_labels.add('build')
+        wt = FakeWT()
+        sc.default_host_id = 'h1'
+        sc.host_names['h1'] = 'managed-h1'
+        self.read_versions.return_value = {
+            **_KNOWN_GOOD, 'claude': '2.1.270'
+        }
+        with mock.patch.object(R.pane, 'capture_pane', return_value='x'):
+            with self.assertRaises(R.PipelineRunError):
+                self._run(_LINEAR, dict(_LINEAR_REPLIES), sc=sc, wt=wt)
+        doc = wt.artifacts['turns/build.pane.txt']
+        self.assertIn('claude 2.1.270', doc)
+        # A session whose first turn failed is exactly the one to keep.
+        self.assertEqual(
+            wt.states[-1]['harness_versions']['build']['versions']['claude'],
+            '2.1.270',
+        )
+
+    def test_a_pending_self_update_is_flagged_on_the_pane(self) -> None:
+        sc = FakeSC(dict(_LINEAR_REPLIES))
+        sc.fail_labels.add('build')
+        wt = FakeWT()
+        sc.default_host_id = 'h1'
+        sc.host_names['h1'] = 'managed-h1'
+        self.read_versions.return_value = _KNOWN_GOOD
+        notice = '   \u2714 Update installed \u00b7 Restart to apply'
+        with mock.patch.object(
+            R.pane, 'capture_pane', return_value=notice
+        ):
+            with self.assertRaises(R.PipelineRunError):
+                self._run(_LINEAR, dict(_LINEAR_REPLIES), sc=sc, wt=wt)
+        self.assertIn(
+            'older than', wt.artifacts['turns/build.pane.txt']
+        )
+
+    def test_a_change_mid_session_is_reported(self) -> None:
+        # The planner's first turn succeeds; its consolidation turn
+        # fails after agy updated itself in between.
+        class SecondPlanTurnFails(FakeSC):
+            def send_and_wait(self, session, message, **kw):
+                if self._label.get(session) == 'plan' and any(
+                    s == session for s, _m in self.sent
+                ):
+                    self.sent.append((session, message))
+                    return SwarmTurnResult('failed', None, '')
+                return super().send_and_wait(session, message, **kw)
+
+        calls: list[str] = []
+
+        def versions(sandbox):
+            calls.append(sandbox)
+            agy = '1.1.16' if len(calls) == 1 else '1.1.17'
+            return {**_KNOWN_GOOD, 'agy': agy}
+
+        sc = SecondPlanTurnFails(dict(_LINEAR_REPLIES))
+        _r, _wt, said = self._run_on_vm(versions, sc=sc)
+        joined = '\n'.join(said)
+        self.assertIn('plan: agy 1.1.17', joined)
+        self.assertIn('1.1.16 at its first turn', joined)
+
+    def test_reading_versions_never_fails_a_run(self) -> None:
+        def boom(sandbox):
+            raise RuntimeError('unexpected')
+
+        result, _wt, _said = self._run_on_vm(boom)
+        self.assertEqual(result.status, 'completed')
+
+
 class TestDiskMetricsAreOptIn(_Base):
     """Recording what a run costs on disk (TASKS.md #36).
 
@@ -9185,6 +9360,29 @@ class TestResume(_Base):
         built = {sc.label_of(s) for s, _m in sc.sent}
         self.assertFalse([b for b in built if b.startswith('m0-')])
         self.assertIn('m1-plan', built)
+
+    def test_earlier_harness_versions_survive_a_resume(self) -> None:
+        # A resume must not forget which versions the first attempt ran
+        # (#17), and must not trust a malformed entry.
+        state = self._finished_state(
+            ['plan'],
+            harness_versions={
+                'plan': {'runs': 'agy', 'versions': {'agy': '1.1.16'}},
+                'bad': 'not a mapping',
+                'worse': {'runs': 'claude', 'versions': {'claude': 5}},
+                'worst': {'runs': 7, 'versions': {'claude': '2.1.266'}},
+            },
+        )
+        _r, _sc, wt = self._resume(state)
+        recorded = wt.states[-1]['harness_versions']
+        self.assertEqual(
+            recorded, {'plan': {'runs': 'agy', 'versions': {'agy': '1.1.16'}}}
+        )
+
+    def test_state_without_harness_versions_still_resumes(self) -> None:
+        result, _sc, wt = self._resume(self._finished_state(['plan']))
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(wt.states[-1]['harness_versions'], {})
 
 
 class TestResumeLoopBack(_Base):
