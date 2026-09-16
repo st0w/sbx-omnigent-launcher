@@ -29,6 +29,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -73,6 +74,31 @@ def _run_default(
             f'{" ".join(cmd)}\n{proc.stderr.strip()}'
         )
     return proc.stdout
+
+
+def clone_copy_command(
+    src: str, dst: str, *, platform: str | None = None
+) -> list[str]:
+    """
+    The ``cp`` argv that copies *src* to *dst*, cloning where it can.
+
+    The clone flag is not portable (#60). macOS ``cp -c`` clones with
+    ``clonefile(2)`` and falls back to a real copy. GNU ``cp`` has no
+    ``-c`` at all and rejects it; its equivalent is ``--reflink=auto``,
+    which clones on a reflink filesystem (btrfs, XFS with reflink) and
+    makes a full copy elsewhere. Any other ``cp`` gets a plain copy.
+
+    :param src: Directory to copy.
+    :param dst: Destination path, which must not exist yet.
+    :param platform: ``sys.platform`` override (tests).
+    :returns: The argv.
+    """
+    platform = sys.platform if platform is None else platform
+    if platform == 'darwin':
+        return ['cp', '-Rc', src, dst]
+    if platform.startswith('linux'):
+        return ['cp', '-R', '--reflink=auto', src, dst]
+    return ['cp', '-R', src, dst]
 
 
 def _validate_name(value: str, kind: str) -> str:
@@ -298,6 +324,9 @@ class WorktreeManager:
         )
         self._publish_token: str | None = None
         self._publish_token_read = False
+        #: Build-cache operations (``seed``/``refresh``) whose failure
+        #: has already been reported. Once each, not once per node.
+        self._build_cache_warned: set[str] = set()
 
     def publish_token(self, *, refresh: bool = False) -> str | None:
         """
@@ -1176,8 +1205,9 @@ class WorktreeManager:
         On APFS ``cp -Rc`` is a copy-on-write CLONE: measured at 200 MB
         in under 10 ms with no space consumed until a block diverges,
         so a multi-gigabyte cache costs neither time nor disk to hand
-        out. ``-c`` falls back to a real copy on a filesystem without
-        clonefile, which is slower but still correct.
+        out. On Linux ``cp --reflink=auto`` clones only on a reflink
+        filesystem and makes a full copy elsewhere, which costs real
+        disk per node. See :func:`clone_copy_command`.
 
         STALENESS IS THE BUILD TOOL'S PROBLEM, deliberately. Cargo
         fingerprints every artifact by source hash, feature flags and
@@ -1208,13 +1238,14 @@ class WorktreeManager:
             try:
                 if not os.listdir(src):
                     continue  # empty cache entry buys nothing
-                self._run(['cp', '-Rc', src, dst])
+                self._run(clone_copy_command(src, dst))
                 seeded.append(name)
-            except (click.ClickException, OSError):
+            except (click.ClickException, OSError) as exc:
                 # A partial copy is worse than none: a half-written
                 # build directory is exactly what a build tool cannot
                 # revalidate its way out of.
                 shutil.rmtree(dst, ignore_errors=True)
+                self._warn_build_cache('seed', name, exc)
         return seeded
 
     def refresh_build_cache(self, worktree_path: str) -> list[str]:
@@ -1249,16 +1280,43 @@ class WorktreeManager:
             try:
                 os.makedirs(cache, exist_ok=True)
                 shutil.rmtree(staged, ignore_errors=True)
-                self._run(['cp', '-Rc', src, staged])
+                self._run(clone_copy_command(src, staged))
                 previous = f'{dst}.replaced.{os.getpid()}'
                 if os.path.exists(dst):
                     os.rename(dst, previous)
                 os.rename(staged, dst)
                 shutil.rmtree(previous, ignore_errors=True)
                 refreshed.append(name)
-            except (click.ClickException, OSError):
+            except (click.ClickException, OSError) as exc:
                 shutil.rmtree(staged, ignore_errors=True)
+                self._warn_build_cache('refresh', name, exc)
         return refreshed
+
+    def _warn_build_cache(
+        self, operation: str, name: str, exc: Exception
+    ) -> None:
+        """
+        Say once that the build cache is not working.
+
+        Seeding and refreshing stay best-effort, but a failure used to
+        be swallowed without a word, so a cache that never took was
+        discovered only from build times (#60).
+
+        :param operation: ``'seed'`` or ``'refresh'``.
+        :param name: The cache entry that failed.
+        :param exc: The error, whose text names the command.
+        """
+        if operation in self._build_cache_warned:
+            return
+        self._build_cache_warned.add(operation)
+        detail = (
+            exc.message if isinstance(exc, click.ClickException) else exc
+        )
+        click.echo(
+            f'[build-cache] could not {operation} {name!r}: {detail}. '
+            f'Nodes build without the warm cache; the run continues. '
+            f'Reported once per run.'
+        )
 
     def write_ignored_file(
         self, worktree_path: str, name: str, content: str
