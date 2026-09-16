@@ -960,6 +960,51 @@ _UNATTENDED = (
 )
 
 
+#: What the tests stage is held to, restated on every one of its
+#: turns.
+#:
+#: Its suite is the contract two implementers build against and every
+#: reviewer judges against, and no downstream agent may change it — so
+#: a wrong assertion is undone only by halting the run for a human
+#: ruling. A wrong test costs more than a missing one, and nothing
+#: said so.
+#:
+#: Five disputes on one campaign were the same shape: assertions about
+#: the outside world, frozen by the one stage with no way to check
+#: them. They passed at the tests stage, at both implementations and
+#: in every reviewer's full run, because they are tautological — the
+#: stage authors the claim and the test compares the claim against a
+#: copy of itself. The first party with independent knowledge is a
+#: reviewer, by which point the only move left is a dispute.
+#:
+#: Both halves are stated with examples. The forbidden half alone
+#: reads as "write fewer tests", which is not the ask.
+_FROZEN_TESTS_CONTRACT = (
+    'YOUR TESTS ARE FROZEN. When this stage ends, every assertion you '
+    'wrote becomes the contract two independent implementers build '
+    'against and every reviewer judges against, and no downstream '
+    'agent may change one — an implementer that edits your suite has '
+    'broken the boundary the whole pipeline rests on. Correcting a '
+    'wrong assertion means halting the run for a human ruling, so a '
+    'test that is WRONG costs far more than a test that is missing.\n\n'
+    'So assert the INVARIANT, never a value you cannot check from in '
+    'here. You may freeze shape, bounds, refusals and floors: that a '
+    'loader rejects a four-segment name, that an ambiguous key '
+    'resolves to nothing rather than guessing, that a recorded set '
+    'may not shrink, that a value round-trips unchanged. You may not '
+    'freeze a claim about the outside world: that a particular vendor '
+    'method maps to a particular permission, that a specific status '
+    'means success, that an external identifier is spelled a certain '
+    'way. You cannot verify those here, and a wrong one is wrong for '
+    'both implementers at once.\n\n'
+    'Facts belong in the DATA an implementer writes — the catalog, the '
+    'mapping table, the fixture — where a reviewer that finds one '
+    'wrong has it corrected by an ordinary loop-back. Assert that the '
+    'data is well-formed, complete and self-consistent. Do not assert '
+    'that a particular row of it is true.'
+)
+
+
 class PipelineRunError(Exception):
     """A pipeline run failed (setup, a turn, or a git step)."""
 
@@ -6761,6 +6806,7 @@ class PipelineRunner:
             'production surface, do not add it. Say so in your reply, '
             'name exactly what is needed and why, and leave that test '
             'out. Stopping to ask is correct here; implementing is not.'
+            f'\n\n{_FROZEN_TESTS_CONTRACT}'
             f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}'
         )
 
@@ -7002,6 +7048,11 @@ class PipelineRunner:
         turn = instruction or self._fix_instruction(findings)
         if instruction is None and self._is_refactor(stage):
             turn = f'{self._refactor_contract()}\n\n{turn}'
+        # Same reason, same shape: the tests stage is the other writer
+        # whose findings routinely ask for work its contract forbids,
+        # and a fix turn is exactly when it decides what to assert.
+        if instruction is None and self._is_test_writer(stage):
+            turn = f'{_FROZEN_TESTS_CONTRACT}\n\n{turn}'
         node.output = self._drive(node.session, turn)
         # Kept even on success: this session is disposed at publish, and
         # what a writer did with a reviewer's findings is exactly what
@@ -8471,6 +8522,7 @@ class PipelineRunner:
                 f'{self._config.acceptance}'
             )
         instr += (
+            f'\n\n{_FROZEN_TESTS_CONTRACT}'
             f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}'
             + self._setup_block()
         )

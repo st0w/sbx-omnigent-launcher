@@ -5646,6 +5646,113 @@ rather than obeying it.
 """
 
 
+class TestTheTestsStageIsToldWhatFreezingCosts(_Base):
+    """
+    The tests stage froze claims it had no way to check.
+
+    Its suite is the contract two implementers build against and every
+    reviewer judges against, and no downstream agent may change it —
+    so a wrong assertion can only be undone by halting the run for a
+    human ruling. Five disputes on one campaign came from exactly
+    that: assertions about the outside world, frozen by the one stage
+    that cannot verify them.
+
+    A wrong test therefore costs more than a missing one, and nothing
+    told the stage so.
+    """
+
+    def _tests_turn(self) -> str:
+        _r, sc, _wt = self._run(_TDD, {'tests': 't', 'build': 'b'})
+        return sc.message_for_label('tests')
+
+    def test_it_is_told_its_assertions_are_frozen(self) -> None:
+        self.assertIn('FROZEN', self._tests_turn())
+
+    def test_it_is_told_no_downstream_agent_can_correct_one(self) -> None:
+        # The cost that makes the rest of the rule worth following.
+        turn = self._tests_turn().lower()
+        self.assertIn('halt', turn)
+
+    def test_it_is_told_to_assert_the_invariant_not_the_value(self) -> None:
+        turn = self._tests_turn()
+        self.assertIn('INVARIANT', turn)
+
+    def test_it_is_given_both_sides_of_the_line(self) -> None:
+        # A rule with only the forbidden half reads as "write fewer
+        # tests". Both halves, with examples, is what makes it usable.
+        turn = self._tests_turn().lower()
+        self.assertIn('you may freeze', turn)
+        self.assertIn('you may not freeze', turn)
+
+    def test_it_is_told_where_facts_belong_instead(self) -> None:
+        # The other half of B: a fact in the DATA is correctable by an
+        # ordinary loop-back, which is the whole point of moving it.
+        turn = self._tests_turn().lower()
+        self.assertIn('loop-back', turn)
+
+    def test_a_coder_is_not_given_the_contract(self) -> None:
+        # It is the tests stage's contract. A coder that reads it
+        # would take "do not assert external facts" as licence to skip
+        # the catalog it is supposed to write.
+        _r, sc, _wt = self._run(_TDD, {'tests': 't', 'build': 'b'})
+        self.assertNotIn('FROZEN', sc.message_for_label('build'))
+
+    def test_a_refactorer_is_not_given_the_contract(self) -> None:
+        _r, sc, _wt = self._run(
+            _JUDGE_REFACTOR,
+            {
+                'impl-a': 'A', 'impl-b': 'B', 'pick': 'SELECT: impl-b',
+                'refactor': 'cleaned up',
+                'review-r-sec': 'VERDICT: APPROVED',
+            },
+        )
+        self.assertNotIn('FROZEN', sc.message_for_label('refactor'))
+
+    def test_the_contract_is_restated_on_a_loop_back(self) -> None:
+        # Same reason the refactorer's is: a fix turn relays findings
+        # and leans on session history for the framing, and a resumed
+        # run re-attaches the node to a FRESH session with no history.
+        cfg = self._cfg(_TDD)
+        sc = FakeSC({})
+        runner = R.PipelineRunner(
+            cfg, session_client=sc, worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        runner._nodes['tests'] = R.NodeResult(
+            'tests', 'writer', branch='pl/r1/tests',
+            worktree='/wt/r1/nodes/tests', session='sess-tests',
+        )
+        runner._redrive_writer('tests', 'a reviewer blocked on x')
+        sent = [m for _s, m in sc.sent]
+        self.assertTrue(sent)
+        self.assertIn('FROZEN', sent[-1])
+
+    def test_the_role_template_carries_the_rule_too(self) -> None:
+        # Both places, for the reason the dispute-shape fix needed
+        # both: the template is the role prompt the session opens
+        # with, and the turn is what a loop-back re-states. A rule in
+        # only one of them is a rule the stage can be driven without.
+        template = Path(
+            'sbx_omnigent/templates/tdd-writer.md'
+        ).read_text(encoding='utf-8').lower()
+        self.assertIn('frozen when this stage ends', template)
+        self.assertIn('do not freeze a claim about the outside world',
+                      template)
+        self.assertIn('loop-back', template)
+
+    def test_the_tests_only_gate_restates_it(self) -> None:
+        # That gate re-drives the tests stage over production edits,
+        # which is exactly a turn where it is deciding what to assert.
+        cfg = self._cfg(_TDD)
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        self.assertIn('FROZEN', runner._tests_only_instruction('- src/x.py'))
+
+
 class TestADisputeNearMissIsReported(_Base):
     """
     A correct dispute in the wrong shape was lost in silence.
