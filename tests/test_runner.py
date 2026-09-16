@@ -128,6 +128,10 @@ class FakeWT:
         #: Default True: a candidate carries its seed unless a test
         #: says otherwise.
         self.contains: dict[tuple[str, str], bool] = {}
+        #: (node_id, label) for each review snapshot cut, in order.
+        self.snapshots: list[tuple[str, str]] = []
+        #: Node ids whose clone holds a commit the hub has not seen.
+        self.ahead: set[str] = set()
         #: Every branch_contains question asked, in order.
         self.contains_queries: list[tuple[str, str]] = []
 
@@ -166,6 +170,13 @@ class FakeWT:
     def branch_contains(self, run_id, node_id, *, ancestor) -> bool:
         self.contains_queries.append((node_id, ancestor))
         return self.contains.get((node_id, ancestor), True)
+
+    def create_review_snapshot(self, run_id, node_id, *, label) -> str:
+        self.snapshots.append((node_id, label))
+        return f'/wt/{run_id}/nodes/{label}'
+
+    def node_ahead_of_hub(self, run_id, node_id) -> bool:
+        return node_id in self.ahead
 
     def refresh_build_cache(self, path) -> list[str]:
         self.cache_refreshed.append(path)
@@ -269,7 +280,8 @@ class FakeWT:
     def dispose_node_worktrees(self, run_id, node_ids) -> int:
         # Record only: node_from is the historical record other
         # assertions read, so reclaiming must not rewrite it.
-        wanted = [n for n in node_ids if n in self.node_from]
+        known = set(self.node_from) | {lbl for _n, lbl in self.snapshots}
+        wanted = [n for n in node_ids if n in known]
         self.reclaimed.extend(wanted)
         return len(wanted)
 
@@ -701,15 +713,22 @@ class TestLinear(_Base):
         self.assertIn('Task:', build_msg)
         self.assertNotIn('DESIGN PLAN', build_msg)
 
-    def test_reviewer_mounts_writer_worktree(self) -> None:
+    def test_reviewer_mounts_a_snapshot_read_only(self) -> None:
+        # This asserted the writer's OWN tree, which is the defect:
+        # that directory is live while the writer's session is up, so
+        # a reviewer could be reading a tree changing under it. It now
+        # reads a snapshot of the branch — the same commit the judge
+        # clones — mounted read-only.
         _, sc, _ = self._run(
             _LINEAR,
             {'plan': 'P', 'build': 'b', 'review-sec': 'VERDICT: APPROVED'},
         )
         by_label = {c['title'].split('/', 1)[-1]: c for c in sc.creates}
         build_wt = by_label['build']['workspace'].split('#')[0]
-        sec_wt = by_label['review-sec']['workspace'].split('#')[0]
-        self.assertEqual(build_wt, sec_wt)  # same tree, different mode
+        sec_ws = by_label['review-sec']['workspace']
+        self.assertNotEqual(build_wt, sec_ws.split('#')[0])
+        self.assertTrue(sec_ws.endswith('#ro'), sec_ws)
+        self.assertTrue(by_label['build']['workspace'].endswith('#rw'))
 
     def test_only_agy_terminals_are_warmed_at_create(self) -> None:
         # An agy terminal auto-creates with the session, so it can be
@@ -5614,6 +5633,129 @@ class TestAParallelBlockRunsInParallel(_Base):
         self.assertEqual(finished, ['impl-b'])
 
 
+class TestReviewersReadASnapshot(_Base):
+    """
+    Reviewers mounted the writer's LIVE clone, read-only.
+
+    A native-terminal writer keeps working after its turn reports idle,
+    and a writer a review can loop back to keeps its session, so that
+    directory can change while a reviewer is reading it. Two reviewers
+    of one branch returned opposite verdicts minutes apart for that
+    reason. The judge, meanwhile, clones the BRANCH — so the two were
+    not even looking at the same candidate.
+    """
+
+    def _replies(self, **over):
+        base = {
+            'tests': 't', 'build': 'b',
+            'review-sec': 'VERDICT: APPROVED',
+        }
+        base.update(over)
+        return base
+
+    def test_reviewers_mount_a_snapshot_not_the_writers_tree(self) -> None:
+        _r, sc, wt = self._run(_TDD_REVIEW, self._replies())
+        self.assertEqual(wt.snapshots, [('build', 'review-r1')])
+        # The workspace arrives as a mount sentinel, so assert on the
+        # path it carries rather than on the whole string.
+        mounts = [
+            c['workspace'] for c in sc.creates
+            if c['title'].endswith('review-sec')
+        ]
+        self.assertEqual(len(mounts), 1, mounts)
+        self.assertIn('/wt/r1/nodes/review-r1', mounts[0])
+        self.assertNotIn('/wt/r1/nodes/build', mounts[0])
+
+    def test_the_snapshot_is_removed_when_the_round_ends(self) -> None:
+        _r, _sc, wt = self._run(_TDD_REVIEW, self._replies())
+        self.assertIn('review-r1', wt.reclaimed)
+
+    def test_every_round_reads_its_own_snapshot(self) -> None:
+        # A re-driven writer commits between rounds, so round two must
+        # read the fixed branch — not the tree round one cloned.
+        _r, _sc, wt = self._run(
+            _TDD_REVIEW,
+            self._replies(**{
+                'review-sec': ['VERDICT: BLOCKING', 'VERDICT: APPROVED'],
+            }),
+        )
+        self.assertEqual(
+            wt.snapshots, [('build', 'review-r1'), ('build', 'review-r2')]
+        )
+        self.assertIn('review-r1', wt.reclaimed)
+        self.assertIn('review-r2', wt.reclaimed)
+
+    def test_the_branch_is_reconciled_before_each_snapshot(self) -> None:
+        # The snapshot is only as good as the branch behind it, so the
+        # late-write reconcile has to run every round, not once.
+        wt = FakeWT()
+        wt.dirty_nodes = {'build'}
+        self._run(_TDD_REVIEW, self._replies(), wt=wt)
+        self.assertLess(
+            wt.events.index(('commit', 'build')),
+            len(wt.events),
+        )
+        self.assertEqual(wt.snapshots, [('build', 'review-r1')])
+
+
+class TestAnAgentsOwnCommitReachesTheBranch(_Base):
+    """
+    An agent that runs `git commit` itself leaves a CLEAN tree.
+
+    The late-write reconcile asked only whether the worktree was dirty,
+    so that state read as "nothing to do" and the commit never reached
+    the hub — where the judge and the publish step both read.
+    """
+
+    def test_a_clean_but_unpushed_clone_is_still_reconciled(self) -> None:
+        wt = FakeWT()
+        wt.ahead = {'build'}          # committed in the VM, not pushed
+        wt.dirty_nodes = set()        # and therefore clean
+        self._run(
+            _TDD_REVIEW,
+            {'tests': 't', 'build': 'b', 'review-sec': 'VERDICT: APPROVED'},
+            wt=wt,
+        )
+        msgs = [m for n, m, _a in wt.commits if n == 'build']
+        self.assertTrue(
+            any('late write' in m for m in msgs),
+            f'the unpushed commit was never reconciled: {msgs}',
+        )
+
+    def test_a_synced_clean_clone_is_left_alone(self) -> None:
+        # Nothing to do must stay nothing to do: no empty commit, no
+        # pointless push, no log line.
+        wt = FakeWT()
+        self._run(
+            _TDD_REVIEW,
+            {'tests': 't', 'build': 'b', 'review-sec': 'VERDICT: APPROVED'},
+            wt=wt,
+        )
+        msgs = [m for n, m, _a in wt.commits if n == 'build']
+        self.assertFalse([m for m in msgs if 'late write' in m], msgs)
+
+
+_TDD_REVIEW = """\
+name: tr
+repo: ./proj
+publish: none
+task: |
+  build it
+agents:
+  tw: {template: tdd-writer, model: claude-sonnet-5}
+  build: {template: coder, model: claude-sonnet-5}
+  sec: {template: security-reviewer, model: claude-fable-5}
+stages:
+  - {id: tests, run: tw, write: true}
+  - {id: build, run: build, write: true, needs: [tests]}
+  - id: review
+    run: [sec]
+    needs: [build]
+    gate: consensus
+    on_block: build
+"""
+
+
 class TestCompetingWriters(_Base):
     def test_isolated_writers_and_judge_select(self) -> None:
         result, _sc, wt = self._run(
@@ -9315,10 +9457,14 @@ class TestChunkWorktreeReclaim(_Base):
         ).run()
         self.assertEqual(result.status, 'completed')
 
-    def test_a_single_pass_run_reclaims_nothing_mid_run(self) -> None:
+    def test_a_single_pass_run_reclaims_no_node_mid_run(self) -> None:
         # Nothing to stage-manage: teardown removes the whole run dir.
+        # A review round's snapshot is not a node — it is cut and
+        # removed within the round — so it is excluded rather than
+        # counted as a mid-run reclaim.
         _, _sc, wt = self._run(_LINEAR, dict(_LINEAR_REPLIES))
-        self.assertEqual(wt.reclaimed, [])
+        snapshots = {label for _node, label in wt.snapshots}
+        self.assertEqual([r for r in wt.reclaimed if r not in snapshots], [])
 
 
 class TestChunkGranularity(unittest.TestCase):

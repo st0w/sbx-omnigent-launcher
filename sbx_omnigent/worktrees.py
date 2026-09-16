@@ -23,6 +23,7 @@ so the launcher can bind-mount the worktrees this module creates.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -1455,6 +1456,73 @@ class WorktreeManager:
             ['git', '-C', path, 'status', '--porcelain']
         ).strip()
 
+    def _tree_fingerprint(self, path: str) -> str:
+        """
+        A digest of a worktree's UNCOMMITTED CONTENT.
+
+        ``git status --porcelain`` names what changed, never how much:
+        it prints ``M f.py`` for one edit to a file and for the tenth.
+        A writer still rewriting files it had already touched therefore
+        looked identical on every poll, and the settle-wait called it
+        finished after the stable window.
+
+        Content, not mtime, so a rewrite with the same bytes correctly
+        reads as no change. Untracked files are fingerprinted by size
+        and mtime instead — they are the agent's new source files, and
+        hashing every byte of a build directory on a one-second poll
+        would cost more than the wait it serves.
+
+        :param path: The worktree to fingerprint.
+        :returns: A hex digest; equal digests mean nothing changed.
+        """
+        parts = [self._porcelain(path)]
+        with contextlib.suppress(click.ClickException):
+            parts.append(self._run(['git', '-C', path, 'diff', 'HEAD']))
+        others = ''
+        with contextlib.suppress(click.ClickException):
+            others = self._run([
+                'git', '-C', path, 'ls-files', '--others',
+                '--exclude-standard', '-z',
+            ])
+        for rel in sorted(others.split('\0')):
+            if not rel:
+                continue
+            try:
+                stat = os.stat(os.path.join(path, rel))
+            except OSError:
+                continue  # vanished mid-poll: the next poll sees it
+            parts.append(f'{rel}\0{stat.st_size}\0{stat.st_mtime_ns}')
+        return hashlib.sha256('\n'.join(parts).encode()).hexdigest()
+
+    def node_ahead_of_hub(self, run_id: str, node_id: str) -> bool:
+        """
+        Whether a node's clone holds a commit the hub has not seen.
+
+        Agents run ``git commit`` inside their own VM, which leaves the
+        clone ahead of the hub with a CLEAN worktree — a state every
+        dirtiness check reads as "nothing to do". Everything downstream
+        reads the hub, so that work reaches no reviewer, no judge and
+        no publish.
+
+        :param run_id: Pipeline run id.
+        :param node_id: The node to compare.
+        :returns: ``True`` when the clone's HEAD differs from the hub's
+            branch tip. ``False`` when either cannot be read — an
+            unanswerable question must not trigger a commit.
+        """
+        path = self.node_worktree_path(run_id, node_id)
+        if not os.path.isdir(path):
+            return False
+        try:
+            local = self._run(
+                ['git', '-C', path, 'rev-parse', '--verify', '--quiet',
+                 'HEAD']
+            ).strip()
+        except click.ClickException:
+            return False
+        hub = self.hub_branch_tip(run_id, node_id)
+        return bool(local) and bool(hub) and local != hub
+
     def node_is_dirty(self, run_id: str, node_id: str) -> bool:
         """
         Whether a node's worktree holds work that is not on its branch.
@@ -1507,15 +1575,18 @@ class WorktreeManager:
         if not os.path.isdir(path):
             return
         deadline = time.monotonic() + timeout
-        last = self._porcelain(path)
+        last = self._tree_fingerprint(path)
         last_change = time.monotonic()
         while time.monotonic() < deadline:
             time.sleep(poll)
-            cur = self._porcelain(path)
+            cur = self._tree_fingerprint(path)
             if cur != last:
                 last, last_change = cur, time.monotonic()
                 continue
-            if cur and time.monotonic() - last_change >= stable_window:
+            if (
+                self._porcelain(path)
+                and time.monotonic() - last_change >= stable_window
+            ):
                 return
 
     def commit_node(
@@ -1587,6 +1658,48 @@ class WorktreeManager:
         # nothing to send is a cheap no-op.
         self._run(['git', '-C', path, 'push', 'origin', branch])
         return self.hub_branch_tip(run_id, node_id) != before
+
+    def create_review_snapshot(
+        self, run_id: str, node_id: str, *, label: str
+    ) -> str:
+        """
+        Cut a throwaway clone of a node's branch for one review round.
+
+        Reviewers used to mount the writer's own clone ``:ro``. That
+        directory is live: a native-terminal writer keeps writing after
+        its turn reports idle, and a writer a review can loop back to
+        keeps its session, so the tree could change under a reviewer
+        mid-verdict. Two reviewers of one branch returned opposite
+        verdicts minutes apart for exactly that reason.
+
+        A snapshot fixes what a round is reviewing, and fixes it at the
+        same commit the judge will clone, so review and judgement stop
+        disagreeing about what a candidate even is.
+
+        Source only: a local clone of the hub with hardlinked objects
+        and no build cache. Reviewers build into their own VM's disk
+        anyway, so this costs the same as the judge's comparison tree
+        rather than a writer's.
+
+        :param run_id: Pipeline run id.
+        :param node_id: The writer node whose branch to snapshot.
+        :param label: Snapshot directory name, unique per round.
+        :returns: The snapshot path, for mounting ``:ro``.
+        :raises click.ClickException: On a missing run or git error.
+        """
+        repo = self._run_repo(run_id)
+        if not os.path.isdir(repo):
+            raise click.ClickException(f'no run {run_id!r}')
+        path = os.path.join(
+            self._nodes_dir(run_id), _validate_name(label, 'snapshot label')
+        )
+        if os.path.exists(path):
+            self._remove_under_root(path)
+        os.makedirs(self._nodes_dir(run_id), exist_ok=True)
+        branch = self.node_branch(run_id, node_id)
+        self._run(['git', 'clone', '--no-checkout', repo, path])
+        self._run(['git', '-C', path, 'checkout', branch])
+        return path
 
     def create_judge_worktree(
         self,

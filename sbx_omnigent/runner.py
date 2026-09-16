@@ -7080,9 +7080,6 @@ class PipelineRunner:
 
     def _run_review(self, stage: pipeline.PipelineStage) -> None:
         target = self._review_target(stage)
-        self._reconcile_late_writes(target)
-        target_wt = self._nodes[target].worktree
-        assert target_wt is not None
         # Local budget only. The RECORDED round number must not come
         # from it: a gate failure re-enters this method with a fresh
         # budget, and reusing the local count labelled every re-review
@@ -7097,29 +7094,45 @@ class PipelineRunner:
             verdicts: dict[str, str | None] = {}
             round_no = self._next_review_round(stage.id)
             created: list[str] = []
-            self._parallel(
-                stage.id,
-                [
-                    (
-                        f'{stage.id}-{reviewer}',
-                        # partial binds every argument NOW. A closure
-                        # would capture the enclosing retry loop's
-                        # variables by reference and read whatever the
-                        # NEXT round rebound them to.
-                        functools.partial(
-                            self._review_turn, stage, reviewer,
-                            target_wt, round_no, outputs, verdicts,
-                            created,
-                        ),
-                    )
-                    for reviewer in stage.run
-                ],
+            # Both per ROUND, not once per stage. A blocked round
+            # re-drives the writer, so round two must read what that
+            # fix turn produced — and a native-terminal writer can
+            # still be writing when this round starts.
+            self._reconcile_late_writes(target)
+            target_wt = self._review_snapshot(
+                stage.id, target, round_no
             )
-            # Backstop: anything the per-reviewer release could not free
-            # (a delete that failed) is retried here. BY NAME, not by an
-            # index mark — review-a and review-b run concurrently, and a
-            # mark taken by one slices away the other's live guests.
-            self._dispose_sessions(created)
+            try:
+                self._parallel(
+                    stage.id,
+                    [
+                        (
+                            f'{stage.id}-{reviewer}',
+                            # partial binds every argument NOW. A
+                            # closure would capture the enclosing retry
+                            # loop's variables by reference and read
+                            # whatever the NEXT round rebound them to.
+                            functools.partial(
+                                self._review_turn, stage, reviewer,
+                                target_wt, round_no, outputs, verdicts,
+                                created,
+                            ),
+                        )
+                        for reviewer in stage.run
+                    ],
+                )
+            finally:
+                # Backstop: anything the per-reviewer release could not
+                # free (a delete that failed) is retried here. BY NAME,
+                # not by an index mark — review-a and review-b run
+                # concurrently, and a mark taken by one slices away the
+                # other's live guests.
+                #
+                # Before the snapshot goes: those guests have it
+                # mounted. In a `finally` so a turn that raises frees
+                # both rather than leaking a guest AND a clone.
+                self._dispose_sessions(created)
+                self._dispose_review_snapshot(stage.id, round_no)
             # A reviewer that never stated a verdict did not vote
             # AGAINST the branch — it failed to review. Those are
             # different failures with different remedies, and
@@ -7300,6 +7313,66 @@ class PipelineRunner:
             f'reports, settle the contract, and re-run.'
         )
 
+    @staticmethod
+    def _snapshot_label(stage_id: str, round_no: int) -> str:
+        """
+        The snapshot directory name for one review round.
+
+        Keyed on the STAGE, not the reviewed node: two review stages
+        can target one writer, and a stage id is unique by
+        construction while a target is not.
+        """
+        return f'{stage_id}-r{round_no}'
+
+    def _review_snapshot(
+        self, stage_id: str, target: str, round_no: int
+    ) -> str:
+        """
+        Cut the tree this review round reads, at the branch tip.
+
+        Raises rather than falling back to the writer's live clone: the
+        fallback is the behaviour this exists to remove, and taking it
+        silently would leave a round racing a writer with nothing in
+        the log to say so.
+
+        :param stage_id: The review stage (names the snapshot).
+        :param target: The writer node under review.
+        :param round_no: The recorded review round.
+        :returns: The snapshot path, mounted ``:ro`` by every reviewer.
+        :raises PipelineRunError: If the snapshot cannot be cut.
+        """
+        label = self._snapshot_label(stage_id, round_no)
+        try:
+            return self._wt.create_review_snapshot(
+                self._run_id, target, label=label
+            )
+        except click.ClickException as exc:
+            raise PipelineRunError(
+                f'could not snapshot {target!r} for review round '
+                f'{round_no}: {exc}. Reviewers read a snapshot of the '
+                f'branch so a writer still working cannot change the '
+                f'tree under them, and the judge reads the same '
+                f'commit — so this is not something to work around by '
+                f'reading the live worktree.'
+            ) from exc
+
+    def _dispose_review_snapshot(
+        self, stage_id: str, round_no: int
+    ) -> None:
+        """
+        Remove a round's snapshot once its reviewers have voted.
+
+        Best-effort: a clone that will not delete must never fail a
+        review that decided cleanly. It is source-only, and a resume
+        replaces it by name.
+
+        :param stage_id: The review stage that named the snapshot.
+        :param round_no: The recorded review round.
+        """
+        label = self._snapshot_label(stage_id, round_no)
+        with contextlib.suppress(click.ClickException):
+            self._wt.dispose_node_worktrees(self._run_id, [label])
+
     def _reconcile_late_writes(self, node_id: str) -> None:
         """
         Commit work that landed after a writer's stage finished.
@@ -7329,14 +7402,27 @@ class PipelineRunner:
         if node is None or node.kind != 'writer' or stage is None:
             return
         try:
-            if not self._wt.node_is_dirty(self._run_id, node_id):
+            dirty = self._wt.node_is_dirty(self._run_id, node_id)
+            # An agent that ran `git commit` itself leaves a CLEAN
+            # tree that the hub has never seen. Asking only about
+            # dirtiness read that as nothing to do, so the work
+            # reached no reviewer, no judge and no publish.
+            ahead = self._wt.node_ahead_of_hub(self._run_id, node_id)
+            if not dirty and not ahead:
                 return
             click.echo(
-                f'[commit] {node_id}: work landed after its stage '
-                f'finished — settling and committing it so the branch '
-                f'matches what the reviewers will read.'
+                f'[commit] {node_id}: '
+                + (
+                    'work landed after its stage finished'
+                    if dirty
+                    else 'the agent committed inside its VM and the '
+                         'branch never saw it'
+                )
+                + ' — settling and committing it so the branch matches '
+                'what the reviewers will read.'
             )
-            self._wt.wait_for_node_settle(self._run_id, node_id)
+            if dirty:
+                self._wt.wait_for_node_settle(self._run_id, node_id)
             self._commit(node_id, f'{node_id}: late write')
         except click.ClickException as exc:
             click.echo(f'[commit] {node_id}: could not reconcile: {exc}')
@@ -8981,8 +9067,10 @@ def writer_worktrees(config: pipeline.PipelineConfig) -> int:
     (hardlinked objects), so the repo itself is nearly free and the real
     cost is what the agent builds in it — which only a writer does.
     Measured: writer worktrees at 0.7 to 2.5 GB against reader and
-    judge worktrees at 140 to 520 KB, four orders apart. Reviewers
-    cut nothing at all; they mount the writer's tree ``:ro``.
+    judge worktrees at 140 to 520 KB, four orders apart. A review
+    round cuts a source-only snapshot of the branch and removes it
+    when the round ends, which is the reader/judge class of cost —
+    four orders below a writer's, and transient.
 
     The verification gate's throwaway clone counts as a writer: it runs
     the project's build and test command from clean.
