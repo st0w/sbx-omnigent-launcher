@@ -582,17 +582,20 @@ The launcher scopes every managed VM to a per-sandbox allowlist —
 package-registry hosts unless you override it) plus the dial-back. This is the
 tight, per-agent boundary.
 
-> **Debian `apt` (port 80).** The default allowlist includes
-> `deb.debian.org:80`. sbx's own `default-os-packages` bundle allows
-> `**.debian.org:443` but — unlike its Ubuntu entries, which list `:80`
-> explicitly — never port 80, and the host image's apt sources are
-> `http://deb.debian.org`. Without it every `apt` call is denied and an agent
-> cannot install a toolchain: seen live as a reviewer spending its entire turn
-> hunting for a `cargo` that could never be installed, then returning no
-> `VERDICT` — which the runner reads as BLOCKING. Port 80 is safe here: Debian
-> packages are GPG-signed, so only *which* packages you fetch is disclosed,
-> never their integrity. If you **replace** `sbx.egress_allow` with a custom
-> list, carry this entry over.
+> **Entries to carry over into a custom list.** Three default entries exist
+> only to cover gaps in sbx's own bundles. A custom `sbx.egress_allow`
+> **replaces** the default, so keep any of these your agents need:
+>
+> | Entry | Without it |
+> | --- | --- |
+> | `**.astral.sh` | sbx allows `astral.sh` but not the `releases.astral.sh` its uv installer redirects to. The install script comes back as a 403 page, uv never installs, and a verify gate that needs uv cannot run. |
+> | `api.osv.dev` | `uv audit` and `cargo audit` cannot reach their advisory database, and reviewers report that they could not verify. |
+> | `deb.debian.org:80` | sbx allows `**.debian.org` on 443 only, and the host image's apt sources are `http://deb.debian.org`. Every `apt` call is denied and an agent cannot install a toolchain. Seen live as a reviewer spending its whole turn looking for a `cargo` it could never install, then returning no `VERDICT`. Port 80 is safe here: Debian packages are GPG-signed, so only *which* packages you fetch is disclosed, never their integrity. |
+>
+> `omni-sbx server` prints a note at startup naming any of these a custom list
+> leaves out. It never adds them for you, and an empty list (`[]`, deliberate
+> lockdown) prints nothing. The verify gate is not affected: it always gets the
+> full default allowlist.
 
 That boundary only *restricts* if there are no **broad global allow rules**
 underneath it: global allows apply to every sandbox and are additive, so a

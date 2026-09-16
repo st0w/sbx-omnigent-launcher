@@ -43,6 +43,7 @@ from sbx_omnigent.launcher import (
     DEFAULT_EGRESS_ALLOW,
     DEFAULT_HOST_IMAGE,
     DEFAULT_PROVISION_STAGGER_S,
+    SBX_BUNDLE_GAP_HOSTS,
     SbxLauncher,
 )
 
@@ -140,6 +141,78 @@ def _as_egress_allow(value: object) -> tuple[str, ...]:
             'non-empty host strings'
         )
     return tuple(value)
+
+
+def warn_on_dropped_gap_hosts(value: object) -> None:
+    """
+    Warn when an explicit allowlist omits a host sbx's bundles miss.
+
+    A non-empty ``sbx.egress_allow`` REPLACES the default, including
+    the entries that only exist to cover gaps in sbx's own bundles
+    (:data:`SBX_BUNDLE_GAP_HOSTS`). Dropping one fails inside the guest
+    with no signal at startup (#40). Advises only: it never adds a host,
+    and ``[]`` (deliberate lockdown) and unset (the default) are silent.
+
+    :param value: The raw ``sbx.egress_allow`` value, already validated.
+    """
+    if not isinstance(value, list) or not value:
+        return
+    missing = [host for host in SBX_BUNDLE_GAP_HOSTS if host not in value]
+    if not missing:
+        return
+    lines = '\n'.join(
+        f'    {host}: without it, {SBX_BUNDLE_GAP_HOSTS[host]}.'
+        for host in missing
+    )
+    print(
+        "[sbx-omnigent] NOTE: 'sandbox.sbx.egress_allow' replaces the "
+        "default allowlist and omits host(s) that cover gaps in sbx's "
+        'own bundles:\n'
+        f'{lines}\n'
+        '  Add them to the list if your agents need them. Nothing was '
+        'added for you.',
+        file=sys.stderr,
+    )
+
+
+def warn_on_inert_providers(host_config: dict[str, object] | None) -> None:
+    """
+    Warn about ``providers`` entries that are the default for nothing.
+
+    An entry with no ``default:`` passes validation and is written into
+    every guest, but Omnigent's launch routing only ever picks a
+    provider that is the default for a model family. So the entry is
+    ignored, and the symptom surfaces inside a VM, typically as a
+    codex-native agent whose app-server never starts a thread (#34).
+
+    Warns rather than refuses: a non-default entry beside a default one
+    is legitimate, and a false refusal here would block every session.
+
+    :param host_config: The validated ``sandbox.host_config`` mapping.
+    """
+    if not host_config or not isinstance(
+        host_config.get('providers'), dict
+    ):
+        return
+    # Lazy, like upstream's `_parse_host_config`, which has already
+    # validated this block with the same loader.
+    from omnigent.onboarding.provider_config import (  # noqa: PLC0415
+        load_providers,
+    )
+
+    inert = sorted(
+        provider.name
+        for provider in load_providers(host_config).values()
+        if not provider.default_families
+    )
+    for name in inert:
+        print(
+            f"[sbx-omnigent] NOTE: 'sandbox.host_config.providers.{name}' "
+            'is not the default for any model family, so Omnigent never '
+            'routes a harness to it. Set `default: true`, or name the '
+            'family it serves (e.g. `default: openai`).',
+            file=sys.stderr,
+        )
 
 
 def warn_on_global_allow_rules() -> None:
@@ -341,6 +414,7 @@ def _build_sbx_config(raw: dict[str, Any]) -> ManagedSandboxConfig:
         )
 
     egress_allow = _as_egress_allow(sbx.get('egress_allow'))
+    warn_on_dropped_gap_hosts(sbx.get('egress_allow'))
     worktree_root = _parse_worktree_root(sbx)
     cpus = _as_int(sbx.get('cpus'), 'sbx.cpus')
     provision_stagger_s = _as_stagger(sbx.get('provision_stagger_s'))
@@ -355,6 +429,9 @@ def _build_sbx_config(raw: dict[str, Any]) -> ManagedSandboxConfig:
     )
     if agy_enterprise:
         install_agy_enterprise_onboarding_patch()
+
+    host_config = _parse_host_config(raw)
+    warn_on_inert_providers(host_config)
 
     def factory() -> SbxLauncher:
         return SbxLauncher(
@@ -402,7 +479,7 @@ def _build_sbx_config(raw: dict[str, Any]) -> ManagedSandboxConfig:
         # round-trips the mapping through JSON so a YAML scalar that
         # cannot survive the trip fails at STARTUP rather than on
         # every launch.
-        host_config=_parse_host_config(raw),
+        host_config=host_config,
     )
 
 
