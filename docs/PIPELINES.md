@@ -90,7 +90,7 @@ agents:                    # WHO is on the pipeline
     prompt_file: ./p.md    #   a prompt read from a file (relative to this yaml)
     harness: claude-native # default: claude-native
     model: claude-sonnet-5 # optional; pinned at session create
-    effort: medium         # optional; Claude harnesses only (agy has no knob)
+    effort: medium         # optional; Claude and codex (agy has no knob)
     skills: ./skills/tdd   # optional; a dir copied into the agent's bundle
 
 stages:                    # the DAG — what runs, in what order, with what edges
@@ -115,8 +115,11 @@ agent or `codex-native` for Codex. Model and effort are **not** baked into the
 bundle — native harnesses ignore a spec-declared model. The runner applies them
 per session at create time (`model_override` / `reasoning_effort`), which reaches
 every harness: `--model` at launch for the native CLIs, spawn env for the SDK.
-Effort is honored by the Claude harnesses; **agy has no effort knob**, so it's
-omitted there rather than declared and silently ignored.
+Effort is honored by the Claude and codex harnesses; **agy has no effort knob**, so
+it's omitted there rather than declared and silently ignored. Codex takes effort
+as a `-c` config value, so the launcher only passes one from a fixed ladder
+(`none` through `xhigh`). A `codex-native` agent pinned to anything else, such as
+`max`, is refused when the pipeline loads instead of running at codex's default.
 
 ### `stages:` — the DAG
 
