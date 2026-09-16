@@ -43,6 +43,19 @@ The `2>/dev/null` is not tidiness: codex prints a Node
 `[UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental` line on stderr, and
 without the redirect it lands where the version line should be.
 
+The pipeline runner reads the same set out of every session's VM after its first
+turn, and again when a turn fails. It records the result under `harness_versions`
+in the run state, keyed by session label. It prints a `[versions]` warning when the
+CLI a session drives:
+
+- is not the version in the known-good set above (once per CLI per run);
+- differs from an earlier session in the same run that drives the same CLI;
+- differs from the version that session had at its first turn.
+
+A failed turn's `turns/<label>.pane.txt` also names the installed versions. It notes
+when the pane shows an update waiting on a restart, in which case the running
+process is older than the version that was read.
+
 ### Read it from a guest, never from the host
 
 The workstation's CLIs are not the guest's, and the difference is not cosmetic.
@@ -55,7 +68,9 @@ workstation.
 
 ### Previous sets
 
-Add a row whenever the image changes; never overwrite one. The difference between
+Add a row whenever the image changes; never overwrite one. When the known-good set
+above changes, update `KNOWN_GOOD` and `KNOWN_GOOD_RECORDED` in
+`sbx_omnigent/harness_versions.py` to match; a test fails until they agree. The difference between
 rows is what a run that wedges right after an upgrade gets compared against.
 
 | Recorded | Image | claude | codex | agy |

@@ -53,6 +53,7 @@ from sbx_omnigent import (
     agy,
     codex,
     disk_metrics,
+    harness_versions,
     orphans,
     pane,
     pipeline,
@@ -1016,6 +1017,54 @@ class _Blocked(Exception):
         super().__init__(stage_id)
         self.stage_id = stage_id
         self.rounds = rounds
+
+
+def _recorded_version(entry: dict[str, object], cli: str) -> str | None:
+    """
+    The version of *cli* in one recorded harness-versions entry.
+
+    :param entry: ``{'runs': cli, 'versions': {cli: version}}``.
+    :param cli: The CLI to look up.
+    :returns: Its version, or ``None`` when the entry has none.
+    """
+    versions = entry.get('versions')
+    if not isinstance(versions, dict):
+        return None
+    version = versions.get(cli)
+    return version if isinstance(version, str) else None
+
+
+def _restore_harness_versions(raw: object) -> dict[str, dict[str, object]]:
+    """
+    Rebuild the recorded harness versions from run state.
+
+    Anything malformed is dropped rather than trusted: a bad entry would
+    otherwise be compared against, and reported as a version change
+    that never happened.
+
+    :param raw: The ``harness_versions`` value from the state file.
+    :returns: ``{label: {'runs': cli, 'versions': {cli: version}}}``.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    restored: dict[str, dict[str, object]] = {}
+    for label, entry in raw.items():
+        if not isinstance(label, str) or not isinstance(entry, dict):
+            continue
+        runs = entry.get('runs')
+        versions = entry.get('versions')
+        if runs not in harness_versions.CLIS or not isinstance(
+            versions, dict
+        ):
+            continue
+        kept = {
+            cli: version
+            for cli, version in versions.items()
+            if cli in harness_versions.CLIS and isinstance(version, str)
+        }
+        if kept:
+            restored[label] = {'runs': runs, 'versions': kept}
+    return restored
 
 
 def _single_line(text: str) -> str:
@@ -2920,6 +2969,14 @@ class PipelineRunner:
         #: forfeited candidate is excluded from judging: comparing a
         #: vetted branch against an unvetted one is not a choice.
         self._forfeited: set[str] = set()
+        #: Harness CLI versions each session's VM had installed, by
+        #: session label: ``{'runs': cli, 'versions': {cli: version}}``.
+        #: Persisted, so a wedged run can still be compared with the
+        #: known-good set after its VMs are gone (#17).
+        self._harness_versions: dict[str, dict[str, object]] = {}
+        #: CLIs already reported as off the known-good set, THIS
+        #: PROCESS: once per CLI, not once per session.
+        self._known_good_reported: set[str] = set()
         #: Review rounds spent per stage, THIS PROCESS.
         #:
         #: Deliberately not in the run state. The cap bounds the
@@ -3327,6 +3384,11 @@ class PipelineRunner:
             for ident, text in (state.get('blocking_claims') or {}).items()
             if isinstance(ident, str) and isinstance(text, str)
         }
+        # Absent before versions were recorded (#17). Empty restores
+        # "nothing recorded", so RUN_STATE_VERSION stays put.
+        self._harness_versions = _restore_harness_versions(
+            state.get('harness_versions')
+        )
         self._reviews = [
             rec
             for rec in (
@@ -3478,6 +3540,13 @@ class PipelineRunner:
                 for ident, d in self._dispositions.items()
             },
             'blocking_claims': dict(self._blocking_claims),
+            'harness_versions': {
+                label: {
+                    'runs': entry['runs'],
+                    'versions': dict(entry['versions']),
+                }
+                for label, entry in self._harness_versions.items()
+            },
             'completed_chunks': sorted(self._completed_chunks),
             # Which writers already cleared a review gate IN THIS RUN.
             # Held in memory it was lost on --resume, and the judge was
@@ -4299,6 +4368,10 @@ class PipelineRunner:
         sandbox = self._sandbox_for_session(session)
         if sandbox is None:
             return None
+        # Read before the pane, and kept even when there is no pane: a
+        # failed turn is the one whose versions matter most (#17).
+        versions = self._read_harness_versions(sandbox)
+        self._note_harness_versions(session, versions)
         try:
             text = pane.capture_pane(sandbox)
         except Exception:  # pragma: no cover - capture_pane is total
@@ -4312,8 +4385,17 @@ class PipelineRunner:
             f'harness blocked on a keystroke goes silent on every other '
             f'channel, so this screen is usually the whole diagnosis.\n'
             "# Nothing was typed into it — answering on the "
-            "human's behalf is not this tool's job.\n\n"
+            "human's behalf is not this tool's job.\n"
+            f'# Harness CLIs installed in this VM now: '
+            f'{harness_versions.format_versions(versions)}\n'
         )
+        if harness_versions.pending_self_update(text):
+            header += (
+                '# The pane shows an installed update waiting on a '
+                'restart, so the process running here is older than '
+                'the version above.\n'
+            )
+        header += '\n'
         # If the screen is a modal picker, SAY so. The failure a human
         # otherwise sees describes the paste mechanism and buries the
         # thing to do, with the picker dumped raw at the end of a
@@ -8005,6 +8087,121 @@ class PipelineRunner:
         ):
             click.echo(f'[launch] {label}: {why}')
 
+    def _read_harness_versions(self, sandbox: str) -> dict[str, str]:
+        """
+        Read *sandbox*'s harness CLI versions; never raises.
+
+        :param sandbox: The microVM name.
+        :returns: ``{cli: version}``, empty when nothing could be read.
+        """
+        try:
+            return harness_versions.read_versions(sandbox)
+        except Exception:  # pragma: no cover - read_versions is total
+            return {}
+
+    def _record_harness_versions(self, session: str) -> None:
+        """
+        Record the CLI versions in *session*'s VM after its first turn.
+
+        One ``sbx exec`` per session; see
+        :meth:`_note_harness_versions`.
+
+        :param session: The session whose first turn just completed.
+        """
+        sandbox = self._sandbox_for_session(session)
+        if sandbox is None:
+            return
+        self._note_harness_versions(
+            session, self._read_harness_versions(sandbox)
+        )
+
+    def _note_harness_versions(
+        self, session: str, versions: dict[str, str]
+    ) -> None:
+        """
+        Keep *session*'s versions and say when one has moved.
+
+        Only the CLI the session drives is compared, against:
+
+        * the version this session recorded at its first turn, when it
+          has one: the CLI updated itself mid-session;
+        * otherwise an earlier session in this run driving the same CLI;
+        * the known-good set, once per CLI per process.
+
+        WARNS, never raises, and the first reading for a session is the
+        one kept.
+
+        :param session: The session the versions were read from.
+        :param versions: ``{cli: version}`` from its VM.
+        """
+        agent = self._session_agent.get(session)
+        if agent is None or not versions:
+            return
+        label = self._session_label.get(session, session)
+        cli = harness_versions.cli_for_harness(agent.harness)
+        with self._lock:
+            first = self._harness_versions.get(label)
+            warnings = self._version_warnings(
+                label, cli, versions.get(cli), first
+            )
+            if first is None:
+                self._harness_versions[label] = {
+                    'runs': cli,
+                    'versions': dict(versions),
+                }
+        for warning in warnings:
+            click.echo(f'[versions] {warning}')
+        if first is None:
+            self._save_state()
+
+    def _version_warnings(
+        self,
+        label: str,
+        cli: str,
+        now: str | None,
+        first: dict[str, object] | None,
+    ) -> list[str]:
+        """
+        What to say about *cli* at version *now* on *label*.
+
+        Called under ``self._lock``.
+
+        :param label: The session's label.
+        :param cli: The CLI the session drives.
+        :param now: Its version as just read, or ``None``.
+        :param first: The session's own earlier record, if any.
+        :returns: The warnings, possibly none.
+        """
+        if now is None:
+            return []
+        if first is not None:
+            before = _recorded_version(first, cli)
+            if before is None or before == now:
+                return []
+            return [
+                f'{label}: {cli} {now} is installed now, but it ran '
+                f'{before} at its first turn. It updated itself '
+                f'mid-session.'
+            ]
+        warnings: list[str] = []
+        for other, entry in self._harness_versions.items():
+            before = _recorded_version(entry, cli)
+            if entry.get('runs') == cli and before not in (None, now):
+                warnings.append(
+                    f'{label}: {cli} {now}, but {other} ran {before} '
+                    f'earlier in this run.'
+                )
+                break
+        known = harness_versions.KNOWN_GOOD.get(cli)
+        if known not in (None, now) and cli not in self._known_good_reported:
+            self._known_good_reported.add(cli)
+            warnings.append(
+                f'{cli} {now} is not the known-good {known} recorded '
+                f'{harness_versions.KNOWN_GOOD_RECORDED}. If this run '
+                f'misbehaves, compare against docs/HARNESS-VERSIONS.md.'
+            )
+        return warnings
+
     def _create_session(
         self, agent_name: str, worktree: str, mode: str, label: str
     ) -> str:
@@ -8126,6 +8323,7 @@ class PipelineRunner:
             # never fire (observed — it read an empty pane every time).
             # One turn late still beats stage 6 of 8, and costs no wait.
             self._verify_launch(session)
+            self._record_harness_versions(session)
         if not result.ok:
             note = self._session_failure_note(session)
             pane_path = self._capture_turn(
