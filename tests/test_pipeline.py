@@ -14,6 +14,7 @@ import yaml
 from omnigent.spec import parse
 
 from sbx_omnigent import pipeline as P
+from sbx_omnigent._compat import CODEX_EFFORTS
 
 _FULL = """\
 version: 1
@@ -672,6 +673,50 @@ class TestLoadPipeline(_Base):
             'stages:\n  - {id: s, run: a}\n'
         )
         self.assertIsNone(cfg.agents['a'].model)
+
+    def test_a_codex_effort_the_launcher_would_drop_is_rejected_at_load(
+        self,
+    ) -> None:
+        # #53: the launch args leave out any codex effort off the
+        # ladder, so the turn silently ran at codex's default and the
+        # only sign was a read-back warning after the first turn.
+        for effort in ('max', 'ultra', 'bogus', 'XHIGH'):
+            with self.subTest(effort=effort):
+                with self.assertRaises(P.PipelineError) as caught:
+                    self._load(
+                        'repo: ./p\nagents:\n'
+                        '  a: {template: coder, harness: codex-native, '
+                        f'effort: {effort}}}\n'
+                        'stages:\n  - {id: s, run: a}\n'
+                    )
+                msg = str(caught.exception)
+                self.assertIn("agent 'a'", msg)
+                self.assertIn(repr(effort), msg)
+                self.assertIn('xhigh', msg)
+
+    def test_a_codex_effort_on_the_ladder_loads_cleanly(self) -> None:
+        for effort in sorted(CODEX_EFFORTS):
+            with self.subTest(effort=effort):
+                cfg = self._load(
+                    'repo: ./p\nagents:\n'
+                    '  a: {template: coder, harness: codex-native, '
+                    f'effort: {effort}}}\n'
+                    'stages:\n  - {id: s, run: a}\n'
+                )
+                self.assertEqual(cfg.agents['a'].effort, effort)
+
+    def test_an_effort_is_only_laddered_for_codex(self) -> None:
+        # Claude and agy take no `-c` config, so the codex ladder says
+        # nothing about them.
+        for harness in ('claude-native', 'antigravity-native'):
+            with self.subTest(harness=harness):
+                cfg = self._load(
+                    'repo: ./p\nagents:\n'
+                    f'  a: {{template: coder, harness: {harness}, '
+                    'effort: max}\n'
+                    'stages:\n  - {id: s, run: a}\n'
+                )
+                self.assertEqual(cfg.agents['a'].effort, 'max')
 
     def test_parallel_competing_writers(self) -> None:
         cfg = self._load(

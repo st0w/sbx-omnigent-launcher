@@ -34,7 +34,8 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
-from sbx_omnigent._compat import model_family_mismatch
+from sbx_omnigent import codex
+from sbx_omnigent._compat import CODEX_EFFORTS, model_family_mismatch
 
 #: Shipped role prompt templates live here (Path-relative, like the
 #: packaged ``agents/`` bundles — works for the editable install).
@@ -741,6 +742,23 @@ def _validate(config: PipelineConfig) -> None:  # noqa: C901
         reason = model_family_mismatch(agent.harness, agent.model)
         if reason is not None:
             raise PipelineError(f'agent {agent_name!r}: {reason}')
+    # A codex effort off the ladder is LEFT OUT of the launch args
+    # (it is interpolated into a `-c` config expression, so the gate is
+    # a closed allowlist), and the turn then runs at codex's default.
+    # The only sign was a read-back warning after the first turn (#53),
+    # so refuse it here instead of dropping it there.
+    for agent_name, agent in config.agents.items():
+        if (
+            agent.effort is None
+            or agent.harness not in codex.CODEX_HARNESSES
+            or agent.effort in CODEX_EFFORTS
+        ):
+            continue
+        raise PipelineError(
+            f'agent {agent_name!r}: effort {agent.effort!r} is not one '
+            f'codex is launched with ({", ".join(sorted(CODEX_EFFORTS))}); '
+            "the turn would silently run at codex's default effort"
+        )
 
 
 def _iter_stages(
