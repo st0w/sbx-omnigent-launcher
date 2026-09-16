@@ -24,8 +24,9 @@ before any in-VM self-update could run:
 | `agy` (Antigravity CLI) | 1.1.16 |
 
 Models confirmed on that image — one real turn each. The launch read-back checked
-the codex row and found no mismatch. Read-back does not check a Claude model, so
-the Claude row was confirmed by reading the captured pane's banner by hand:
+the codex row and found no mismatch. Read-back did not yet check a Claude model,
+so the Claude row was confirmed by reading the captured pane's banner by hand;
+it now reads that banner's model and effort too:
 
 | Harness | Model | Effort | Pane showed |
 | --- | --- | --- | --- |
