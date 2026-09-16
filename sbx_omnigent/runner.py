@@ -923,6 +923,41 @@ _REVIEW_VERDICT_LINE = (
     'not, or you could not verify).'
 )
 
+#: How a REVIEWER reports a contract that cannot be satisfied.
+#:
+#: `_halt_on_dispute` stops the run on a blocking reviewer's dispute,
+#: but reviewers were never told how to raise one: implementation
+#: reviewers met the marker only in :data:`_UNATTENDED`, whose wording
+#: and example are a writer's, and refactor reviewers never met it. A
+#: reviewer who could not name the channel blocked instead, re-driving
+#: a writer who cannot change the contract until the rounds ran out
+#: (#48).
+#:
+#: The bar is deliberately high, so a halt reaches a human with both
+#: sides of the conflict on the page. The marker is kept mid-sentence:
+#: the parser matches a line that STARTS with it, and a reviewer quoting
+#: this paragraph back must not halt the run.
+_REVIEW_DISPUTE = (
+    '\n\nWHEN THE CONTRACT ITSELF IS WRONG. Block when the code is '
+    'wrong. Sometimes the fault is instead in what the writer was '
+    'handed: a frozen test that requires what another test, the brief '
+    'or a stated invariant forbids, or a success criterion no '
+    'implementation can meet. Re-driving the writer cannot fix that, '
+    'because the writer may not change the contract. Raise a dispute '
+    'instead, which stops the run for a human: a line of its own that '
+    'begins with the marker `DISPUTED:` followed by a one-line claim, '
+    'and still end with `VERDICT: BLOCKING`, because only a blocking '
+    "reviewer's dispute halts the run. The bar is high. Below that "
+    'line, name BOTH conflicting artifacts with file:line, quote the '
+    'requirement from each, say which one is wrong, and say what a '
+    'writer would have to do to satisfy both, or that nothing could. '
+    'If you cannot do all four, it is not a dispute: block on the code. '
+    'Never ask for the tests stage to be re-run to settle it. The '
+    'easiest way for that stage to resolve a conflict is to weaken a '
+    'test, and the writers have already built against the contract it '
+    'would change.'
+)
+
 _REVIEW_NOT_THE_GATE = (
     '\n\nRUN THE TESTS, NOT THE COVERAGE GATE. Execute the suite '
     'covering what you are reviewing — that is what stops an empty '
@@ -9064,6 +9099,7 @@ class PipelineRunner:
             + self._rulings_block()
             + _FINDINGS_ASK
             + self._guarded_block(stage)
+            + _REVIEW_DISPUTE
             + _REVIEW_VERDICT_LINE
         )
 
@@ -9168,6 +9204,7 @@ class PipelineRunner:
             + self._rulings_block()
             + _FINDINGS_ASK
             + self._guarded_block(stage)
+            + _REVIEW_DISPUTE
             + _REVIEW_VERDICT_LINE
         )
 
