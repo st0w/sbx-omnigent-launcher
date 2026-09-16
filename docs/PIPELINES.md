@@ -352,10 +352,13 @@ vanish with the run:
   whether a second writer earns its microVMs.
 
   The record distinguishes what the judge **stated** from what actually shipped.
-  When a reply carries no usable `SELECT:` line the runner keeps the FIRST
-  candidate and says so loudly; that is a fallback, not a preference, and the
-  record calls it an absent decision so a series cannot be read as favouring
-  whichever node happens to be listed first.
+  When a reply carries no usable `SELECT:` line, the runner asks the judge once
+  more. If the second reply has none either, the run **halts** without choosing:
+  the candidates' branches stay on the hub and their reviews stay in the run
+  state, so a human can pick one and resume. The runner never ships a candidate
+  because of its position in `needs`. Runs from before this change fell back to
+  the first candidate, and their records still mark such a pick as an absent
+  decision, not a preference.
 
 - **The losing branch itself**, as a git bundle under
   `<canonical_root>/_retained/<run>/<node>.bundle`. It is complete, reviewed and

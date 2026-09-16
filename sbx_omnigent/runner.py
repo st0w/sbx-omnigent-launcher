@@ -1851,9 +1851,11 @@ class JudgePick:
     :param selected: The node id that won and will publish.
     :param stated: What the judge's own ``SELECT:`` line named, or
         ``None`` when it never stated one. Kept SEPARATE from
-        *selected* because the runner falls back to the first candidate
-        when the line is missing or names a non-candidate — a silent
-        substitution that would otherwise read as a real decision.
+        *selected* because the runner used to fall back to the first
+        candidate when the line was missing or named a non-candidate.
+        It now halts instead, but picks recorded before that change
+        still carry the substitution, which must not read as a real
+        decision.
     :param reasoning: The judge's reply, which carries its per-candidate
         assessment. The session is disposed moments later.
     :param retained: ``(node, bundle-path)`` for each candidate that did
@@ -2172,10 +2174,11 @@ def render_judge_decision(
                 f'{_withdrawn(pick)}.',
             ]
         if not pick.uncontested and not pick.honored:
-            # The runner substitutes the first candidate when the judge
-            # never stated a usable SELECT. That is a fallback, not a
-            # decision, and a series that silently counted it as one
-            # would misreport the race.
+            # Only picks recorded before the runner halted on a missing
+            # SELECT reach here: it used to substitute the first
+            # candidate. That was a fallback, not a decision, and a
+            # series that silently counted it as one would misreport
+            # the race.
             parts += [
                 '',
                 "> **Not the judge's stated choice.** It named "
@@ -9301,8 +9304,9 @@ class PipelineRunner:
         Second, that this is its ONLY turn. The judge asked to "process
         the results as soon as they are available" — a perfectly normal
         thing to say in a conversation, and fatal here, because nothing
-        follows. Without a SELECT line the first candidate wins by
-        default and the judge's opinion is discarded (TASKS.md #41).
+        follows. Without a SELECT line the first candidate used to win
+        by default (TASKS.md #41); now the run halts, which a judge must
+        be told.
 
         :param stage: The judge stage.
         :param candidates: The writer nodes being judged.
@@ -9370,8 +9374,8 @@ class PipelineRunner:
             'background will be waited for or read. Decide now, from '
             'what you have already seen; a decision on partial '
             'evidence is worth far more than none, because without '
-            'that line the first candidate is taken by default and '
-            'your judgement counts for nothing.\n\nReply with a '
+            'that line the run HALTS, no candidate is chosen, and a '
+            'human has to make this choice by hand.\n\nReply with a '
             'one-paragraph rationale, then a final line reading '
             'exactly:\n\n    SELECT: <id>\n\nwhere <id> is one '
             f'of: {", ".join(candidates)}. Include the colon, copy '

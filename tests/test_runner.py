@@ -5794,6 +5794,16 @@ class TestAJudgeThatDecidedButMisspelledIt(_Base):
         self.assertIn('impl-a', instr)
         self.assertIn('impl-b', instr)
 
+    def test_the_retry_does_not_promise_a_default(self) -> None:
+        # The fallback was removed: a second reply without the line
+        # halts the run. Telling the judge the first candidate is taken
+        # understates what its silence costs.
+        instr = R.PipelineRunner._judge_retry_instruction(
+            ['impl-a', 'impl-b']
+        )
+        self.assertNotIn('by default', instr)
+        self.assertIn('HALTS', instr)
+
 
 _PS_CANDIDATES = ['m0-impl-a', 'm0-impl-b']
 
