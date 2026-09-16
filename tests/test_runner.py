@@ -5633,6 +5633,85 @@ class TestAParallelBlockRunsInParallel(_Base):
         self.assertEqual(finished, ['impl-b'])
 
 
+class TestTheReviewBudgetBoundsTheBranch(_Base):
+    """
+    The round cap counted loop-backs within ONE entry into
+    `_run_review`, and the number it bounded was a local.
+
+    Anything that re-enters — a parallel sibling failing, a gate retry
+    — handed the branch a fresh budget while the recorded round number
+    kept climbing. One live branch reached six recorded rounds against
+    a configured cap of three, and nothing stopped it.
+    """
+
+    def _runner(self, *, cap, sc=None, wt=None):
+        cfg = self._cfg(_LINEAR)
+        runner = R.PipelineRunner(
+            cfg,
+            session_client=sc or FakeSC({'review-sec': 'VERDICT: BLOCKING'}),
+            worktree_manager=wt or FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            max_review_rounds=cap, swap_age_s=lambda: 0.0,
+        )
+        runner._nodes['build'] = R.NodeResult(
+            'build', 'writer', branch='pl/r1/build',
+            worktree='/wt/r1/nodes/build', session='sess-build',
+        )
+        return runner
+
+    def _review_until_blocked(self, runner):
+        """Drive one entry into the gate; return the rounds it spent."""
+        before = len(runner._reviews)
+        with self.assertRaises(R._Blocked):
+            runner._run_review(runner._stage_by_id['review'])
+        return len(runner._reviews) - before
+
+    def test_a_single_entry_spends_its_whole_budget(self) -> None:
+        # The meaning of --max-review-rounds is UNCHANGED: N re-drives,
+        # so N+1 reviews. Only its SCOPE moves.
+        runner = self._runner(cap=3)
+        self.assertEqual(self._review_until_blocked(runner), 4)
+
+    def test_re_entering_does_not_grant_a_fresh_budget(self) -> None:
+        # The defect. A second entry used to start over at zero.
+        runner = self._runner(cap=3)
+        self._review_until_blocked(runner)
+        self.assertEqual(self._review_until_blocked(runner), 1)
+
+    def test_the_branch_never_exceeds_its_budget_across_entries(
+        self,
+    ) -> None:
+        runner = self._runner(cap=3)
+        for _entry in range(3):
+            self._review_until_blocked(runner)
+        rounds = [r.round_no for r in runner._reviews if r.stage == 'review']
+        self.assertEqual(len(rounds), 6, rounds)
+
+    def test_two_review_stages_have_separate_budgets(self) -> None:
+        # review-a and review-b review different branches; one
+        # exhausting its rounds must not spend the other's.
+        runner = self._runner(cap=3)
+        runner._spend_review_round('review-a')
+        runner._spend_review_round('review-a')
+        self.assertEqual(runner._spend_review_round('review-b'), 1)
+
+    def test_a_fresh_runner_starts_with_a_full_budget(self) -> None:
+        # What a resume is: a new process. The maintainer's call — a
+        # resume is a deliberate human act, so it buys another N.
+        first = self._runner(cap=3)
+        self._review_until_blocked(first)
+        self.assertEqual(self._review_until_blocked(self._runner(cap=3)), 4)
+
+    def test_the_budget_is_not_carried_in_run_state(self) -> None:
+        # It must not be, or a resume would inherit a spent budget and
+        # the decision above would be reversed by the state file.
+        runner = self._runner(cap=3)
+        self._review_until_blocked(runner)
+        self.assertNotIn(
+            'review_rounds', ' '.join(runner._state_payload())
+        )
+
+
 class TestReviewersReadASnapshot(_Base):
     """
     Reviewers mounted the writer's LIVE clone, read-only.
