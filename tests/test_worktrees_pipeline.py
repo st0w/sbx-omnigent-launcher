@@ -298,6 +298,103 @@ class TestPipelineWorktrees(unittest.TestCase):
             self.mgr.branch_contains('run1', 'ghost', ancestor='tests')
         )
 
+    def test_a_review_snapshot_is_the_branch_not_the_worktree(
+        self,
+    ) -> None:
+        # Reviewers mounted the writer's LIVE clone, which the writer's
+        # session can still be editing. A snapshot is a separate tree
+        # at the branch tip, so a writer still working cannot change
+        # what a reviewer is reading.
+        self.mgr.create_run('run1', self.repo)
+        impl = self.mgr.create_node_worktree('run1', 'impl-a')
+        (Path(impl) / 'done.py').write_text('shipped\n', encoding='utf-8')
+        self.mgr.commit_node('run1', 'impl-a', message='impl')
+        snap = self.mgr.create_review_snapshot('run1', 'impl-a', label='r1')
+        self.assertNotEqual(Path(snap), Path(impl))
+        self.assertIn('done.py', _files(snap))
+
+    def test_a_snapshot_excludes_work_that_is_not_committed(self) -> None:
+        # The property the whole change turns on: what a reviewer sees
+        # is exactly what the judge will clone, not whatever the
+        # writer's tree happens to hold this second.
+        self.mgr.create_run('run1', self.repo)
+        impl = self.mgr.create_node_worktree('run1', 'impl-a')
+        (Path(impl) / 'done.py').write_text('shipped\n', encoding='utf-8')
+        self.mgr.commit_node('run1', 'impl-a', message='impl')
+        (Path(impl) / 'midflight.py').write_text('wip\n', encoding='utf-8')
+        snap = self.mgr.create_review_snapshot('run1', 'impl-a', label='r1')
+        self.assertIn('done.py', _files(snap))
+        self.assertNotIn('midflight.py', _files(snap))
+
+    def test_a_snapshot_is_disposable_by_label(self) -> None:
+        self.mgr.create_run('run1', self.repo)
+        self.mgr.create_node_worktree('run1', 'impl-a')
+        self.mgr.commit_node('run1', 'impl-a', message='impl')
+        snap = self.mgr.create_review_snapshot('run1', 'impl-a', label='r1')
+        self.assertEqual(
+            self.mgr.dispose_node_worktrees('run1', ['r1']), 1
+        )
+        self.assertFalse(Path(snap).exists())
+
+    def test_node_ahead_of_hub_sees_a_commit_the_agent_made_itself(
+        self,
+    ) -> None:
+        # Agents run `git commit` inside their own VM. That leaves the
+        # clone ahead of the hub with a CLEAN tree, which every
+        # dirtiness check reads as "nothing to do".
+        self.mgr.create_run('run1', self.repo)
+        impl = self.mgr.create_node_worktree('run1', 'impl-a')
+        self.assertFalse(self.mgr.node_ahead_of_hub('run1', 'impl-a'))
+        (Path(impl) / 'own.py').write_text('mine\n', encoding='utf-8')
+        _git(Path(impl), 'add', '-A')
+        _git(Path(impl), '-c', 'user.email=a@a', '-c', 'user.name=a',
+             'commit', '-m', 'the agent committed this itself')
+        self.assertTrue(self.mgr.node_ahead_of_hub('run1', 'impl-a'))
+        self.assertEqual(self.mgr._porcelain(impl), '')
+        # Committing it through the manager pushes it to the hub.
+        self.mgr.commit_node('run1', 'impl-a', message='reconciled')
+        self.assertFalse(self.mgr.node_ahead_of_hub('run1', 'impl-a'))
+
+    def test_the_settle_fingerprint_notices_a_second_edit(self) -> None:
+        # `git status --porcelain` prints ' M f.py' for one edit and
+        # for ten, so a writer still rewriting files it already touched
+        # read as settled after the stable window.
+        self.mgr.create_run('run1', self.repo)
+        impl = self.mgr.create_node_worktree('run1', 'impl-a')
+        target = Path(impl) / 'README.md'
+        target.write_text('first\n', encoding='utf-8')
+        once = self.mgr._tree_fingerprint(impl)
+        target.write_text('second, quite different\n', encoding='utf-8')
+        twice = self.mgr._tree_fingerprint(impl)
+        self.assertEqual(
+            self.mgr._porcelain(impl), self.mgr._porcelain(impl)
+        )
+        self.assertNotEqual(once, twice)
+
+    def test_the_settle_fingerprint_is_stable_when_nothing_changes(
+        self,
+    ) -> None:
+        self.mgr.create_run('run1', self.repo)
+        impl = self.mgr.create_node_worktree('run1', 'impl-a')
+        (Path(impl) / 'README.md').write_text('x\n', encoding='utf-8')
+        self.assertEqual(
+            self.mgr._tree_fingerprint(impl),
+            self.mgr._tree_fingerprint(impl),
+        )
+
+    def test_the_settle_fingerprint_notices_an_untracked_file_growing(
+        self,
+    ) -> None:
+        # A new source file is untracked until it is staged, and
+        # porcelain shows only its name.
+        self.mgr.create_run('run1', self.repo)
+        impl = self.mgr.create_node_worktree('run1', 'impl-a')
+        new = Path(impl) / 'fresh.py'
+        new.write_text('a\n', encoding='utf-8')
+        small = self.mgr._tree_fingerprint(impl)
+        new.write_text('a\nb\nc\n', encoding='utf-8')
+        self.assertNotEqual(small, self.mgr._tree_fingerprint(impl))
+
     def test_reseed_missing_worktree_raises(self) -> None:
         self.mgr.create_run('run1', self.repo)
         with self.assertRaises(click.ClickException):
