@@ -11132,10 +11132,6 @@ class TestResolvePublishToken(unittest.TestCase):
             R.resolve_publish_token(self._file('s'), 'echo s')
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class BlockedReviewForfeitsOneCandidate(unittest.TestCase):
     """
     A review that never reaches consensus withdraws ITS candidate.
@@ -11222,3 +11218,7 @@ class BlockedReviewForfeitsOneCandidate(unittest.TestCase):
         runner._forfeited.add('impl-b')
 
         self.assertEqual(runner._judge_candidates(pick), ['impl-a'])
+
+
+if __name__ == '__main__':
+    unittest.main()
