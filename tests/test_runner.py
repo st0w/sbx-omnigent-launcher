@@ -5633,6 +5633,153 @@ class TestAParallelBlockRunsInParallel(_Base):
         self.assertEqual(finished, ['impl-b'])
 
 
+#: The reply from the live run in #15, verbatim in shape: the writer
+#: did exactly what its template asked and the orchestrator could not
+#: hear it. The marker is at the END of a heading, so `_DISPUTE_RE`
+#: finds nothing.
+_NEAR_MISS_REPLY = """\
+## 1. Assumed-role attribution — **DISPUTED**
+
+This finding cannot be satisfied without editing a frozen test
+assertion, so per the rules I left the code alone and am reporting it
+rather than obeying it.
+"""
+
+
+class TestADisputeNearMissIsReported(_Base):
+    """
+    A correct dispute in the wrong shape was lost in silence.
+
+    `_DISPUTE_RE` demands the marker at the start of a line followed by
+    the claim, and that strictness is right: the bare word appears in
+    almost every healthy report as the instruction echoed back, and
+    halting on it would have killed two shipped builds. So the near
+    miss is REPORTED, not acted on — the run continues, and the one
+    line of output is what turns a silent budget-burning loop into
+    something a human can see.
+    """
+
+    def _runner(self, sc=None):
+        cfg = self._cfg(_LINEAR)
+        runner = R.PipelineRunner(
+            cfg, session_client=sc or FakeSC({}), worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        return runner
+
+    def _writer_said(self, text):
+        """Run the writer dispute gate; return what it printed."""
+        runner = self._runner()
+        runner._nodes['build'] = R.NodeResult(
+            'build', 'writer', output=text
+        )
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            runner._halt_on_writer_dispute(runner._stage_by_id['build'])
+        return ' '.join(str(c.args[0]) for c in echo.call_args_list)
+
+    # ── the detector ──────────────────────────────────────────────
+
+    def test_the_heading_form_is_a_near_miss(self) -> None:
+        self.assertTrue(R.dispute_near_misses(_NEAR_MISS_REPLY))
+
+    def test_the_marker_alone_on_a_line_is_a_near_miss(self) -> None:
+        self.assertTrue(R.dispute_near_misses('**DISPUTED**\n\nbecause x'))
+
+    def test_a_parseable_dispute_is_not_a_near_miss(self) -> None:
+        # It parses, so the halt fires and there is nothing to report.
+        self.assertEqual(
+            R.dispute_near_misses('DISPUTED: x.py:50 forbids it'), ()
+        )
+
+    def test_a_reply_that_never_mentions_it_is_not_a_near_miss(self) -> None:
+        self.assertEqual(R.dispute_near_misses('all done, tests green'), ())
+
+    def test_an_instruction_echo_is_not_a_near_miss(self) -> None:
+        # The bare word is in almost every healthy report. Measured
+        # across four campaigns: 34 echoes on the two shipped builds.
+        for echo in (
+            'If it cannot be resolved I will label it DISPUTED and stop.',
+            'Nothing here is DISPUTED.',
+            'I found no DISPUTED findings in this module.',
+            'A contract I cannot satisfy is reported as DISPUTED.',
+        ):
+            with self.subTest(echo=echo):
+                self.assertEqual(R.dispute_near_misses(echo), ())
+
+    def test_the_shipped_prompts_contain_no_near_miss(self) -> None:
+        # The instruction that ASKS for the marker must not look like
+        # someone using it. Guards every template and turn blob at
+        # once, so a future edit cannot quietly start self-triggering.
+        sources = [
+            v for k, v in vars(R).items()
+            if k.isupper() and isinstance(v, str) and 'DISPUTED' in v
+        ]
+        sources += [
+            f.read_text(encoding='utf-8')
+            for f in Path('sbx_omnigent/templates').glob('*.md')
+        ]
+        self.assertTrue(sources, 'nothing scanned')
+        for text in sources:
+            self.assertEqual(R.dispute_near_misses(text), ())
+
+    # ── the writer path ───────────────────────────────────────────
+
+    def test_a_writers_near_miss_is_reported(self) -> None:
+        said = self._writer_said(_NEAR_MISS_REPLY)
+        self.assertIn('build', said)
+        self.assertIn('DISPUTED:', said)
+
+    def test_the_report_shows_the_form_that_would_have_worked(self) -> None:
+        # Naming the shape is the whole value: the writer was right and
+        # only its formatting was unreadable.
+        said = self._writer_said(_NEAR_MISS_REPLY)
+        self.assertIn('start of a line', said.lower())
+
+    def test_a_near_miss_does_not_halt_the_run(self) -> None:
+        # Halting would restore exactly the false-positive risk
+        # `_DISPUTE_RE` was tightened to avoid.
+        self._writer_said(_NEAR_MISS_REPLY)  # must not raise
+
+    def test_a_real_dispute_still_halts(self) -> None:
+        runner = self._runner()
+        runner._nodes['build'] = R.NodeResult(
+            'build', 'writer',
+            output='DISPUTED: the frozen test at x.py:50 forbids it',
+        )
+        with self.assertRaises(R.PipelineRunError):
+            runner._halt_on_writer_dispute(runner._stage_by_id['build'])
+
+    def test_a_clean_reply_says_nothing(self) -> None:
+        self.assertNotIn('DISPUTED', self._writer_said('all green'))
+
+    # ── the review path ───────────────────────────────────────────
+
+    def test_a_blocking_reviewers_near_miss_is_reported(self) -> None:
+        runner = self._runner()
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            runner._halt_on_dispute(
+                runner._stage_by_id['review'],
+                {'sec': _NEAR_MISS_REPLY},
+                ['sec'],
+            )
+        said = ' '.join(str(c.args[0]) for c in echo.call_args_list)
+        self.assertIn('sec', said)
+        self.assertIn('DISPUTED:', said)
+
+    def test_an_approving_reviewers_near_miss_is_not_reported(self) -> None:
+        # Only a BLOCKING reviewer's dispute counts — one raised beside
+        # an approval is an observation, and the run is not stuck.
+        runner = self._runner()
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            runner._halt_on_dispute(
+                runner._stage_by_id['review'],
+                {'sec': _NEAR_MISS_REPLY},
+                [],
+            )
+        self.assertEqual(echo.call_args_list, [])
+
+
 class TestTheReviewBudgetBoundsTheBranch(_Base):
     """
     The round cap counted loop-backs within ONE entry into

@@ -1256,6 +1256,58 @@ def parse_disputes(text: str | None) -> tuple[str, ...]:
     )
 
 
+#: A line that DECLARES a dispute rather than mentioning one. The
+#: bare word is in almost every healthy report as the instruction
+#: echoed back — 34 echoes across the two shipped campaigns — so a
+#: near miss has to be recognised by SHAPE, not by the word.
+#:
+#: Two shapes, both of which read as "this section is a dispute":
+#: a markdown heading carrying the marker (what the live loss looked
+#: like), and a line that is the marker and nothing else.
+_DISPUTE_HEADING_RE = re.compile(r'^[ \t]*#{1,6}[ \t]')
+
+#: Bullets, numbering, emphasis and trailing punctuation, stripped so
+#: ``**DISPUTED**`` and ``- DISPUTED:`` reduce to the bare word.
+_DISPUTE_DECOR_RE = re.compile(
+    r'^[\s\-*\u2022\d.)#*_`\u2014\u2013:]+|[\s*_`.:\u2014\u2013-]+$'
+)
+
+
+def dispute_near_misses(text: str | None) -> tuple[str, ...]:
+    """
+    Lines that declare a dispute but do not parse as one.
+
+    A writer that meets an impossible contract and says so in the wrong
+    shape is lost in silence: the halt never fires, and the run spends
+    its whole budget relaying a finding the writer has correctly
+    refused. That happened live — the marker sat at the END of a
+    markdown heading, which :data:`_DISPUTE_RE` does not match.
+
+    Deliberately narrow. Loosening the PARSER is not an option: the
+    bare word appears throughout healthy reports as the instruction
+    echoed back, and halting on it would have killed two shipped
+    builds. So this recognises only the shapes that read as a
+    declaration, and its caller WARNS rather than halting — the cost
+    of a false positive is one line of output.
+
+    Returns nothing when a real dispute parsed: the halt has it, and
+    there is nothing to report.
+
+    :param text: A stage's reply.
+    :returns: The offending lines, stripped, in order.
+    """
+    if not text or parse_disputes(text):
+        return ()
+    found: list[str] = []
+    for line in text.splitlines():
+        if 'DISPUTED' not in line:
+            continue
+        bare = _DISPUTE_DECOR_RE.sub('', line).strip()
+        if _DISPUTE_HEADING_RE.match(line) or bare.upper() == 'DISPUTED':
+            found.append(line.strip())
+    return tuple(found)
+
+
 def parse_decisions_doc(text: str | None) -> list[tuple[str, str]]:
     """
     Read a committed decisions ledger back into ``(module, text)``.
@@ -7232,6 +7284,32 @@ class PipelineRunner:
             )
             self._redrive_writer(stage.on_block, findings)
 
+    def _warn_dispute_near_miss(self, label: str, text: str | None) -> None:
+        """
+        Say so when a reply declares a dispute the parser cannot read.
+
+        WARNS and returns. Halting here would mean acting on the bare
+        word, which is the false-positive risk :data:`_DISPUTE_RE` was
+        tightened to avoid; saying nothing is what let a correct
+        refusal be relayed until the round budget died, with nobody
+        told why.
+
+        :param label: The stage or reviewer whose reply it was.
+        :param text: That reply.
+        """
+        missed = dispute_near_misses(text)
+        if not missed:
+            return
+        click.echo(
+            f'[dispute] {label}: its reply declares a dispute the '
+            f'orchestrator cannot read, so the run is CONTINUING and '
+            f'will keep relaying this finding until the round budget '
+            f'is gone. A dispute is only heard as `DISPUTED:` at the '
+            f'START OF A LINE, followed by the claim — in a heading or '
+            f'as a label it is invisible. Found: '
+            + '; '.join(repr(line) for line in missed)
+        )
+
     def _halt_on_writer_dispute(self, stage: pipeline.PipelineStage) -> None:
         """
         Stop when a WRITER says its own contract cannot be satisfied.
@@ -7263,8 +7341,10 @@ class PipelineRunner:
         :raises PipelineRunError: When the writer raised a dispute.
         """
         node = self._nodes.get(stage.id)
-        claims = parse_disputes(node.output if node else None)
+        output = node.output if node else None
+        claims = parse_disputes(output)
         if not claims:
+            self._warn_dispute_near_miss(stage.id, output)
             return
         listed = '\n'.join(f'  {claim}' for claim in claims)
         # The claim after the marker is one line. The REASONING that
@@ -7324,6 +7404,11 @@ class PipelineRunner:
             for claim in parse_disputes(outputs.get(name))
         ]
         if not disputes:
+            # Only a BLOCKING reviewer's, for the same reason the halt
+            # is: one raised beside an approval is an observation, and
+            # the run is not stuck on it.
+            for name in blocking:
+                self._warn_dispute_near_miss(name, outputs.get(name))
             return
         self._nodes[stage.id] = NodeResult(
             stage.id, 'review', verdict='BLOCKING'
