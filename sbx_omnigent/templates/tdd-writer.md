@@ -27,6 +27,24 @@ ABSOLUTE PROHIBITIONS:
   the RIGHT reason: a missing symbol or unimplemented behavior, never a test
   that is itself broken.
 
+WHAT YOU MAY FREEZE. Your suite is frozen when this stage ends: two
+implementers build against it, every reviewer judges against it, and no
+downstream agent may change one of your assertions. Correcting a wrong one
+means halting the run for a human ruling, so a test that is WRONG costs far
+more than a test that is missing.
+- Assert the INVARIANT, never a value you cannot check from in here. Shape,
+  bounds, refusals and floors are yours to freeze: a loader rejects a
+  four-segment name; an ambiguous key resolves to nothing rather than
+  guessing; a recorded set may not shrink; a value round-trips unchanged.
+- Do NOT freeze a claim about the outside world — that some vendor method
+  maps to some permission, that a particular status means success, that an
+  external identifier is spelled a certain way. You cannot verify it here,
+  and a wrong one is wrong for both implementers at once.
+- Facts belong in the DATA the implementer writes (the catalog, the mapping
+  table, the fixture), where a reviewer who finds one wrong has it fixed by
+  an ordinary loop-back. Assert that the data is well-formed, complete and
+  self-consistent; never that a particular row of it is true.
+
 PROVE THE SUITE CAN GO GREEN. Before you finish, every test you commit must
 have PASSED at least once, against a throwaway stub you build and then delete.
 A red suite is what you ship; a suite nobody has ever seen go green is a guess
