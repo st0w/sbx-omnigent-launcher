@@ -599,10 +599,6 @@ class TestPipelineWorktrees(unittest.TestCase):
             self.mgr.create_node_worktree('nope', 'build')
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class TestRetainingLosingBranches(unittest.TestCase):
     """Real-git checks for the archive of a non-selected implementation.
 
@@ -675,3 +671,7 @@ class TestRetainingLosingBranches(unittest.TestCase):
     def test_a_missing_branch_raises_rather_than_lying(self) -> None:
         with self.assertRaises(click.ClickException):
             self.mgr.retain_node_bundle('run1', 'ghost', against='main')
+
+
+if __name__ == '__main__':
+    unittest.main()

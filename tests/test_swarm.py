@@ -524,10 +524,6 @@ class TestRegistryRoundTrip(unittest.TestCase):
         self.assertEqual(SwarmRegistry(empty).list_ids(), [])
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class TestCodexIsAThirdHarness(unittest.TestCase):
     """Additive: agy stays supported and unchanged. What made this more
     than config was that the launcher's mount sentinel carried a bare
@@ -652,3 +648,7 @@ class TestCodexIsAThirdHarness(unittest.TestCase):
             _launch_args_for(None, 'xhigh'),
             ('--permission-mode', 'bypassPermissions'),
         )
+
+
+if __name__ == '__main__':
+    unittest.main()

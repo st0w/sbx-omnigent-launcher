@@ -248,10 +248,6 @@ class TestAgyEnterprisePatch(unittest.TestCase):
         loader.assert_called_once_with()
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class TestHostConfigReachesTheSandbox(unittest.TestCase):
     """``sandbox.host_config`` is the verbatim in-sandbox
     ``~/.omnigent/config.yaml`` the server injects before the host
@@ -309,3 +305,7 @@ class TestHostConfigReachesTheSandbox(unittest.TestCase):
                     }
                 },
             })
+
+
+if __name__ == '__main__':
+    unittest.main()
