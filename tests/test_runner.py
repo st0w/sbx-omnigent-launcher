@@ -4576,6 +4576,47 @@ class TestAReviewerThatLostItsRunner(_Base):
             self._run(_LINEAR, {}, sc=sc)
         self.assertIn('no pane captured', str(caught.exception))
 
+    def _no_pane_but_a_vm(self, **kw):
+        sc = FakeSC(dict(_LINEAR_REPLIES))
+        sc.fail_labels = {'build'}
+        sc.default_host_id = 'h1'
+        sc.host_names['h1'] = 'managed-h1'
+        with mock.patch.object(R.pane, 'capture_pane', return_value=None):
+            with self.assertRaises(R.PipelineRunError) as caught:
+                self._run(_LINEAR, {}, sc=sc, **kw)
+        return str(caught.exception)
+
+    def test_a_live_vm_with_no_pane_is_not_called_gone(self) -> None:
+        # Seen live twice: the runner said "the sandbox was already
+        # gone" about a VM it had just read three CLI versions out of.
+        # The terminal had never started, and that is what to say.
+        said = self._no_pane_but_a_vm()
+        self.assertNotIn('already gone', said)
+        self.assertIn('managed-h1', said)
+        self.assertIn('never started', said)
+
+    def test_it_says_where_the_real_error_is(self) -> None:
+        said = self._no_pane_but_a_vm()
+        self.assertIn('sbx exec managed-h1', said)
+        self.assertIn('~/.omnigent/logs/runner/', said)
+
+    def test_without_keep_it_says_the_vm_will_be_removed(self) -> None:
+        self.assertIn('--keep', self._no_pane_but_a_vm())
+
+    def test_with_keep_it_says_the_vm_is_still_there(self) -> None:
+        said = self._no_pane_but_a_vm(keep=True)
+        self.assertIn('still there', said)
+        self.assertNotIn('re-run with --keep', said)
+
+    def test_an_unlocatable_vm_says_so(self) -> None:
+        sc = FakeSC(dict(_LINEAR_REPLIES))
+        sc.fail_labels = {'build'}
+        with self.assertRaises(R.PipelineRunError) as caught:
+            self._run(_LINEAR, {}, sc=sc)
+        said = str(caught.exception)
+        self.assertIn('could not be located', said)
+        self.assertNotIn('already gone', said)
+
 
 class TestAVerifiesStageParsesFromYaml(_Base):
     """The declaration a pipeline actually writes, end to end."""
