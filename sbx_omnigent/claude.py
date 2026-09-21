@@ -47,6 +47,25 @@ from __future__ import annotations
 
 #: Sentinel the in-VM seed prints on success, so a silent no-op cannot
 #: pass for a successful seed.
+#: The claude-native harness ids, as Omnigent spells them
+#: (``CLAUDE_GATEWAY_HARNESSES`` in ``omnigent/gateway_inference.py``).
+CLAUDE_NATIVE_HARNESSES: frozenset[str] = frozenset(
+    {'claude-native', 'native-claude'}
+)
+
+#: Largest agent instructions, in bytes, a claude-native agent is
+#: allowed at pipeline load.
+#:
+#: Omnigent v0.13.0 starts Claude Code inside tmux and passes the
+#: agent's instructions on that command line (``--append-system-prompt
+#: <text>``). tmux 3.5a refuses a command over about 16,329 bytes
+#: (measured in a guest), and the same command also carries an inline
+#: MCP config, tool lists and the model and permission flags. Over the
+#: limit the terminal never starts, and the run fails with
+#: ``failed: None``. Observed: 13,584 bytes launched; 16,763 and 17,719
+#: did not. This leaves about 2 KB for the rest of the command.
+LAUNCH_INSTRUCTIONS_BUDGET = 14_000
+
 SEED_OK_MARKER = '__omni_claude_seed_ok__'
 
 #: The ``~/.claude/settings.json`` key that records "I have accepted the

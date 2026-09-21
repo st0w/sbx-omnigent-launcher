@@ -8589,12 +8589,43 @@ class PipelineRunner:
             # silently reproduced it.
             where = (
                 f' — see {pane_path}' if pane_path
-                else ' (no pane captured — the sandbox was already gone)'
+                else self._no_pane_note(session)
             )
             raise PipelineRunError(
                 f'turn on {session} failed: {result.error}{note}{where}'
             )
         return result.reply
+
+    def _no_pane_note(self, session: str) -> str:
+        """
+        Why a failed turn has no pane, and where its real error is.
+
+        This used to say "the sandbox was already gone" whenever no pane
+        came back. Seen live twice with the VM running: the terminal had
+        never started (tmux refused its launch command), so there was no
+        pane to read. The harness logs the reason inside the VM, and the
+        message has to point there.
+
+        :param session: The session whose turn failed.
+        :returns: A parenthesised note for the failure message.
+        """
+        sandbox = self._sandbox_for_session(session)
+        if sandbox is None:
+            return (
+                " (no pane captured — the session's VM could not be "
+                'located)'
+            )
+        kept = (
+            'This run keeps its VMs (--keep), so the VM is still there.'
+            if self._keep
+            else 'Teardown removes the VM, so re-run with --keep to read it.'
+        )
+        return (
+            f' (no pane captured from {sandbox}: most often the harness '
+            f'terminal never started. Its own error is in the runner log '
+            f"inside the VM: sbx exec {sandbox} -- sh -lc 'tail -120 "
+            f"~/.omnigent/logs/runner/runner-*.log'. {kept})"
+        )
 
     def _session_failure_note(self, session: str) -> str:
         """

@@ -34,7 +34,7 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
-from sbx_omnigent import codex
+from sbx_omnigent import claude, codex
 from sbx_omnigent._compat import CODEX_EFFORTS, model_family_mismatch
 
 #: Shipped role prompt templates live here (Path-relative, like the
@@ -758,6 +758,47 @@ def _validate(config: PipelineConfig) -> None:  # noqa: C901
             f'agent {agent_name!r}: effort {agent.effort!r} is not one '
             f'codex is launched with ({", ".join(sorted(CODEX_EFFORTS))}); '
             "the turn would silently run at codex's default effort"
+        )
+    _validate_launch_sizes(config)
+
+
+def _validate_launch_sizes(config: PipelineConfig) -> None:
+    """
+    Refuse a claude-native agent whose instructions cannot be launched.
+
+    Its instructions are its role prompt plus the pipeline ``context:``
+    (:func:`_prompt_with_context`), and Omnigent puts them on the tmux
+    command line that starts Claude Code. Over
+    :data:`claude.LAUNCH_INSTRUCTIONS_BUDGET` the terminal never starts,
+    and the run failed minutes in with ``failed: None``, its cause in a
+    log inside a VM that teardown deletes. codex-native writes its
+    instructions to a file, and antigravity-native does not take them
+    at launch, so only Claude is checked.
+
+    :param config: The assembled config.
+    :raises PipelineError: Naming the agent and where its bytes come
+        from, when one is over the budget.
+    """
+    budget = claude.LAUNCH_INSTRUCTIONS_BUDGET
+    context = config.context or ''
+    for agent_name, agent in config.agents.items():
+        if agent.harness not in claude.CLAUDE_NATIVE_HARNESSES:
+            continue
+        size = len(_prompt_with_context(agent.prompt, context).encode())
+        if size <= budget:
+            continue
+        shared = len(context.encode())
+        role = len(agent.prompt.rstrip().encode())
+        raise PipelineError(
+            f'agent {agent_name!r}: its instructions are {size:,} bytes, '
+            f'over the {budget:,} a claude-native agent can launch with. '
+            f'Omnigent passes them to Claude Code on its tmux command '
+            f'line, and tmux refuses a command over about 16 KB, so the '
+            f'terminal would never start. They are the role prompt '
+            f'({role:,} bytes) plus the pipeline context ({shared:,} '
+            f'bytes), which every agent carries. Shorten either, or move '
+            f'material from `context:` into `task:`, which is sent as a '
+            f'turn instead.'
         )
 
 

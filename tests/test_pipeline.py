@@ -13,6 +13,7 @@ from pathlib import Path
 import yaml
 from omnigent.spec import parse
 
+from sbx_omnigent import claude
 from sbx_omnigent import pipeline as P
 from sbx_omnigent._compat import CODEX_EFFORTS
 
@@ -740,6 +741,90 @@ class TestLoadPipeline(_Base):
         self.assertEqual(impl.parallel[0].id, 'impl-a')
         self.assertTrue(impl.parallel[0].write)
         self.assertEqual(cfg.stages[1].selects, 'branch')
+
+
+class TestAClaudeAgentMustFitItsLaunchCommand(_Base):
+    """A claude-native agent's instructions ride its launch command.
+
+    Omnigent starts Claude Code inside tmux with the agent's
+    instructions as ``--append-system-prompt <text>``, and tmux refuses
+    a command over about 16 KB. Each agent's instructions are its role
+    prompt plus the pipeline ``context:``. Over the limit, Claude never
+    starts: the run fails with ``failed: None`` minutes in, and the only
+    explanation is in a log inside a VM teardown deletes. Refusing at
+    load names the agent before anything is provisioned.
+    """
+
+    _BUDGET = claude.LAUNCH_INSTRUCTIONS_BUDGET
+
+    def _agent(self, size: int, *, harness: str = 'claude-native',
+               context: int = 0, char: str = 'x') -> str:
+        (self.root / 'p.md').write_text(char * size, encoding='utf-8')
+        text = (
+            'repo: ./p\nagents:\n'
+            f'  a: {{prompt_file: p.md, harness: {harness}}}\n'
+            'stages:\n  - {id: s, run: a}\n'
+        )
+        if context:
+            (self.root / 'ctx.md').write_text('c' * context,
+                                              encoding='utf-8')
+            text = 'context_file: ctx.md\n' + text
+        return text
+
+    def test_instructions_at_the_budget_load(self) -> None:
+        self._load(self._agent(self._BUDGET))
+
+    def test_one_byte_over_is_refused_naming_the_agent(self) -> None:
+        with self.assertRaises(P.PipelineError) as caught:
+            self._load(self._agent(self._BUDGET + 1))
+        msg = str(caught.exception)
+        self.assertIn("agent 'a'", msg)
+        self.assertIn(f'{self._BUDGET + 1:,}', msg)
+        self.assertIn(f'{self._BUDGET:,}', msg)
+
+    def test_the_shared_context_counts_and_is_named(self) -> None:
+        # The live failure: a 6 KB role prompt plus 11.6 KB of context.
+        with self.assertRaises(P.PipelineError) as caught:
+            self._load(self._agent(6_000, context=self._BUDGET))
+        msg = str(caught.exception)
+        self.assertIn('context', msg)
+        self.assertIn(f'{self._BUDGET:,}', msg)   # the context's share
+
+    def test_size_is_measured_in_bytes_not_characters(self) -> None:
+        # tmux counts bytes; a two-byte character costs two.
+        with self.assertRaises(P.PipelineError):
+            self._load(self._agent(self._BUDGET // 2 + 1, char='\u00e9'))
+
+    def test_the_default_harness_is_checked(self) -> None:
+        (self.root / 'p.md').write_text('x' * (self._BUDGET + 1),
+                                        encoding='utf-8')
+        with self.assertRaises(P.PipelineError):
+            self._load(
+                'repo: ./p\nagents:\n  a: {prompt_file: p.md}\n'
+                'stages:\n  - {id: s, run: a}\n'
+            )
+
+    def test_the_native_claude_alias_is_checked(self) -> None:
+        with self.assertRaises(P.PipelineError):
+            self._load(
+                self._agent(self._BUDGET + 1, harness='native-claude')
+            )
+
+    def test_codex_and_agy_are_not_limited(self) -> None:
+        # codex-native writes its instructions into config.toml, and
+        # antigravity-native does not take them at launch at all, so
+        # neither goes through the tmux command line.
+        for harness in ('codex-native', 'antigravity-native'):
+            with self.subTest(harness=harness):
+                self._load(self._agent(self._BUDGET * 2, harness=harness))
+
+    def test_every_shipped_template_fits_on_its_own(self) -> None:
+        # A template alone over the budget would refuse every pipeline
+        # that uses it; leave room for a context block too.
+        for path in sorted(P._TEMPLATES_DIR.glob('*.md')):
+            with self.subTest(template=path.stem):
+                size = len(P.template_prompt(path.stem).encode())
+                self.assertLess(size, self._BUDGET // 2)
 
 
 class TestDuplicateKeysAreRejected(_Base):

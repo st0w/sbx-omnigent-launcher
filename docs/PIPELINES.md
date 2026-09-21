@@ -261,6 +261,17 @@ to re-register the agents (like any prompt/skills change) — negligible for sta
 project info. For context that varies per run, put it in `task:`/`acceptance:`
 instead (those are relayed per-turn, no restart).
 
+**Keep it small: a claude-native agent's instructions have a size limit.**
+Omnigent starts Claude Code inside tmux and passes the agent's instructions (its
+role prompt plus `context:`) on that command line, and tmux refuses a command
+over about 16 KB. Over the limit the terminal never starts, and the run fails on
+the agent's first turn. So the pipeline refuses to load a claude-native agent
+whose instructions exceed 14,000 bytes, naming the agent and how many bytes come
+from its role prompt and how many from `context:`. The shipped role prompts are
+up to about 6 KB, which leaves roughly 7 KB for `context:`. Move longer material
+into `task:`, which is sent as a turn and has no such limit. codex-native and
+antigravity-native agents are not affected.
+
 ### Text from a file
 
 Any of the three top-level text fields can be read from a file instead of pasted
