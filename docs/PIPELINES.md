@@ -1113,8 +1113,31 @@ Override any of them with an inline `prompt`/`prompt_file`, and augment with
 | `--no-interactive-plan` | Don't block the plan stage on human approval — use the planner's single-turn output as-is. |
 | `--no-auto-harvest` | Don't start an agy token harvester for this run; refuse instead when the swap secret is stale (use when one runs elsewhere). |
 | `--skip-disk-check` | Skip the preflight that refuses to start when free disk can't cover the run's microVMs. |
+| `--skip-codex-check` | Skip the check that the server accepts the host Codex login, for a network that blocks WebSockets but reaches Codex over HTTPS (see [Codex notes](#codex-notes)). An expired access token is still refused. |
 | `--resume` | Continue the run with this `--run-id` instead of starting clean (see [Resuming a run](#resuming-a-run)). |
 | `--turn-timeout` | Seconds one agent turn may take, overriding the pipeline's `turn_timeout`. |
+
+## Codex notes
+
+Codex (`codex-native`) agents use the host's Codex login: its access token is
+copied into each agent VM, with an inert placeholder in place of the refresh
+token, which never leaves the host. A pipeline with any Codex agent checks that
+login twice before it provisions a VM, and `omni-sbx-swarm start` does the same
+when a Codex agent is bound:
+
+1. **Expiry.** It reads the access token's expiry, refuses if it has passed, and
+   warns if it passes within six hours, so a long run doesn't die partway.
+2. **The server.** It runs `codex doctor` and reads its authenticated WebSocket
+   handshake. The expiry check can't see a login the server has already
+   rejected. A dead refresh token passed it, and `codex login status` still
+   printed `Logged in`; every Codex turn then failed as a startup timeout.
+   `codex doctor` redacts why a handshake failed, so a network that blocks
+   WebSockets fails the same way. When the handshake fails, the run is refused
+   with both causes named. Pass **`--skip-codex-check`** if Codex works on your
+   network over HTTPS and only WebSockets are blocked. If `codex doctor` can't
+   run or its report can't be read, the run goes ahead with a warning.
+
+Either refusal names the fix: `codex login --device-auth` on the host.
 
 ## Agy notes
 

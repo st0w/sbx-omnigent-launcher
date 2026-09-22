@@ -645,6 +645,12 @@ class _Base(unittest.TestCase):
         )
         self.read_versions = versions.start()
         self.addCleanup(versions.stop)
+        # Never run the real `codex doctor` on this host.
+        probe = mock.patch.object(
+            R.codex, 'probe_login', return_value=None
+        )
+        self.probe_login = probe.start()
+        self.addCleanup(probe.stop)
         # Never read this host's snapshot store or run its `sbx ls`. A
         # disk refusal names leaked guest disks, and without this the
         # six tests that refuse asked the real sbx on whatever machine
@@ -12392,6 +12398,134 @@ class TestSbxPreflight(_Base):
             res = self._invoke()
         self.assertEqual(res.exit_code, 0, res.output)
         drive.assert_called_once()
+
+
+_CODEX_ONLY = """\
+name: cx
+repo: ./proj
+publish: none
+task: |
+  build it
+agents:
+  cb: {template: coder, harness: codex-native, model: gpt-5}
+stages:
+  - {id: build, run: cb, write: true}
+"""
+
+
+class TestTheCodexLoginIsCheckedAgainstTheServer(_Base):
+    """The expiry check passed a login the server had rejected (#26), so
+    a Codex pipeline also runs `codex doctor`'s authenticated handshake
+    before any VM."""
+
+    def _check(self, text: str, *, skip: bool = False) -> list[str]:
+        said: list[str] = []
+        R.preflight_codex_login(
+            self._cfg(text), skip=skip, echo=said.append
+        )
+        return said
+
+    def test_a_rejected_login_is_refused_naming_the_agents(self) -> None:
+        self.probe_login.side_effect = R.codex.CodexLoginRejected('nope')
+        with self.assertRaises(click.ClickException) as caught:
+            self._check(_CODEX_ONLY)
+        message = caught.exception.format_message()
+        self.assertIn('cb', message)
+        self.assertIn('nope', message)
+
+    def test_a_live_login_says_nothing(self) -> None:
+        self.assertEqual(self._check(_CODEX_ONLY), [])
+
+    def test_a_probe_warning_is_shown(self) -> None:
+        self.probe_login.return_value = 'codex: doctor unreadable'
+        self.assertEqual(
+            self._check(_CODEX_ONLY),
+            ['[preflight] codex: doctor unreadable'],
+        )
+
+    def test_skipping_never_runs_the_probe(self) -> None:
+        self.probe_login.side_effect = R.codex.CodexLoginRejected('nope')
+        said = self._check(_CODEX_ONLY, skip=True)
+        self.probe_login.assert_not_called()
+        self.assertIn('not checked', ' '.join(said))
+
+    def test_a_pipeline_without_codex_is_never_probed(self) -> None:
+        self.assertEqual(self._check(_LINEAR), [])
+        self.probe_login.assert_not_called()
+
+    def _main(self, *extra: str) -> tuple[Result, mock.MagicMock]:
+        cfg_path = self.root / 'pipeline.yaml'
+        cfg_path.write_text(_CODEX_ONLY, encoding='utf-8')
+        with mock.patch.object(R, 'preflight_sbx'), \
+                mock.patch.object(R, 'preflight_disk'), \
+                mock.patch.object(R, 'preflight_codex_auth'), \
+                mock.patch.object(R, 'preflight_codex_login') as login, \
+                mock.patch.object(R, '_drive'):
+            res = CliRunner().invoke(
+                R.main,
+                [
+                    '-c', str(cfg_path),
+                    '--canonical-root', str(self.root / 'c'),
+                    '--worktree-root', str(self.root / 'w'),
+                    '--skip-agy-check',
+                    *extra,
+                ],
+            )
+        return res, login
+
+    def test_the_cli_runs_the_check_by_default(self) -> None:
+        res, login = self._main()
+        self.assertEqual(res.exit_code, 0, res.output)
+        self.assertFalse(login.call_args.kwargs['skip'])
+
+    def test_the_cli_flag_skips_it(self) -> None:
+        res, login = self._main(R.codex.SKIP_LOGIN_CHECK_FLAG)
+        self.assertEqual(res.exit_code, 0, res.output)
+        self.assertTrue(login.call_args.kwargs['skip'])
+
+    def test_the_flag_never_skips_the_expiry_check(self) -> None:
+        # The flag exists for an ambiguous signal; an expired token is
+        # not ambiguous.
+        cfg_path = self.root / 'pipeline.yaml'
+        cfg_path.write_text(_CODEX_ONLY, encoding='utf-8')
+        expired = R.codex.CodexAuthError('the token expired')
+        with mock.patch.object(R, 'preflight_sbx'), \
+                mock.patch.object(R, 'preflight_disk'), \
+                mock.patch.object(R.codex, 'preflight', side_effect=expired), \
+                mock.patch.object(R, '_drive') as drive:
+            res = CliRunner().invoke(
+                R.main,
+                [
+                    '-c', str(cfg_path),
+                    '--canonical-root', str(self.root / 'c'),
+                    '--worktree-root', str(self.root / 'w'),
+                    '--skip-agy-check',
+                    R.codex.SKIP_LOGIN_CHECK_FLAG,
+                ],
+            )
+        self.assertEqual(res.exit_code, 1, res.output)
+        self.assertIn('the token expired', res.output)
+        drive.assert_not_called()
+
+    def test_the_cli_checks_before_any_vm(self) -> None:
+        cfg_path = self.root / 'pipeline.yaml'
+        cfg_path.write_text(_CODEX_ONLY, encoding='utf-8')
+        self.probe_login.side_effect = R.codex.CodexLoginRejected('nope')
+        with mock.patch.object(R, 'preflight_sbx'), \
+                mock.patch.object(R, 'preflight_disk'), \
+                mock.patch.object(R, 'preflight_codex_auth'), \
+                mock.patch.object(R, '_drive') as drive:
+            res = CliRunner().invoke(
+                R.main,
+                [
+                    '-c', str(cfg_path),
+                    '--canonical-root', str(self.root / 'c'),
+                    '--worktree-root', str(self.root / 'w'),
+                    '--skip-agy-check',
+                ],
+            )
+        self.assertEqual(res.exit_code, 1, res.output)
+        drive.assert_not_called()
 
 
 if __name__ == '__main__':
