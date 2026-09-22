@@ -682,27 +682,42 @@ def _default_stages(
     return tuple(stages)
 
 
-def _validate(config: PipelineConfig) -> None:  # noqa: C901
+def _validate(config: PipelineConfig) -> None:
     """
     Cross-check stage references against declared agents + stage ids.
 
+    Each check is its own function, run in this order, so the first
+    problem reported is the same one it always was.
+
     :param config: The assembled config.
-    :raises PipelineError: On an unknown agent/stage reference or a
-        duplicate stage id.
+    :raises PipelineError: On an unknown agent/stage reference, a
+        duplicate stage id, or an agent its harness cannot run.
+    """
+    seen_ids = _validate_stage_ids(config)
+    _validate_stage_refs(config, seen_ids)
+    _validate_model_families(config)
+    _validate_codex_efforts(config)
+    _validate_launch_sizes(config)
+
+
+def _validate_stage_ids(config: PipelineConfig) -> set[str]:
+    """
+    Check stage ids are unique and every stage runs a declared agent.
+
+    :param config: The assembled config.
+    :returns: Every stage id, including ``parallel:`` sub-stages.
+    :raises PipelineError: On a duplicate id or an unknown agent.
     """
     seen_ids: set[str] = set()
 
     def check_stage(stage: PipelineStage) -> None:
         for sub in stage.parallel:
             check_stage(sub)
-        if stage.parallel:
-            if stage.id in seen_ids:
-                raise PipelineError(f'duplicate stage id {stage.id!r}')
-            seen_ids.add(stage.id)
-            return
         if stage.id in seen_ids:
             raise PipelineError(f'duplicate stage id {stage.id!r}')
         seen_ids.add(stage.id)
+        if stage.parallel:
+            return
         for agent in stage.run:
             if agent not in config.agents:
                 raise PipelineError(
@@ -711,7 +726,19 @@ def _validate(config: PipelineConfig) -> None:  # noqa: C901
 
     for stage in config.stages:
         check_stage(stage)
-    # needs / on_block / from resolve to known stage ids.
+    return seen_ids
+
+
+def _validate_stage_refs(
+    config: PipelineConfig, seen_ids: set[str]
+) -> None:
+    """
+    Check every ``needs`` / ``on_block`` / ``from`` names a known stage.
+
+    :param config: The assembled config.
+    :param seen_ids: Every stage id, from :func:`_validate_stage_ids`.
+    :raises PipelineError: On a reference to an unknown stage.
+    """
     for stage in _iter_stages(config.stages):
         for ref, what in (
             *[(n, 'needs') for n in stage.needs],
@@ -723,28 +750,46 @@ def _validate(config: PipelineConfig) -> None:  # noqa: C901
                     f'stage {stage.id!r} {what} references unknown '
                     f'stage {ref!r}'
                 )
-    # A pinned model must belong to a family its harness can actually
-    # run. Omnigent enforces this at session CREATE — the same
-    # `model_family_mismatch` is its own dispatch guard — which on
-    # a full cadre can be stage 6 of 8, ten microVMs into a run.
-    # Checking it here turns that into a parse error naming the
-    # offending agent, before anything is provisioned. Same reason
-    # as the duplicate-key and inert-provider work: a config that
-    # parses clean and dies later is the expensive kind of wrong.
-    #
-    # Agents with no `model:` are skipped — they run the bundle's own
-    # default, so there is nothing to check.
+
+
+def _validate_model_families(config: PipelineConfig) -> None:
+    """
+    Refuse a pinned model its harness cannot run.
+
+    Omnigent enforces this at session CREATE — the same
+    `model_family_mismatch` is its own dispatch guard — which on a full
+    cadre can be stage 6 of 8, ten microVMs into a run. Checking it here
+    turns that into a parse error naming the offending agent, before
+    anything is provisioned. Same reason as the duplicate-key and
+    inert-provider work: a config that parses clean and dies later is
+    the expensive kind of wrong.
+
+    Agents with no ``model:`` are skipped: they run the bundle's own
+    default, so there is nothing to check.
+
+    :param config: The assembled config.
+    :raises PipelineError: Naming the agent and the reason.
+    """
     for agent_name, agent in config.agents.items():
         if not agent.model:
             continue
         reason = model_family_mismatch(agent.harness, agent.model)
         if reason is not None:
             raise PipelineError(f'agent {agent_name!r}: {reason}')
-    # A codex effort off the ladder is LEFT OUT of the launch args
-    # (it is interpolated into a `-c` config expression, so the gate is
-    # a closed allowlist), and the turn then runs at codex's default.
-    # The only sign was a read-back warning after the first turn (#53),
-    # so refuse it here instead of dropping it there.
+
+
+def _validate_codex_efforts(config: PipelineConfig) -> None:
+    """
+    Refuse a codex effort the launch args would leave out.
+
+    It is interpolated into a ``-c`` config expression, so the gate is a
+    closed allowlist, and an effort off it made the turn run at codex's
+    default. The only sign was a read-back warning after the first turn
+    (#53), so it is refused here instead of dropped there.
+
+    :param config: The assembled config.
+    :raises PipelineError: Naming the agent, its effort and the ladder.
+    """
     for agent_name, agent in config.agents.items():
         if (
             agent.effort is None
@@ -757,7 +802,6 @@ def _validate(config: PipelineConfig) -> None:  # noqa: C901
             f'codex is launched with ({", ".join(sorted(CODEX_EFFORTS))}); '
             "the turn would silently run at codex's default effort"
         )
-    _validate_launch_sizes(config)
 
 
 def _validate_launch_sizes(config: PipelineConfig) -> None:

@@ -16,6 +16,7 @@ provisioning to a single ``sbx create`` call.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import shlex
@@ -24,7 +25,6 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Mapping
 from typing import TYPE_CHECKING, ClassVar
 from urllib.parse import urlparse
 
@@ -43,10 +43,8 @@ from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 from sbx_omnigent import agy, claude, codex
 from sbx_omnigent import swarm as swarm_mod
-from sbx_omnigent._compat import (
-    base_start_host_takes_repos,
-    repo_workspace,
-)
+from sbx_omnigent._compat import repo_workspace
+from sbx_omnigent.defaults import DEFAULT_HOST_IMAGE
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -62,11 +60,7 @@ _logger = logging.getLogger(__name__)
 #: why a host never came online.
 _KEEP_SANDBOXES_ENV = 'SBX_KEEP_SANDBOXES'
 
-#: Prebaked Omnigent host image (multi-arch: linux/amd64 +
-#: linux/arm64, so it runs natively on Apple Silicon). Pin to
-#: ``:vX.Y.Z`` or ``:sha-<short>`` in config to match your server
-#: version and avoid host<->server protocol skew.
-DEFAULT_HOST_IMAGE = 'ghcr.io/omnigent-ai/omnigent-host:latest'
+
 
 #: Workspace-string sentinel marking a bind-mount directive. A
 #: managed session whose ``workspace`` is
@@ -144,69 +138,6 @@ _LAST_CREATE_DONE = [0.0]
 #: does not.
 DEFAULT_PROVISION_STAGGER_S = 2.0
 
-#: Curated per-VM network allowlist applied to managed VMs when
-#: ``sbx.egress_allow`` is unset — the "reasonable baseline" so agents
-#: work out of the box: the LLM endpoints the coding harness needs plus
-#: common trusted package registries. A config list REPLACES this with
-#: a stricter/custom set. The Omnigent dial-back is added automatically
-#: on top (see :meth:`SbxLauncher._apply_egress`), so it is not listed.
-DEFAULT_EGRESS_ALLOW: tuple[str, ...] = (
-    # Claude coding harness (claude-native).
-    'api.anthropic.com',
-    'statsig.anthropic.com',
-    'downloads.claude.ai',
-    # Trusted package registries (coder builds / dependency installs).
-    'registry.npmjs.org',
-    'npmjs.org',
-    'pypi.org',
-    'files.pythonhosted.org',
-    # uv, which every Python project here installs in its verify
-    # setup. sbx's own default-package-managers bundle allows
-    # `astral.sh:443` with no wildcard, but the installer 301s to
-    # `releases.astral.sh` — so
-    # `curl -LsSf https://astral.sh/uv/install.sh` yields a 125-byte
-    # 403 page rather than a script, and uv never installs. Observed
-    # live as a verify gate that could not run at all, which fails a
-    # whole chunk as INFRASTRUCTURE after every review has already
-    # passed.
-    '**.astral.sh',
-    # OSV, which `uv audit` / `cargo audit` query for advisories.
-    # Without it the audit resolves the lockfile, fails the lookup
-    # with a 403, and reports that it could not verify — which a
-    # reviewer then files as a finding. Fifteen issues in one m0
-    # campaign said exactly that.
-    'api.osv.dev',
-    # Debian apt, on PORT 80. sbx's own default-os-packages bundle
-    # allows **.debian.org:443 but — unlike its Ubuntu entries, which
-    # list :80 explicitly — never :80, and the host image's sources are
-    # http://deb.debian.org. Without this every apt call is denied, so
-    # an agent cannot install a toolchain: observed live as a reviewer
-    # burning its whole turn hunting for a cargo that could never be
-    # installed, then returning no VERDICT. Port 80 is safe here —
-    # packages are GPG-signed, so only which packages are fetched is
-    # disclosed, not their integrity.
-    'deb.debian.org:80',
-)
-
-#: The :data:`DEFAULT_EGRESS_ALLOW` entries that exist only to cover
-#: gaps in sbx's own shipped bundles, each with the failure it
-#: prevents. An explicit ``sbx.egress_allow`` replaces the default, so
-#: a custom list loses these without a word; server startup names any
-#: it omits (#40).
-SBX_BUNDLE_GAP_HOSTS: Mapping[str, str] = {
-    '**.astral.sh': (
-        "uv's installer redirects to releases.astral.sh, so without it "
-        'uv never installs and a verify gate that needs uv cannot run'
-    ),
-    'api.osv.dev': (
-        'uv audit and cargo audit cannot reach their advisory database, '
-        'and reviewers report that they could not verify'
-    ),
-    'deb.debian.org:80': (
-        "every apt call is denied (the image's apt sources are plain "
-        'http), so an agent cannot install a toolchain'
-    ),
-}
 
 
 def _normalize_repo_request(
@@ -259,6 +190,26 @@ def _normalize_repo_request(
     return repo_url, repo_branch, repo_name
 
 
+def base_start_host_takes_repos() -> bool:
+    """
+    Whether the installed ``start_host`` takes ``repos=``.
+
+    Omnigent replaced ``start_host``'s ``repo_url``/``repo_branch``/
+    ``repo_name`` keywords with a single ``repos`` sequence, so a
+    subclass that delegates upward must send the shape the INSTALLED
+    base declares. Read off the signature rather than guessed from a
+    version string: the signature is the thing that actually has to
+    match, and probing it costs one introspection per VM launch.
+
+    :returns: ``True`` for the multi-repo signature, ``False`` for
+        the legacy per-field one.
+    """
+    parameters = inspect.signature(
+        ExecModelHostLauncher.start_host
+    ).parameters
+    return 'repos' in parameters
+
+
 def _base_repo_kwargs(
     repos: Sequence[RepoWorkspaceLike],
     repo_url: str | None,
@@ -272,7 +223,7 @@ def _base_repo_kwargs(
     bootstrap, so it must pass the shape that Omnigent's
     ``start_host`` actually declares — which differs across the
     multi-repo change. Probed, not assumed: see
-    :func:`~sbx_omnigent._compat.base_start_host_takes_repos`.
+    :func:`base_start_host_takes_repos`.
 
     :param repos: The sequence as received, empty when the caller
         used the legacy keywords.
@@ -627,7 +578,7 @@ class SbxLauncher(ExecModelHostLauncher):
                 server_url=server_url,
                 host_config=host_config,
                 on_stage=on_stage,
-                **_base_repo_kwargs(  # type: ignore[arg-type]
+                **_base_repo_kwargs(
                     repos, repo_url, repo_branch, repo_name
                 ),
             )

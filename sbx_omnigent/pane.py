@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Callable
 
 #: Emitted by the in-VM script when no native terminal directory exists
 #: — an SDK harness, or a VM whose terminal never launched. Not an
@@ -190,7 +191,7 @@ def capture_pane(
     *,
     lines: int = DEFAULT_SCROLLBACK_LINES,
     timeout_s: float = DEFAULT_TIMEOUT_S,
-    run: object = subprocess.run,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> str | None:
     """
     Capture *sandbox*'s TUI pane, or ``None`` when there is nothing.
@@ -209,7 +210,7 @@ def capture_pane(
         ``None`` when there is no pane to show.
     """
     try:
-        proc = run(  # type: ignore[operator]
+        proc = run(
             capture_command(sandbox, lines=lines),
             capture_output=True,
             text=True,

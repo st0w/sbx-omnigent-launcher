@@ -31,6 +31,7 @@ from typing import Any
 
 import omnigent.server.managed_hosts as managed_hosts
 from omnigent.cli import cli
+from omnigent.onboarding.provider_config import load_providers
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
@@ -39,13 +40,12 @@ from omnigent.server.managed_hosts import (
 
 from sbx_omnigent import pipeline
 from sbx_omnigent._compat import load_agy_bridge
-from sbx_omnigent.launcher import (
+from sbx_omnigent.defaults import (
     DEFAULT_EGRESS_ALLOW,
     DEFAULT_HOST_IMAGE,
-    DEFAULT_PROVISION_STAGGER_S,
     SBX_BUNDLE_GAP_HOSTS,
-    SbxLauncher,
 )
+from sbx_omnigent.launcher import DEFAULT_PROVISION_STAGGER_S, SbxLauncher
 
 #: sbx sandboxes persist (create/stop with no platform lifetime cap),
 #: so keep the launch token comfortably long-lived; it must outlive
@@ -194,12 +194,6 @@ def warn_on_inert_providers(host_config: dict[str, object] | None) -> None:
         host_config.get('providers'), dict
     ):
         return
-    # Lazy, like upstream's `_parse_host_config`, which has already
-    # validated this block with the same loader.
-    from omnigent.onboarding.provider_config import (  # noqa: PLC0415
-        load_providers,
-    )
-
     inert = sorted(
         provider.name
         for provider in load_providers(host_config).values()
@@ -495,24 +489,46 @@ def install_sbx_provider() -> None:
         managed_hosts.parse_sandbox_config
     )
     # Guard against double-wrapping if called more than once.
-    if getattr(original, '_sbx_wrapped', False):
+    if isinstance(original, _SbxParseSandboxConfig):
         return
+    managed_hosts.parse_sandbox_config = _SbxParseSandboxConfig(original)
 
-    def patched(raw: object) -> ManagedSandboxDeployment | None:
-        # `parse_sandbox_config` returns a DEPLOYMENT, not a single
-        # config. Upstream split the two so a server can offer
-        # several providers side by side: `ManagedSandboxConfig` is
-        # now one provider's entry, and `ManagedSandboxDeployment` is
-        # the collection the server calls `.recorded(...)` /
-        # `.for_provider(...)` on. Returning the bare entry here
-        # raised `'ManagedSandboxConfig' object has no attribute
-        # 'recorded'` on every session read.
+
+class _SbxParseSandboxConfig:
+    """
+    ``parse_sandbox_config`` with the ``sbx`` provider added.
+
+    A class rather than a closure so :func:`install_sbx_provider` can
+    recognise its own wrapper and install it once.
+
+    :param original: The parser being wrapped, which handles every
+        provider other than ``sbx``.
+    """
+
+    def __init__(
+        self, original: Callable[[object], ManagedSandboxDeployment | None]
+    ) -> None:
+        self._original = original
+
+    def __call__(self, raw: object) -> ManagedSandboxDeployment | None:
+        """
+        Parse one ``sandbox:`` block.
+
+        ``parse_sandbox_config`` returns a DEPLOYMENT, not a single
+        config. Upstream split the two so a server can offer several
+        providers side by side: ``ManagedSandboxConfig`` is one
+        provider's entry, and ``ManagedSandboxDeployment`` is the
+        collection the server calls ``.recorded(...)`` /
+        ``.for_provider(...)`` on. Returning the bare entry raised
+        ``'ManagedSandboxConfig' object has no attribute 'recorded'``
+        on every session read.
+
+        :param raw: The raw ``sandbox:`` mapping.
+        :returns: The deployment, or what the original parser returns.
+        """
         if isinstance(raw, dict) and raw.get('provider') == 'sbx':
             return ManagedSandboxDeployment.single(_build_sbx_config(raw))
-        return original(raw)
-
-    patched._sbx_wrapped = True  # type: ignore[attr-defined]
-    managed_hosts.parse_sandbox_config = patched
+        return self._original(raw)
 
 
 def _bundled_agent_dirs() -> list[str]:

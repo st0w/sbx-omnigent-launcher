@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 #: Override for the snapshotter store, for a layout neither candidate
@@ -103,7 +104,8 @@ def layer_bytes(root: Path | None = None) -> tuple[int, int]:
 
 
 def live_sandboxes(
-    run: object = subprocess.run, timeout_s: float = 20.0
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    timeout_s: float = 20.0,
 ) -> int | None:
     """
     How many sandboxes sbx currently lists, or ``None``.
@@ -115,7 +117,7 @@ def live_sandboxes(
         look orphaned.
     """
     try:
-        proc = run(  # type: ignore[operator]
+        proc = run(
             ['sbx', 'ls'],
             capture_output=True,
             text=True,
@@ -134,7 +136,8 @@ def live_sandboxes(
 
 
 def orphan_advice(
-    root: Path | None = None, run: object = subprocess.run
+    root: Path | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> str | None:
     """
     One sentence naming leaked guest disks, or ``None``.

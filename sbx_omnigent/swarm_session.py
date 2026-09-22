@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
@@ -435,7 +436,7 @@ def _approved_plan_text(
     return None
 
 
-def _stream_event_from_payload(  # noqa: C901
+def _stream_event_from_payload(
     payload: dict[str, object], delta_buf: list[str]
 ) -> _StreamEvent | None:
     """
@@ -460,35 +461,104 @@ def _stream_event_from_payload(  # noqa: C901
         # response_id on the terminal idle instead.
         return _StreamEvent('completed')
     if kind == 'session.status':
-        status = payload.get('status')
-        error = payload.get('error')
-        rid = payload.get('response_id')
-        return _StreamEvent(
-            'status',
-            status=status if isinstance(status, str) else None,
-            error=error if isinstance(error, str) else None,
-            response_id=rid if isinstance(rid, str) else None,
-        )
+        return _status_event(payload)
     if kind == 'response.output_text.delta':
-        delta = payload.get('delta')
-        if isinstance(delta, str):
-            delta_buf.append(delta)
-        if payload.get('final'):
-            text = ''.join(delta_buf)
-            delta_buf.clear()
-            if text:
-                return _StreamEvent('reply', reply=text)
-        return None
+        return _delta_event(payload, delta_buf)
     if kind == 'response.output_item.done':
-        item = payload.get('item')
-        if not isinstance(item, dict):
-            return None
-        is_msg = item.get('type') == 'message'
-        is_assistant = item.get('role') == 'assistant'
-        if is_msg and is_assistant:
-            text = _item_message_text(item)
-            if text:
-                return _StreamEvent('reply', reply=text)
+        return _item_done_event(payload)
+    return None
+
+
+def _status_event(payload: dict[str, object]) -> _StreamEvent:
+    """
+    A ``status`` event from a ``session.status`` payload.
+
+    :param payload: The decoded frame.
+    :returns: The event; a field of the wrong type becomes ``None``.
+    """
+    status = payload.get('status')
+    error = payload.get('error')
+    rid = payload.get('response_id')
+    return _StreamEvent(
+        'status',
+        status=status if isinstance(status, str) else None,
+        error=error if isinstance(error, str) else None,
+        response_id=rid if isinstance(rid, str) else None,
+    )
+
+
+def _delta_event(
+    payload: dict[str, object], delta_buf: list[str]
+) -> _StreamEvent | None:
+    """
+    Buffer a streamed text chunk; emit the reply on the final one.
+
+    :param payload: The decoded ``response.output_text.delta`` frame.
+    :param delta_buf: Mutable accumulator for streamed text deltas.
+    :returns: A ``reply`` event on the final chunk, else ``None``.
+    """
+    delta = payload.get('delta')
+    if isinstance(delta, str):
+        delta_buf.append(delta)
+    if not payload.get('final'):
+        return None
+    text = ''.join(delta_buf)
+    delta_buf.clear()
+    return _StreamEvent('reply', reply=text) if text else None
+
+
+def _item_done_event(payload: dict[str, object]) -> _StreamEvent | None:
+    """
+    A ``reply`` event from a finished assistant message item.
+
+    :param payload: The decoded ``response.output_item.done`` frame.
+    :returns: The event, or ``None`` for any other item or no text.
+    """
+    item = payload.get('item')
+    if not isinstance(item, dict):
+        return None
+    if item.get('type') != 'message' or item.get('role') != 'assistant':
+        return None
+    text = _item_message_text(item)
+    return _StreamEvent('reply', reply=text) if text else None
+
+
+def _on_idle_edge(
+    wait_state: _TurnWait,
+    event: _StreamEvent,
+    now: float,
+    idle_reply_grace: float,
+) -> _TurnOutcome | None:
+    """
+    Decide whether an ``idle`` edge ends the turn.
+
+    :param wait_state: The turn so far.
+    :param event: The idle status event.
+    :param now: When this wait began.
+    :param idle_reply_grace: Max seconds to await a lagging reply.
+    :returns: The outcome, or ``None`` when the idle is not terminal.
+    """
+    if event.response_id:
+        # Claude's REAL terminal idle carries an id.
+        return SwarmTurnResult(_STATUS_IDLE, None, wait_state.reply), True
+    if wait_state.saw_response_id:
+        # A Claude turn's id-less idle is a premature settle or a
+        # mid-turn quiescence lull (the item stream went briefly quiet
+        # in a tool round) — NOT terminal. Skip, or an intermediate
+        # message gets captured as this turn's reply. The id-bearing
+        # idle that ends the turn CAN go missing, but that is covered by
+        # the silence watchdog rather than armed here: this idle is
+        # itself a frame, so the watchdog is already counting from it.
+        return None
+    if wait_state.reply:
+        # No response_id this turn (agy): the reply is in and this
+        # id-less idle is terminal.
+        return SwarmTurnResult(_STATUS_IDLE, None, wait_state.reply), True
+    if wait_state.saw_completed:
+        # agy's terminal idle before its lagging reply — wait briefly
+        # for the mirrored reply.
+        wait_state.grace_deadline = now + idle_reply_grace
+    # else: a premature pre-work idle, skipped.
     return None
 
 
@@ -607,8 +677,61 @@ class Transport(Protocol):
         ...
 
 
+#: The only URL schemes the transport opens. Every URL here is the
+#: configured server plus an API path, so anything else is refused with
+#: a message naming the server setting.
+_HTTP_SCHEMES = frozenset({'http', 'https'})
+
+
+def _http_only_opener() -> urllib.request.OpenerDirector:
+    """
+    A urllib opener that can open http and https URLs and nothing else.
+
+    ``urllib.request.urlopen`` uses the default handler set, which also
+    opens ``file://``, ``ftp://`` and ``data:`` URLs, so a URL built
+    from configuration could read a local file. This is that default
+    set without :class:`~urllib.request.FTPHandler`,
+    :class:`~urllib.request.FileHandler` and
+    :class:`~urllib.request.DataHandler`: any other scheme reaches
+    :class:`~urllib.request.UnknownHandler` and is refused. Proxies,
+    redirects and HTTP error responses behave as they did.
+
+    :returns: The opener.
+    """
+    opener = urllib.request.OpenerDirector()
+    for handler in (
+        urllib.request.ProxyHandler(),
+        urllib.request.UnknownHandler(),
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPSHandler(),
+        urllib.request.HTTPDefaultErrorHandler(),
+        urllib.request.HTTPRedirectHandler(),
+        urllib.request.HTTPErrorProcessor(),
+    ):
+        opener.add_handler(handler)
+    return opener
+
+
+def _require_http_url(url: str) -> None:
+    """
+    Refuse a URL urllib would open as anything but HTTP.
+
+    :param url: The URL about to be opened.
+    :raises SwarmSessionError: If its scheme is not http or https.
+    """
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme not in _HTTP_SCHEMES:
+        raise SwarmSessionError(
+            f'refusing to open {url!r}: the Omnigent server URL must be '
+            f'http:// or https://'
+        )
+
+
 class UrllibTransport:
     """Default :class:`Transport` over the standard library."""
+
+    def __init__(self) -> None:
+        self._opener = _http_only_opener()
 
     def request(
         self,
@@ -630,14 +753,15 @@ class UrllibTransport:
         :returns: ``(status_code, response_body)``; HTTP error
             responses are returned (not raised) so callers can inspect
             the status.
-        :raises SwarmSessionError: On a transport-level failure (no
-            HTTP response at all).
+        :raises SwarmSessionError: On a non-HTTP URL, or a
+            transport-level failure (no HTTP response at all).
         """
+        _require_http_url(url)
         req = urllib.request.Request(
             url, data=body, headers=headers, method=method
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with self._opener.open(req, timeout=timeout) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
@@ -655,11 +779,13 @@ class UrllibTransport:
         :param read_timeout: Per-read socket timeout; must exceed the
             server heartbeat cadence.
         :returns: Iterator of decoded (utf-8, replace) lines.
-        :raises SwarmSessionError: If the stream cannot be opened.
+        :raises SwarmSessionError: On a non-HTTP URL, or if the stream
+            cannot be opened.
         """
+        _require_http_url(url)
         req = urllib.request.Request(url, headers=headers, method='GET')
         try:
-            resp = urllib.request.urlopen(req, timeout=read_timeout)
+            resp = self._opener.open(req, timeout=read_timeout)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise SwarmSessionError(
                 f'could not open stream {url}: {exc}'
@@ -667,6 +793,76 @@ class UrllibTransport:
         with resp:
             for raw in resp:
                 yield raw.decode('utf-8', errors='replace')
+
+
+#: A finished wait: the turn's result, and whether it ever started.
+_TurnOutcome = tuple['SwarmTurnResult', bool]
+
+
+@dataclass
+class _TurnWait:
+    """
+    What :meth:`SwarmSessionClient._await_terminal` knows mid-turn.
+
+    :param reply: The assistant reply captured so far.
+    :param saw_completed: A ``response.completed`` frame arrived.
+    :param saw_response_id: A status edge carried a ``response_id``,
+        which only Claude sends, so this is a Claude turn.
+    :param grace_deadline: When a terminal idle was seen before its
+        reply, how long to wait for that reply; ``None`` otherwise.
+    :param turn_started: The turn produced real output or a terminal
+        signal (see :meth:`SwarmSessionClient._await_terminal`).
+    :param last_frame_at: When the last real frame arrived. Reset ONLY
+        by a frame, never by a confirmation poll, so it measures true
+        silence, which is what the abandoned verdict is timed against.
+    :param next_confirm_at: When to next poll the item store. Paced
+        separately so repeated polls cannot keep pushing the silence
+        clock forward.
+    :param stall_deadline: When pre-start silence ends the wait as an
+        un-started failure; ``None`` when that watchdog is off.
+    :param approvals: Permission prompts auto-approved this turn.
+    """
+
+    last_frame_at: float
+    next_confirm_at: float
+    stall_deadline: float | None
+    reply: str = ''
+    saw_completed: bool = False
+    saw_response_id: bool = False
+    grace_deadline: float | None = None
+    turn_started: bool = False
+    approvals: int = 0
+
+    @property
+    def watch_stall(self) -> bool:
+        """Whether the pre-start stall watchdog is armed."""
+        return self.stall_deadline is not None and not self.turn_started
+
+    @property
+    def watch_silence(self) -> bool:
+        """
+        Whether the mid-turn silence watchdog is armed.
+
+        Suspended while a grace wait is pending: that path is short and
+        self-bounding, and letting this shorten its wait would return
+        before the grace had actually elapsed.
+        """
+        return self.turn_started and self.grace_deadline is None
+
+    def frame_arrived(self, stall_grace_s: float | None) -> None:
+        """
+        Restart the silence clocks: a frame is activity.
+
+        The stall watchdog measures silence since the LAST frame, not
+        time since the post; otherwise a cold TUI's early chatter burns
+        the whole grace before the turn could start.
+
+        :param stall_grace_s: The stall watchdog's window, or ``None``.
+        """
+        self.last_frame_at = time.monotonic()
+        self.next_confirm_at = self.last_frame_at + _IDLE_CONFIRM_S
+        if stall_grace_s is not None and not self.turn_started:
+            self.stall_deadline = time.monotonic() + stall_grace_s
 
 
 @dataclass(frozen=True)
@@ -1608,7 +1804,7 @@ class SwarmSessionClient:
         if event is not None:
             events.put(event)
 
-    def _await_terminal(  # noqa: C901
+    def _await_terminal(
         self,
         session_id: str,
         events: queue.Queue[_StreamEvent],
@@ -1616,7 +1812,7 @@ class SwarmSessionClient:
         idle_reply_grace: float = _IDLE_REPLY_GRACE_S,
         *,
         stall_grace_s: float | None = None,
-    ) -> tuple[SwarmTurnResult, bool]:
+    ) -> _TurnOutcome:
         """
         Consume events until the turn's terminal edge (or timeout).
 
@@ -1660,24 +1856,14 @@ class SwarmSessionClient:
             before the turn reaches a terminal status.
         """
         deadline = time.monotonic() + timeout
-        reply = ''
-        saw_completed = False
-        saw_response_id = False
-        grace_deadline: float | None = None
-        turn_started = False
-        #: When the last real frame arrived. Reset ONLY by a frame,
-        #: never by a confirmation poll, so it measures true silence —
-        #: which is what the abandoned verdict is timed against.
-        last_frame_at = time.monotonic()
-        #: When to next poll the item store. Paced separately so
-        #: repeated polls cannot keep pushing the silence clock forward.
-        next_confirm_at = last_frame_at + _IDLE_CONFIRM_S
-        stall_deadline = (
-            last_frame_at + stall_grace_s
-            if stall_grace_s is not None
-            else None
+        start = time.monotonic()
+        wait_state = _TurnWait(
+            last_frame_at=start,
+            next_confirm_at=start + _IDLE_CONFIRM_S,
+            stall_deadline=(
+                start + stall_grace_s if stall_grace_s is not None else None
+            ),
         )
-        approvals = 0
         while True:
             now = time.monotonic()
             if now >= deadline:
@@ -1685,191 +1871,258 @@ class SwarmSessionClient:
                     f'turn on {session_id} did not complete within '
                     f'{timeout:.0f}s'
                 )
-            watch_stall = stall_deadline is not None and not turn_started
-            # Suspended while a grace wait is pending: that path is
-            # short and self-bounding, and letting this shorten its wait
-            # would return before the grace had actually elapsed.
-            watch_silence = turn_started and grace_deadline is None
-            wait = deadline - now
-            if grace_deadline is not None:
-                wait = min(wait, max(0.0, grace_deadline - now))
-            if watch_silence:
-                wait = min(wait, max(0.0, next_confirm_at - now))
-            if watch_stall:
-                wait = min(wait, max(0.0, stall_deadline - now))
             try:
-                event = events.get(timeout=wait)
-                last_frame_at = time.monotonic()
-                next_confirm_at = last_frame_at + _IDLE_CONFIRM_S
-                if stall_grace_s is not None and not turn_started:
-                    # Any frame is activity: the watchdog measures
-                    # silence since the LAST one, not elapsed time since
-                    # the post. Otherwise a cold TUI's early chatter
-                    # burns the whole grace before the turn could start.
-                    stall_deadline = time.monotonic() + stall_grace_s
-            except queue.Empty:
-                if grace_deadline is not None:
-                    # Terminal idle already seen; the reply never caught
-                    # up within the grace — return with what we have.
-                    return SwarmTurnResult(_STATUS_IDLE, None, reply), True
-                if watch_silence and time.monotonic() >= next_confirm_at:
-                    silent = time.monotonic() - last_frame_at
-                    state, settled = self._classify_settled(session_id)
-                    if state == 'finished' and settled:
-                        return (
-                            SwarmTurnResult(
-                                _STATUS_IDLE, None, settled or reply
-                            ),
-                            True,
-                        )
-                    if state == 'asking':
-                        # No margin needed: an open prompt is not a slow
-                        # turn, it is a stopped one. What CAN move it is
-                        # a verdict, which this sends before treating it
-                        # as fatal — the microVM is the containment
-                        # boundary, so the prompt is pure latency.
-                        if (
-                            self._auto_approve
-                            and approvals < _MAX_AUTO_APPROVALS_PER_TURN
-                            and (answered := self._approve_pending(
-                                session_id
-                            ))
-                        ):
-                            approvals += answered
-                            # The turn is moving again, so restart the
-                            # silence clock: leaving it stale would have
-                            # the very next poll re-classify a session
-                            # that has only just been unblocked.
-                            last_frame_at = time.monotonic()
-                            next_confirm_at = (
-                                last_frame_at + _IDLE_CONFIRM_S
-                            )
-                            continue
-                        capped = (
-                            self._auto_approve
-                            and approvals >= _MAX_AUTO_APPROVALS_PER_TURN
-                        )
-                        error = (
-                            f'{_ASKING_LOOP_ERROR} '
-                            f'({_MAX_AUTO_APPROVALS_PER_TURN}). It asked'
-                            if capped
-                            else _ASKING_TURN_ERROR
-                        )
-                        return (
-                            SwarmTurnResult(
-                                _STATUS_FAILED,
-                                f'{error}: {settled}',
-                                reply,
-                            ),
-                            True,
-                        )
-                    if (
-                        state == 'abandoned'
-                        and silent >= _ABANDON_CONFIRM_S
-                    ):
-                        # The tool result was delivered and the model
-                        # never continued. Waiting out the turn budget
-                        # discovers exactly this, hours later.
-                        return (
-                            SwarmTurnResult(
-                                _STATUS_FAILED,
-                                _ABANDONED_TURN_ERROR,
-                                reply,
-                            ),
-                            True,
-                        )
-                    # Still working (or not silent long enough to
-                    # call it dead): pace the next poll WITHOUT
-                    # touching last_frame_at, or the silence clock
-                    # never advances.
-                    next_confirm_at = time.monotonic() + _IDLE_CONFIRM_S
-                    continue
-                if watch_stall and time.monotonic() >= stall_deadline:
-                    # Silent past the stall grace before any turn-start:
-                    # the paste was dropped into a cold TUI. Surface an
-                    # un-started failure so the caller can re-deliver.
-                    return (
-                        SwarmTurnResult(_STATUS_FAILED, None, reply),
-                        False,
-                    )
-                raise SwarmSessionError(
-                    f'turn on {session_id} did not complete within '
-                    f'{timeout:.0f}s'
-                ) from None
-            if event.kind == 'completed':
-                saw_completed = True
-                turn_started = True
-            elif event.kind == 'reply':
-                if event.reply:
-                    # Only real TEXT counts as a start. An EMPTY delta
-                    # does NOT: agy emits one as its cold-start cascade
-                    # rotates away, and treating that as a start disarms
-                    # the stall watchdog below — the turn then blocks to
-                    # the full timeout on a conversation the agent has
-                    # already abandoned.
-                    turn_started = True
-                    reply = event.reply
-                if grace_deadline is not None:
-                    # The lagging reply after a terminal idle arrived.
-                    return SwarmTurnResult(_STATUS_IDLE, None, reply), True
-            elif event.kind == 'status':
-                if event.status == _STATUS_FAILED:
-                    return (
-                        SwarmTurnResult(_STATUS_FAILED, event.error, reply),
-                        turn_started,
-                    )
-                if event.response_id:
-                    # Claude tags its status edges with a response_id;
-                    # agy never does — so one marks a Claude turn.
-                    saw_response_id = True
-                # NB: a bare ``running`` edge does NOT count as started.
-                # The server marks a turn ``running`` the moment it is
-                # ACCEPTED — before a native TUI has actually submitted
-                # the paste — so a turn that fails with only a running
-                # edge (no reply/completed, no clean idle) is a dropped
-                # submit worth re-delivering. Only real output
-                # (reply/completed) or a terminal idle is a real start.
-                if event.status == _STATUS_IDLE:
-                    if event.response_id:
-                        # Claude's REAL terminal idle carries an id.
-                        return SwarmTurnResult(_STATUS_IDLE, None, reply), True
-                    if saw_response_id:
-                        # A Claude turn's id-less idle is a premature
-                        # settle or a mid-turn quiescence lull (the item
-                        # stream went briefly quiet in a tool round) —
-                        # NOT terminal. Skip, or an intermediate message
-                        # gets captured as this turn's reply. The
-                        # id-bearing idle that ends the turn CAN go
-                        # missing, but that is covered by the silence
-                        # watchdog above rather than armed here: this
-                        # idle is itself a frame, so the watchdog is
-                        # already counting from it.
-                        pass
-                    elif reply:
-                        # No response_id this turn (agy): the reply is
-                        # in and this id-less idle is terminal.
-                        return SwarmTurnResult(_STATUS_IDLE, None, reply), True
-                    elif saw_completed:
-                        # agy's terminal idle before its lagging reply —
-                        # wait briefly for the mirrored reply.
-                        grace_deadline = now + idle_reply_grace
-                    # else: premature pre-work idle → skip.
-                elif grace_deadline is not None:
-                    # A running edge after a provisionally-graced
-                    # id-less idle: the turn resumed, so that idle
-                    # wasn't terminal. Reopen and keep waiting.
-                    grace_deadline = None
-            else:
-                # done / closed / error: the stream ended. If we already
-                # saw this turn's terminal idle (grace pending), the end
-                # just means no lagging reply is coming — return it.
-                # Otherwise disambiguate with one snapshot poll.
-                if grace_deadline is not None:
-                    return SwarmTurnResult(_STATUS_IDLE, None, reply), True
-                return (
-                    self._resolve_on_stream_end(session_id, event, reply),
-                    turn_started,
+                event = events.get(
+                    timeout=self._turn_wait(wait_state, now, deadline)
                 )
+            except queue.Empty:
+                outcome = self._on_turn_silence(
+                    session_id, wait_state, timeout
+                )
+            else:
+                wait_state.frame_arrived(stall_grace_s)
+                outcome = self._on_turn_event(
+                    session_id, wait_state, event, now, idle_reply_grace
+                )
+            if outcome is not None:
+                return outcome
+
+    @staticmethod
+    def _turn_wait(
+        wait_state: _TurnWait, now: float, deadline: float
+    ) -> float:
+        """
+        How long to block for the next frame.
+
+        :param wait_state: The turn so far.
+        :param now: The current monotonic time.
+        :param deadline: When the whole turn times out.
+        :returns: Seconds, bounded by every armed clock.
+        """
+        wait = deadline - now
+        if wait_state.grace_deadline is not None:
+            wait = min(wait, max(0.0, wait_state.grace_deadline - now))
+        if wait_state.watch_silence:
+            wait = min(wait, max(0.0, wait_state.next_confirm_at - now))
+        if wait_state.watch_stall and wait_state.stall_deadline is not None:
+            wait = min(wait, max(0.0, wait_state.stall_deadline - now))
+        return wait
+
+    def _on_turn_silence(
+        self, session_id: str, wait_state: _TurnWait, timeout: float
+    ) -> _TurnOutcome | None:
+        """
+        No frame arrived within the wait: decide what the silence means.
+
+        :param session_id: The session driven.
+        :param wait_state: The turn so far.
+        :param timeout: The turn's budget, for the timeout message.
+        :returns: The outcome, or ``None`` to keep waiting.
+        :raises SwarmSessionError: When the turn budget ran out.
+        """
+        if wait_state.grace_deadline is not None:
+            # Terminal idle already seen; the reply never caught up
+            # within the grace — return with what we have.
+            return SwarmTurnResult(_STATUS_IDLE, None, wait_state.reply), True
+        if (
+            wait_state.watch_silence
+            and time.monotonic() >= wait_state.next_confirm_at
+        ):
+            return self._on_settled_check(session_id, wait_state)
+        if (
+            wait_state.watch_stall
+            and wait_state.stall_deadline is not None
+            and time.monotonic() >= wait_state.stall_deadline
+        ):
+            # Silent past the stall grace before any turn-start: the
+            # paste was dropped into a cold TUI. Surface an un-started
+            # failure so the caller can re-deliver.
+            return (
+                SwarmTurnResult(_STATUS_FAILED, None, wait_state.reply),
+                False,
+            )
+        raise SwarmSessionError(
+            f'turn on {session_id} did not complete within {timeout:.0f}s'
+        ) from None
+
+    def _on_settled_check(
+        self, session_id: str, wait_state: _TurnWait
+    ) -> _TurnOutcome | None:
+        """
+        Poll the item store after mid-turn silence.
+
+        :param session_id: The session driven.
+        :param wait_state: The turn so far.
+        :returns: The outcome, or ``None`` to keep waiting.
+        """
+        silent = time.monotonic() - wait_state.last_frame_at
+        state, settled = self._classify_settled(session_id)
+        if state == 'finished' and settled:
+            return (
+                SwarmTurnResult(
+                    _STATUS_IDLE, None, settled or wait_state.reply
+                ),
+                True,
+            )
+        if state == 'asking':
+            return self._on_asking(session_id, wait_state, settled)
+        if state == 'abandoned' and silent >= _ABANDON_CONFIRM_S:
+            # The tool result was delivered and the model never
+            # continued. Waiting out the turn budget discovers exactly
+            # this, hours later.
+            return (
+                SwarmTurnResult(
+                    _STATUS_FAILED, _ABANDONED_TURN_ERROR, wait_state.reply
+                ),
+                True,
+            )
+        # Still working (or not silent long enough to call it dead):
+        # pace the next poll WITHOUT touching last_frame_at, or the
+        # silence clock never advances.
+        wait_state.next_confirm_at = time.monotonic() + _IDLE_CONFIRM_S
+        return None
+
+    def _on_asking(
+        self, session_id: str, wait_state: _TurnWait, settled: str
+    ) -> _TurnOutcome | None:
+        """
+        The session is blocked on an open permission prompt.
+
+        No margin needed: an open prompt is not a slow turn, it is a
+        stopped one. What CAN move it is a verdict, which this sends
+        before treating it as fatal — the microVM is the containment
+        boundary, so the prompt is pure latency.
+
+        :param session_id: The session driven.
+        :param wait_state: The turn so far.
+        :param settled: The prompt text the item store holds.
+        :returns: ``None`` once a prompt was approved, else the failure.
+        """
+        if (
+            self._auto_approve
+            and wait_state.approvals < _MAX_AUTO_APPROVALS_PER_TURN
+            and (answered := self._approve_pending(session_id))
+        ):
+            wait_state.approvals += answered
+            # The turn is moving again, so restart the silence clock:
+            # leaving it stale would have the very next poll
+            # re-classify a session that has only just been unblocked.
+            wait_state.last_frame_at = time.monotonic()
+            wait_state.next_confirm_at = (
+                wait_state.last_frame_at + _IDLE_CONFIRM_S
+            )
+            return None
+        capped = (
+            self._auto_approve
+            and wait_state.approvals >= _MAX_AUTO_APPROVALS_PER_TURN
+        )
+        error = (
+            f'{_ASKING_LOOP_ERROR} ({_MAX_AUTO_APPROVALS_PER_TURN}). It asked'
+            if capped
+            else _ASKING_TURN_ERROR
+        )
+        return (
+            SwarmTurnResult(
+                _STATUS_FAILED, f'{error}: {settled}', wait_state.reply
+            ),
+            True,
+        )
+
+    def _on_turn_event(
+        self,
+        session_id: str,
+        wait_state: _TurnWait,
+        event: _StreamEvent,
+        now: float,
+        idle_reply_grace: float,
+    ) -> _TurnOutcome | None:
+        """
+        Apply one stream event to the turn.
+
+        :param session_id: The session driven.
+        :param wait_state: The turn so far.
+        :param event: The event.
+        :param now: When this wait began, which the idle grace is
+            measured from.
+        :param idle_reply_grace: Max seconds to await a lagging reply
+            after a terminal idle.
+        :returns: The outcome, or ``None`` to keep waiting.
+        """
+        if event.kind == 'completed':
+            wait_state.saw_completed = True
+            wait_state.turn_started = True
+            return None
+        if event.kind == 'reply':
+            if event.reply:
+                # Only real TEXT counts as a start. An EMPTY delta does
+                # NOT: agy emits one as its cold-start cascade rotates
+                # away, and treating that as a start disarms the stall
+                # watchdog — the turn then blocks to the full timeout
+                # on a conversation the agent has already abandoned.
+                wait_state.turn_started = True
+                wait_state.reply = event.reply
+            if wait_state.grace_deadline is not None:
+                # The lagging reply after a terminal idle arrived.
+                return (
+                    SwarmTurnResult(_STATUS_IDLE, None, wait_state.reply),
+                    True,
+                )
+            return None
+        if event.kind == 'status':
+            return self._on_status_edge(
+                wait_state, event, now, idle_reply_grace
+            )
+        # done / closed / error: the stream ended. If we already saw
+        # this turn's terminal idle (grace pending), the end just means
+        # no lagging reply is coming — return it. Otherwise disambiguate
+        # with one snapshot poll.
+        if wait_state.grace_deadline is not None:
+            return SwarmTurnResult(_STATUS_IDLE, None, wait_state.reply), True
+        return (
+            self._resolve_on_stream_end(session_id, event, wait_state.reply),
+            wait_state.turn_started,
+        )
+
+    @staticmethod
+    def _on_status_edge(
+        wait_state: _TurnWait,
+        event: _StreamEvent,
+        now: float,
+        idle_reply_grace: float,
+    ) -> _TurnOutcome | None:
+        """
+        Apply a ``session.status`` edge.
+
+        A bare ``running`` edge does NOT count as started. The server
+        marks a turn ``running`` the moment it is ACCEPTED — before a
+        native TUI has actually submitted the paste — so a turn that
+        fails with only a running edge (no reply/completed, no clean
+        idle) is a dropped submit worth re-delivering. Only real output
+        (reply/completed) or a terminal idle is a real start.
+
+        :param wait_state: The turn so far.
+        :param event: The status event.
+        :param now: When this wait began.
+        :param idle_reply_grace: Max seconds to await a lagging reply.
+        :returns: The outcome, or ``None`` to keep waiting.
+        """
+        if event.status == _STATUS_FAILED:
+            return (
+                SwarmTurnResult(_STATUS_FAILED, event.error, wait_state.reply),
+                wait_state.turn_started,
+            )
+        if event.response_id:
+            # Claude tags its status edges with a response_id; agy never
+            # does — so one marks a Claude turn.
+            wait_state.saw_response_id = True
+        if event.status == _STATUS_IDLE:
+            return _on_idle_edge(wait_state, event, now, idle_reply_grace)
+        if wait_state.grace_deadline is not None:
+            # A running edge after a provisionally-graced id-less idle:
+            # the turn resumed, so that idle wasn't terminal. Reopen and
+            # keep waiting.
+            wait_state.grace_deadline = None
+        return None
 
     def _classify_settled(self, session_id: str) -> tuple[str, str]:
         """

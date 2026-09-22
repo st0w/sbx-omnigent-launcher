@@ -829,9 +829,17 @@ def handle_to_entry(
 
 def handle_from_entry(entry: dict[str, object]) -> SwarmHandle:
     """Rebuild a :class:`SwarmHandle` from a registry entry."""
+    raw = entry.get('reviewers', [])
+    if not isinstance(raw, list) or not all(
+        isinstance(r, dict) for r in raw
+    ):
+        raise click.ClickException(
+            f'registry entry {entry.get("swarm_id")!r}: reviewers must be '
+            f'a list of mappings'
+        )
     reviewers = tuple(
         Reviewer(role=str(r['role']), session=str(r['session']))
-        for r in entry.get('reviewers', [])  # type: ignore[union-attr]
+        for r in raw
     )
     return SwarmHandle(
         swarm_id=str(entry['swarm_id']),

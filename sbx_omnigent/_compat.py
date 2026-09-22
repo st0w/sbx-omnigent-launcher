@@ -23,9 +23,19 @@ from each tuple below -- the call sites do not change. See
 from __future__ import annotations
 
 import importlib
-import inspect
+from collections.abc import Callable
 from types import ModuleType
-from typing import Any, Protocol
+from typing import Protocol, runtime_checkable
+
+__all__ = [
+    'AGY_BRIDGE_MODULES',
+    'CODEX_EFFORTS',
+    'RepoWorkspaceLike',
+    'agy_bridge_module_name',
+    'load_agy_bridge',
+    'model_family_mismatch',
+    'repo_workspace',
+]
 
 #: ``model_family_mismatch`` -- new path first, legacy second.
 _MODEL_OVERRIDE_MODULES = (
@@ -58,56 +68,57 @@ _REPO_WORKSPACE_MODULES = (
     'omnigent.server.managed_hosts',
 )
 
-#: Sentinel distinguishing "no default given" from ``default=None``,
-#: which is a legitimate value for an optional module.
-_UNSET = object()
-
-
-def _first_attr(
-    modules: tuple[str, ...],
-    name: str,
-    described_as: str,
-    *,
-    default: Any = _UNSET,
-) -> Any:
+def _moved(described_as: str, name: str, paths: tuple[str, ...]) -> str:
     """
-    Return *name* from the first module in *modules* that has it.
+    The message for a name found at none of its known paths.
 
-    A module that will not import is skipped, not fatal: on either
-    layout one of the candidates is genuinely absent, and that is the
-    normal case rather than an error.
-
-    :param modules: Candidate module paths, most-current first.
-    :param name: The attribute to resolve, e.g.
-        ``"model_family_mismatch"``.
-    :param described_as: Human phrase for the failure message, e.g.
-        ``"the model-family guard"``.
-    :param default: Returned instead of raising when *name* is absent
-        everywhere. Omit to fail loud.
-    :returns: The resolved attribute, or *default*.
-    :raises ImportError: When no candidate provides *name* and no
-        *default* was given. The message names every path tried, so
-        the next Omnigent move is diagnosable from the traceback
-        alone.
+    :param described_as: Human phrase, e.g.
+        ``"the repository-workspace record"``.
+    :param name: The attribute looked for.
+    :param paths: Every path tried, most-current first.
+    :returns: The message, naming every path so the next Omnigent move
+        is diagnosable from the traceback alone.
     """
-    for module_path in modules:
-        try:
-            module = importlib.import_module(module_path)
-        except ImportError:
-            continue
-        found = getattr(module, name, _UNSET)
-        if found is not _UNSET:
-            return found
-    if default is not _UNSET:
-        return default
-    tried = ', '.join(modules)
-    raise ImportError(
+    return (
         f'this Omnigent provides {described_as} ({name}) at none of: '
-        f'{tried}. It likely moved again — add the new path to '
-        f'sbx_omnigent/_compat.py.'
+        f'{", ".join(paths)}. It likely moved again — add the new path '
+        f'to sbx_omnigent/_compat.py.'
     )
 
 
+def _resolve(
+    name: str,
+    described_as: str,
+    paths: tuple[str, str],
+    loaders: tuple[Callable[[], ModuleType], Callable[[], ModuleType]],
+) -> object:
+    """
+    Return *name* from the first candidate module that defines it.
+
+    Each loader imports one fixed module path. A candidate that does
+    not import, or imports without defining *name*, is skipped: on
+    either Omnigent layout one of them is genuinely absent.
+
+    :param name: The attribute to resolve.
+    :param described_as: Human phrase for the failure message.
+    :param paths: The two module paths, in the order *loaders* import
+        them, for the message.
+    :param loaders: One loader per path, most-current first.
+    :returns: The attribute.
+    :raises ImportError: When no candidate defines it.
+    """
+    for load in loaders:
+        try:
+            module = load()
+        except ImportError:
+            continue
+        found = getattr(module, name, None)
+        if found is not None:
+            return found
+    raise ImportError(_moved(described_as, name, paths))
+
+
+@runtime_checkable
 class RepoWorkspaceLike(Protocol):
     """
     The three fields every Omnigent ``RepoWorkspace`` carries.
@@ -141,36 +152,23 @@ def repo_workspace(
     :returns: The record, typed by the fields this package reads.
     :raises ImportError: When no candidate module defines it.
     """
-    factory = _first_attr(
-        _REPO_WORKSPACE_MODULES,
+    factory = _resolve(
         'RepoWorkspace',
         'the repository-workspace record',
+        _REPO_WORKSPACE_MODULES,
+        (
+            lambda: importlib.import_module(
+                'omnigent.onboarding.sandboxes.types'
+            ),
+            lambda: importlib.import_module('omnigent.server.managed_hosts'),
+        ),
     )
-    return factory(url=url, branch=branch, repo_name=repo_name)
-
-
-def base_start_host_takes_repos() -> bool:
-    """
-    Whether the installed ``start_host`` takes ``repos=``.
-
-    Omnigent replaced ``start_host``'s ``repo_url``/``repo_branch``/
-    ``repo_name`` keywords with a single ``repos`` sequence, so a
-    subclass that delegates upward must send the shape the INSTALLED
-    base declares. Read off the signature rather than guessed from a
-    version string: the signature is the thing that actually has to
-    match, and probing it costs one introspection per VM launch.
-
-    :returns: ``True`` for the multi-repo signature, ``False`` for
-        the legacy per-field one.
-    """
-    from omnigent.onboarding.sandboxes.base import (  # noqa: PLC0415
-        ExecModelHostLauncher,
-    )
-
-    parameters = inspect.signature(
-        ExecModelHostLauncher.start_host
-    ).parameters
-    return 'repos' in parameters
+    if not callable(factory):
+        raise TypeError(f'RepoWorkspace is not a class: {factory!r}')
+    record = factory(url=url, branch=branch, repo_name=repo_name)
+    if not isinstance(record, RepoWorkspaceLike):
+        raise TypeError(f'RepoWorkspace built {record!r}')
+    return record
 
 
 def load_agy_bridge() -> ModuleType | None:
@@ -181,12 +179,16 @@ def load_agy_bridge() -> ModuleType | None:
         no agy bridge at all (it is an optional harness, so absence
         is not an error).
     """
-    for module_path in AGY_BRIDGE_MODULES:
-        try:
-            return importlib.import_module(module_path)
-        except ImportError:
-            continue
-    return None
+    try:
+        return importlib.import_module(
+            'omnigent.harnesses.antigravity_native.bridge'
+        )
+    except ImportError:
+        pass
+    try:
+        return importlib.import_module('omnigent.antigravity_native_bridge')
+    except ImportError:
+        return None
 
 
 def agy_bridge_module_name() -> str | None:
@@ -200,14 +202,57 @@ def agy_bridge_module_name() -> str | None:
     return None if module is None else module.__name__
 
 
+
+def _model_family_mismatch() -> Callable[[str, str], str | None]:
+    """
+    Omnigent's check that a model's family can run on a harness.
+
+    :returns: The check, which returns a rejection reason or ``None``.
+    :raises ImportError: When neither layout provides it.
+    :raises TypeError: When what it provides is not callable.
+    """
+    found = _resolve(
+        'model_family_mismatch',
+        'the model-family guard',
+        _MODEL_OVERRIDE_MODULES,
+        (
+            lambda: importlib.import_module('omnigent.models.model_override'),
+            lambda: importlib.import_module('omnigent.model_override'),
+        ),
+    )
+    if not callable(found):
+        raise TypeError(f'model_family_mismatch is not callable: {found!r}')
+    return found
+
+
+def _codex_efforts() -> frozenset[str]:
+    """
+    Omnigent's codex reasoning-effort ladder.
+
+    :returns: The effort names.
+    :raises ImportError: When neither layout provides it.
+    :raises TypeError: When what it provides is not a set of strings.
+    """
+    found = _resolve(
+        'CODEX_EFFORTS',
+        'the codex effort ladder',
+        _REASONING_EFFORT_MODULES,
+        (
+            lambda: importlib.import_module('omnigent.util.reasoning_effort'),
+            lambda: importlib.import_module('omnigent.reasoning_effort'),
+        ),
+    )
+    if not isinstance(found, (set, frozenset)) or not all(
+        isinstance(effort, str) for effort in found
+    ):
+        raise TypeError(f'CODEX_EFFORTS is not a set of names: {found!r}')
+    return frozenset(found)
+
+
 #: Rejection reason when a model's family cannot run on a harness, or
 #: ``None`` when the pairing is fine. Used by the pipeline's
 #: model-pinning guard.
-model_family_mismatch = _first_attr(
-    _MODEL_OVERRIDE_MODULES,
-    'model_family_mismatch',
-    'the model-family guard',
-)
+model_family_mismatch = _model_family_mismatch()
 
 #: Reasoning-effort levels codex accepts, used to gate what may be
 #: interpolated into a ``-c model_reasoning_effort=...`` expression.
@@ -219,8 +264,4 @@ model_family_mismatch = _first_attr(
 #: the harness layer — the one place this project has repeatedly lost
 #: days to (see docs/HARNESS-VERSIONS.md) — so it is a decision of its
 #: own, not a side effect of an import move.
-CODEX_EFFORTS = _first_attr(
-    _REASONING_EFFORT_MODULES,
-    'CODEX_EFFORTS',
-    'the codex effort ladder',
-)
+CODEX_EFFORTS = _codex_efforts()

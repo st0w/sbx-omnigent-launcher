@@ -27,12 +27,12 @@ inside an `except ImportError` and would have gone silent.
 
 When the supported floor rises past both changes:
 
-- drop the legacy entry from each tuple in `sbx_omnigent/_compat.py`
+- drop the legacy import from each fallback in `sbx_omnigent/_compat.py`
   (call sites do not change);
 - drop the `repo_url` / `repo_branch` / `repo_name` keywords and
   `_base_repo_kwargs` from `SbxLauncher.start_host`, keeping only
   `repos`;
-- `base_start_host_takes_repos()` then has one answer and can go.
+- `base_start_host_takes_repos()` in `sbx_omnigent/launcher.py` then has one answer and can go.
 
 `tests/test_compat.py` and the delegation tests in
 `tests/test_launcher.py` are what make that deletion safe to attempt.

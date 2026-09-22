@@ -37,11 +37,12 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, TypedDict, Unpack
 
 import click
 
 from sbx_omnigent._compat import AGY_BRIDGE_MODULES
+from sbx_omnigent.defaults import DEFAULT_HOST_IMAGE
 
 #: Default name of the trusted auth-agy sandbox (Stage 0).
 TRUSTED_BOX_DEFAULT = 'agy-auth-trusted'
@@ -976,8 +977,18 @@ def _looks_like_relogin(text: str) -> bool:
     return any(s in low for s in signals)
 
 
+class RunOptions(TypedDict, total=False):
+    """The :func:`subprocess.run` options the harvester passes."""
+
+    capture_output: bool
+    text: bool
+    stdin: int | None
+    timeout: float | None
+    input: str | None
+
+
 def _run_subprocess(
-    argv: list[str], **kwargs: object
+    argv: list[str], **kwargs: Unpack[RunOptions]
 ) -> subprocess.CompletedProcess[str]:
     """
     Default process runner — resolves ``subprocess.run`` at *call* time.
@@ -992,7 +1003,7 @@ def _run_subprocess(
     :param kwargs: Forwarded to :func:`subprocess.run`.
     :returns: The completed process.
     """
-    return subprocess.run(argv, **kwargs)  # type: ignore[call-overload]
+    return subprocess.run(argv, **kwargs)
 
 
 @dataclass
@@ -1338,8 +1349,6 @@ def bootstrap(
     complete it, only prepare for it.
     """
     if image is None:
-        from sbx_omnigent.launcher import DEFAULT_HOST_IMAGE  # noqa: PLC0415
-
         image = DEFAULT_HOST_IMAGE
     workspace = workspace or f'/tmp/{box}-ws'
 

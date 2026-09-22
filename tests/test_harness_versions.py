@@ -12,26 +12,37 @@ from sbx_omnigent import harness_versions as hv
 _DOC = Path(__file__).resolve().parents[1] / 'docs' / 'HARNESS-VERSIONS.md'
 
 
-class _Proc:
-    """Minimal stand-in for a CompletedProcess."""
+class _Proc(subprocess.CompletedProcess[str]):
+    """A finished process with the given output."""
 
     def __init__(self, stdout: str = '', returncode: int = 0) -> None:
-        self.stdout = stdout
-        self.returncode = returncode
+        super().__init__(args=[], returncode=returncode, stdout=stdout)
 
 
-def _runner(proc=None, raises=None):
+class _Runner:
     """A subprocess.run stand-in that records argv and kwargs."""
-    calls: list[tuple[list[str], dict[str, object]]] = []
 
-    def run(argv, **kwargs):
-        calls.append((argv, kwargs))
-        if raises is not None:
-            raise raises
-        return proc if proc is not None else _Proc()
+    def __init__(
+        self,
+        proc: _Proc | None = None,
+        raises: BaseException | None = None,
+    ) -> None:
+        self.calls: list[tuple[list[str], dict[str, object]]] = []
+        self._proc = proc if proc is not None else _Proc()
+        self._raises = raises
 
-    run.calls = calls  # type: ignore[attr-defined]
-    return run
+    def __call__(self, argv: list[str], **kwargs: object) -> _Proc:
+        self.calls.append((argv, kwargs))
+        if self._raises is not None:
+            raise self._raises
+        return self._proc
+
+
+def _runner(
+    proc: _Proc | None = None, raises: BaseException | None = None
+) -> _Runner:
+    """A recording runner returning *proc*, or raising *raises*."""
+    return _Runner(proc, raises)
 
 
 class TestParseVersions(unittest.TestCase):

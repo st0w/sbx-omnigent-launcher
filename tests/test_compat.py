@@ -11,12 +11,16 @@ fails loud, naming both paths.
 
 from __future__ import annotations
 
+import importlib
 import inspect
+import sys
+import types
 import unittest
+from unittest import mock
 
 from omnigent.onboarding.sandboxes.base import ExecModelHostLauncher
 
-from sbx_omnigent import _compat
+from sbx_omnigent import _compat, launcher
 
 
 class TestResolvesAgainstInstalledOmnigent(unittest.TestCase):
@@ -66,36 +70,160 @@ class TestResolvesAgainstInstalledOmnigent(unittest.TestCase):
             )
 
 
-class TestFirstAttr(unittest.TestCase):
-    """The resolver itself: first hit wins, total miss fails loud."""
+def _module(name: str, **attrs: object) -> types.ModuleType:
+    """A stand-in module carrying *attrs*."""
+    module = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    return module
 
-    def test_returns_the_first_module_that_has_the_name(self) -> None:
-        # ``os.sep`` exists; the bogus module ahead of it must be
-        # skipped rather than raising.
+
+class TestImportTimeFallbacks(unittest.TestCase):
+    """The two names resolved at import fall back to the legacy path.
+
+    `_compat` is re-executed with the new path made unimportable and a
+    stand-in at the legacy one, then restored.
+    """
+
+    def tearDown(self) -> None:
+        importlib.reload(_compat)
+
+    def _reload_with(self, modules: dict[str, object]) -> None:
+        with mock.patch.dict(sys.modules, modules):
+            importlib.reload(_compat)
+
+    def test_model_family_mismatch_falls_back(self) -> None:
+        def legacy_guard(harness: str, model: str) -> str | None:
+            return f'legacy: {harness} {model}'
+
+        legacy = _module('omnigent.model_override',
+                         model_family_mismatch=legacy_guard)
+        self._reload_with({
+            'omnigent.models.model_override': None,
+            'omnigent.model_override': legacy,
+        })
         self.assertEqual(
-            _compat._first_attr(
-                ('sbx_omnigent.__nope__', 'os'), 'sep', 'thing'
-            ),
-            __import__('os').sep,
+            _compat.model_family_mismatch('h', 'm'), 'legacy: h m'
         )
 
-    def test_missing_everywhere_raises_naming_every_path(self) -> None:
-        with self.assertRaises(ImportError) as caught:
-            _compat._first_attr(
-                ('os', 'sys'), '__definitely_not_here__', 'the thing'
-            )
-        message = str(caught.exception)
-        self.assertIn('the thing', message)
-        self.assertIn('os', message)
-        self.assertIn('sys', message)
+    def test_a_guard_that_is_not_callable_is_refused(self) -> None:
+        legacy = _module('omnigent.model_override',
+                         model_family_mismatch='not a function')
+        with self.assertRaises(TypeError):
+            self._reload_with({
+                'omnigent.models.model_override': None,
+                'omnigent.model_override': legacy,
+            })
 
-    def test_default_is_returned_instead_of_raising(self) -> None:
-        self.assertEqual(
-            _compat._first_attr(
-                ('os',), '__definitely_not_here__', 'x', default='fb'
-            ),
-            'fb',
+    def test_an_effort_ladder_that_is_not_names_is_refused(self) -> None:
+        legacy = _module('omnigent.reasoning_effort', CODEX_EFFORTS=[1, 2])
+        with self.assertRaises(TypeError):
+            self._reload_with({
+                'omnigent.util.reasoning_effort': None,
+                'omnigent.reasoning_effort': legacy,
+            })
+
+    def test_codex_efforts_falls_back(self) -> None:
+        legacy = _module('omnigent.reasoning_effort',
+                         CODEX_EFFORTS=frozenset({'high'}))
+        self._reload_with({
+            'omnigent.util.reasoning_effort': None,
+            'omnigent.reasoning_effort': legacy,
+        })
+        self.assertEqual(_compat.CODEX_EFFORTS, frozenset({'high'}))
+
+    def test_neither_path_fails_naming_both(self) -> None:
+        for new, old in (
+            ('omnigent.models.model_override', 'omnigent.model_override'),
+            ('omnigent.util.reasoning_effort', 'omnigent.reasoning_effort'),
+        ):
+            with self.subTest(new=new):
+                with self.assertRaises(ImportError) as caught:
+                    self._reload_with({new: None, old: None})
+                self.assertIn(new, str(caught.exception))
+                self.assertIn(old, str(caught.exception))
+
+
+class TestAgyBridgeFallback(unittest.TestCase):
+    """The bridge is tried in `AGY_BRIDGE_MODULES` order.
+
+    The in-VM patch script reads that tuple, so the order it names and
+    the order `load_agy_bridge` tries must be the same.
+    """
+
+    def _loaded_name(self) -> str:
+        module = _compat.load_agy_bridge()
+        if module is None:
+            self.fail('no agy bridge was loaded')
+        return module.__name__
+
+    def test_the_first_path_wins(self) -> None:
+        first, second = _compat.AGY_BRIDGE_MODULES
+        with mock.patch.dict(sys.modules, {
+            first: _module(first), second: _module(second),
+        }):
+            self.assertEqual(self._loaded_name(), first)
+
+    def test_the_second_path_is_the_fallback(self) -> None:
+        first, second = _compat.AGY_BRIDGE_MODULES
+        with mock.patch.dict(sys.modules, {
+            first: None, second: _module(second),
+        }):
+            self.assertEqual(self._loaded_name(), second)
+
+    def test_neither_is_none_not_an_error(self) -> None:
+        first, second = _compat.AGY_BRIDGE_MODULES
+        with mock.patch.dict(sys.modules, {first: None, second: None}):
+            self.assertIsNone(_compat.load_agy_bridge())
+
+
+class TestRepoWorkspaceFallback(unittest.TestCase):
+    """`RepoWorkspace` is tried in `_REPO_WORKSPACE_MODULES` order."""
+
+    @staticmethod
+    def _factory(
+        *, url: str, branch: str | None, repo_name: str
+    ) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            url=url, branch=branch, repo_name=repo_name
         )
+
+    def test_the_legacy_path_is_the_fallback(self) -> None:
+        new, old = _compat._REPO_WORKSPACE_MODULES
+        with mock.patch.dict(sys.modules, {
+            new: None, old: _module(old, RepoWorkspace=self._factory),
+        }):
+            repo = _compat.repo_workspace('u', 'b', 'n')
+        self.assertEqual(
+            (repo.url, repo.branch, repo.repo_name), ('u', 'b', 'n')
+        )
+
+    def test_a_module_without_it_is_skipped(self) -> None:
+        # Omnigent v0.13.0: the new module imports, and the record is
+        # still at the legacy path.
+        new, old = _compat._REPO_WORKSPACE_MODULES
+        with mock.patch.dict(sys.modules, {
+            new: _module(new), old: _module(old, RepoWorkspace=self._factory),
+        }):
+            repo = _compat.repo_workspace('u', None, 'n')
+        self.assertEqual(repo.repo_name, 'n')
+
+    def test_neither_module_defining_it_fails_naming_both(self) -> None:
+        new, old = _compat._REPO_WORKSPACE_MODULES
+        with mock.patch.dict(sys.modules, {
+            new: _module(new), old: _module(old),
+        }):
+            with self.assertRaises(ImportError) as caught:
+                _compat.repo_workspace('u', None, 'n')
+        self.assertIn(new, str(caught.exception))
+        self.assertIn(old, str(caught.exception))
+
+    def test_neither_path_fails_naming_both(self) -> None:
+        new, old = _compat._REPO_WORKSPACE_MODULES
+        with mock.patch.dict(sys.modules, {new: None, old: None}):
+            with self.assertRaises(ImportError) as caught:
+                _compat.repo_workspace('u', None, 'n')
+        self.assertIn(old, str(caught.exception))
 
 
 class TestStartHostShapeProbe(unittest.TestCase):
@@ -106,10 +234,10 @@ class TestStartHostShapeProbe(unittest.TestCase):
             'repos'
             in inspect.signature(ExecModelHostLauncher.start_host).parameters
         )
-        self.assertEqual(_compat.base_start_host_takes_repos(), expected)
+        self.assertEqual(launcher.base_start_host_takes_repos(), expected)
 
     def test_probe_is_a_bool(self) -> None:
-        self.assertIsInstance(_compat.base_start_host_takes_repos(), bool)
+        self.assertIsInstance(launcher.base_start_host_takes_repos(), bool)
 
 
 class TestRepoWorkspace(unittest.TestCase):
