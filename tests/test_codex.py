@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import base64
 import json
+import subprocess
 import tempfile
 import unittest
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -174,6 +176,159 @@ class TestSecretsNeverReachALog(_Base):
 
     def test_the_seed_script_writes_the_file_mode_0600(self) -> None:
         self.assertIn('0o600', codex.build_seed_script())
+
+
+def _doctor(
+    handshake: str | None = 'ok', *, schema: object = 1
+) -> str:
+    """A `codex doctor --json` report in the 0.148.0 shape.
+
+    Synthetic: real reports carry host paths, so none is copied here.
+    """
+    checks: dict[str, object] = {
+        'auth.credentials': {
+            'id': 'auth.credentials', 'status': 'ok',
+            'summary': 'auth is configured',
+        },
+    }
+    if handshake is not None:
+        checks['network.websocket_reachability'] = {
+            'id': 'network.websocket_reachability',
+            'status': handshake,
+            'summary': 'Responses WebSocket failed',
+            'details': {'handshake transport error': '<redacted>'},
+        }
+    return json.dumps({
+        'schemaVersion': schema, 'overallStatus': 'warning',
+        'codexVersion': '0.148.0', 'checks': checks,
+    })
+
+
+class _Doctor:
+    """Records each call and replays one outcome."""
+
+    def __init__(
+        self, stdout: str = '', *, raises: BaseException | None = None
+    ) -> None:
+        self._stdout = stdout
+        self._raises = raises
+        self.calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def __call__(
+        self, argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append((list(argv), kwargs))
+        if self._raises is not None:
+            raise self._raises
+        return subprocess.CompletedProcess(argv, 0, self._stdout, '')
+
+
+def _on_path(_name: str) -> str:
+    return '/usr/local/bin/codex'
+
+
+class TestTheLoginIsCheckedAgainstTheServer(unittest.TestCase):
+    """`codex login status` and the token's `exp` both said a dead login
+    was fine (#26). `codex doctor`'s WebSocket handshake is the one
+    check that authenticates against the server."""
+
+    def _probe(self, doctor: _Doctor) -> str | None:
+        return codex.probe_login(run=doctor, which=_on_path)
+
+    def test_a_live_login_passes(self) -> None:
+        self.assertIsNone(self._probe(_Doctor(_doctor('ok'))))
+
+    def test_a_failed_handshake_is_refused(self) -> None:
+        with self.assertRaises(codex.CodexLoginRejected):
+            self._probe(_Doctor(_doctor('warning')))
+
+    def test_a_refusal_is_a_codex_auth_error(self) -> None:
+        # Every caller already catches CodexAuthError.
+        self.assertTrue(
+            issubclass(codex.CodexLoginRejected, codex.CodexAuthError)
+        )
+
+    def test_a_refusal_names_the_relogin_command(self) -> None:
+        with self.assertRaises(codex.CodexLoginRejected) as caught:
+            self._probe(_Doctor(_doctor('warning')))
+        self.assertIn(codex.RELOGIN_HINT, str(caught.exception))
+
+    def test_a_refusal_names_the_skip_flag(self) -> None:
+        # The reason is redacted, so a network that blocks WebSockets
+        # looks the same as a rejected login.
+        with self.assertRaises(codex.CodexLoginRejected) as caught:
+            self._probe(_Doctor(_doctor('warning')))
+        self.assertIn(codex.SKIP_LOGIN_CHECK_FLAG, str(caught.exception))
+
+    def test_an_error_status_is_refused_too(self) -> None:
+        with self.assertRaises(codex.CodexLoginRejected):
+            self._probe(_Doctor(_doctor('error')))
+
+    def test_it_runs_doctor_as_json_with_a_timeout(self) -> None:
+        doctor = _Doctor(_doctor('ok'))
+        self._probe(doctor)
+        argv, kwargs = doctor.calls[0]
+        self.assertEqual(argv, ['codex', 'doctor', '--json'])
+        self.assertEqual(kwargs['timeout'], codex.DOCTOR_TIMEOUT_S)
+
+    def test_the_report_never_reaches_a_message(self) -> None:
+        # Redacted by codex, and still not ours to print.
+        report = _doctor('warning').replace(
+            '<redacted>', 'secret-looking-detail'
+        )
+        with self.assertRaises(codex.CodexLoginRejected) as caught:
+            self._probe(_Doctor(report))
+        self.assertNotIn('secret-looking-detail', str(caught.exception))
+
+
+class TestAProbeThatCannotAnswerNeverBlocks(unittest.TestCase):
+    """The probe is a check on the login, not a dependency: when it
+    cannot be run or read, the run goes ahead with a warning."""
+
+    def _warns(
+        self,
+        doctor: _Doctor,
+        *,
+        which: Callable[[str], str | None] = _on_path,
+    ) -> str:
+        warning = codex.probe_login(run=doctor, which=which)
+        assert warning is not None
+        return warning
+
+    def test_no_codex_on_path(self) -> None:
+        doctor = _Doctor(_doctor('ok'))
+        warning = self._warns(doctor, which=lambda _n: None)
+        self.assertIn('not found', warning)
+        self.assertEqual(doctor.calls, [])
+
+    def test_a_doctor_that_hangs(self) -> None:
+        warning = self._warns(_Doctor(
+            raises=subprocess.TimeoutExpired(['codex'], 60.0)
+        ))
+        self.assertIn('did not finish', warning)
+
+    def test_a_doctor_that_cannot_run(self) -> None:
+        self._warns(_Doctor(raises=OSError('exec format error')))
+
+    def test_output_that_is_not_json(self) -> None:
+        self._warns(_Doctor('Usage: codex doctor'))
+
+    def test_a_report_that_is_not_an_object(self) -> None:
+        self._warns(_Doctor('[]'))
+
+    def test_an_unknown_report_schema(self) -> None:
+        warning = self._warns(_Doctor(_doctor('warning', schema=2)))
+        self.assertIn('schema', warning)
+
+    def test_a_report_without_the_handshake_check(self) -> None:
+        self._warns(_Doctor(_doctor(None)))
+
+    def test_an_unknown_handshake_status(self) -> None:
+        self._warns(_Doctor(_doctor('skipped')))
+
+    def test_each_warning_says_the_login_was_not_checked(self) -> None:
+        for doctor in (_Doctor('nope'), _Doctor(_doctor(None))):
+            self.assertIn('not checked', self._warns(doctor))
 
 
 if __name__ == '__main__':

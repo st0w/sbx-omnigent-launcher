@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1184,6 +1185,49 @@ def _preflight_codex_bindings(
         ) from exc
 
 
+def _probe_codex_login(
+    agents: list[dict[str, object]],
+    bound_ids: list[str],
+    *,
+    skip: bool,
+    probe: Callable[[], str | None] | None = None,
+) -> str | None:
+    """
+    Refuse to start a swarm with a Codex agent on a rejected login.
+
+    :func:`_preflight_codex_bindings` reads the token's expiry; this
+    asks the server, through ``codex doctor``'s authenticated handshake
+    (see :func:`codex.probe_login`), because a dead refresh token passed
+    the expiry check (#26).
+
+    :param agents: The built-in agent catalog.
+    :param bound_ids: Agent refs bound to this swarm.
+    :param skip: ``--skip-codex-check``: report that the login was not
+        checked, and do not probe.
+    :param probe: The probe (injected in tests); ``None`` means
+        :func:`codex.probe_login`, looked up at call time.
+    :returns: A warning to show, or ``None``. A swarm with no Codex
+        agent is never probed.
+    :raises click.ClickException: If the handshake failed; the message
+        names the agents, the re-login command and the skip flag.
+    """
+    names = _detect_codex_bindings(agents, bound_ids)
+    if not names:
+        return None
+    if skip:
+        return (
+            f'codex: {codex.SKIP_LOGIN_CHECK_FLAG}: the login was not '
+            f'checked against the server.'
+        )
+    check = probe if probe is not None else codex.probe_login
+    try:
+        return check()
+    except codex.CodexAuthError as exc:
+        raise click.ClickException(
+            f'Codex agent(s) {", ".join(names)} are bound, but {exc}'
+        ) from exc
+
+
 def _read_message(message: str | None, message_file: str | None) -> str:
     """
     Read a turn message from ``--message`` or ``--message-file``.
@@ -1273,6 +1317,14 @@ def cli(ctx: click.Context, registry: str) -> None:
         'auth failure later.'
     ),
 )
+@click.option(
+    '--skip-codex-check',
+    is_flag=True,
+    help='Skip the check that the server accepts the host Codex login '
+    '(the WebSocket handshake in `codex doctor`). For a network that '
+    'blocks WebSockets but reaches Codex over HTTPS. An expired access '
+    'token is still refused.',
+)
 @click.pass_obj
 def _start(
     registry: SwarmRegistry,
@@ -1287,6 +1339,7 @@ def _start(
     reviewer_specs_raw: tuple[str, ...],
     base_branch: str | None,
     agy_ack: bool | None,
+    skip_codex_check: bool,
 ) -> None:
     """Cut a worktree, spin coder (rw) + reviewer(s) (:ro), register."""
     reviewer_specs = _parse_reviewer_specs(reviewer_specs_raw)
@@ -1320,6 +1373,9 @@ def _start(
     warning = _preflight_codex_bindings(catalog, bound_ids)
     if warning:
         # stderr: stdout carries the registry entry as JSON.
+        click.echo(f'[preflight] {warning}', err=True)
+    warning = _probe_codex_login(catalog, bound_ids, skip=skip_codex_check)
+    if warning:
         click.echo(f'[preflight] {warning}', err=True)
     # Per-agent model/effort come from each bound agent's bundle
     # config.yaml and ride the session-create body (model_override /

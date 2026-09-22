@@ -143,6 +143,8 @@ class TestStartRunsTheCodexPreflight(unittest.TestCase):
             mock.patch.object(swarm, 'SwarmOrchestrator', orch),
             mock.patch.object(swarm, 'WorktreeManager'),
             mock.patch.object(swarm.codex, 'preflight', preflight),
+            # Never run the real `codex doctor` on this host.
+            mock.patch.object(swarm.codex, 'probe_login', return_value=None),
         ):
             registry = tempfile.mkdtemp()
             result = CliRunner().invoke(
@@ -165,6 +167,94 @@ class TestStartRunsTheCodexPreflight(unittest.TestCase):
         self.assertIn('[preflight] codex: soon', result.stderr)
         self.assertNotIn('codex: soon', result.stdout)
         orch.assert_called_once()
+
+
+class TestStartChecksTheLoginAgainstTheServer(unittest.TestCase):
+    """The expiry check passed a login the server had rejected (#26), so
+    `start` also runs `codex doctor`'s authenticated handshake."""
+
+    _ARGS = TestStartRunsTheCodexPreflight._ARGS
+
+    def _invoke(
+        self, probe: mock.Mock, *extra: str
+    ) -> tuple[click.testing.Result, mock.Mock]:
+        client = mock.Mock()
+        client.list_builtin_agents.return_value = _AGENTS
+        orch = mock.Mock()
+        orch.return_value.start_swarm.side_effect = RuntimeError('stop here')
+        with (
+            mock.patch.object(
+                swarm, 'SwarmSessionClient', return_value=client
+            ),
+            mock.patch.object(swarm, 'SwarmOrchestrator', orch),
+            mock.patch.object(swarm, 'WorktreeManager'),
+            mock.patch.object(swarm.codex, 'preflight', return_value=None),
+            mock.patch.object(swarm.codex, 'probe_login', probe),
+        ):
+            registry = tempfile.mkdtemp()
+            result = CliRunner().invoke(
+                swarm.cli, ['--registry', registry, *self._ARGS, *extra]
+            )
+        return result, orch
+
+    def test_a_rejected_login_stops_start_before_any_vm(self) -> None:
+        result, orch = self._invoke(mock.Mock(
+            side_effect=codex.CodexLoginRejected('handshake refused')
+        ))
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn('swarm-codex-coder', result.output)
+        self.assertIn('handshake refused', result.output)
+        orch.assert_not_called()
+
+    def test_the_skip_flag_skips_the_probe(self) -> None:
+        probe = mock.Mock(
+            side_effect=codex.CodexLoginRejected('handshake refused')
+        )
+        result, orch = self._invoke(probe, codex.SKIP_LOGIN_CHECK_FLAG)
+        probe.assert_not_called()
+        orch.assert_called_once()
+        self.assertIn('not checked', result.stderr)
+
+    def test_the_flag_never_skips_the_expiry_check(self) -> None:
+        client = mock.Mock()
+        client.list_builtin_agents.return_value = _AGENTS
+        orch = mock.Mock()
+        with (
+            mock.patch.object(
+                swarm, 'SwarmSessionClient', return_value=client
+            ),
+            mock.patch.object(swarm, 'SwarmOrchestrator', orch),
+            mock.patch.object(swarm, 'WorktreeManager'),
+            mock.patch.object(
+                swarm.codex, 'preflight',
+                side_effect=codex.CodexAuthError('the token expired'),
+            ),
+            mock.patch.object(swarm.codex, 'probe_login') as probe,
+        ):
+            registry = tempfile.mkdtemp()
+            result = CliRunner().invoke(swarm.cli, [
+                '--registry', registry, *self._ARGS,
+                codex.SKIP_LOGIN_CHECK_FLAG,
+            ])
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn('the token expired', result.output)
+        probe.assert_not_called()
+        orch.assert_not_called()
+
+    def test_a_probe_warning_goes_to_stderr(self) -> None:
+        result, _orch = self._invoke(
+            mock.Mock(return_value='codex: doctor unreadable')
+        )
+        self.assertIn('[preflight] codex: doctor unreadable', result.stderr)
+        self.assertNotIn('doctor unreadable', result.stdout)
+
+    def test_a_swarm_without_codex_is_never_probed(self) -> None:
+        probe = mock.Mock(return_value=None)
+        self.assertIsNone(
+            swarm._probe_codex_login(_AGENTS, ['ag_claude'], skip=False,
+                                     probe=probe)
+        )
+        probe.assert_not_called()
 
 
 if __name__ == '__main__':

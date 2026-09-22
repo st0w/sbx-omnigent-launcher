@@ -48,6 +48,9 @@ import binascii
 import json
 import os
 import re
+import shutil
+import subprocess
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -93,6 +96,26 @@ RELOGIN_HINT = 'codex login --device-auth'
 
 class CodexAuthError(Exception):
     """The host has no usable Codex credential."""
+
+
+class CodexLoginRejected(CodexAuthError):
+    """The Codex server refused an authenticated handshake."""
+
+
+#: The flag that skips :func:`probe_login`, on ``omni-sbx-pipeline`` and
+#: on ``omni-sbx-swarm start``. Named in the refusal, because the probe
+#: cannot tell a rejected login from a network that blocks WebSockets.
+SKIP_LOGIN_CHECK_FLAG = '--skip-codex-check'
+
+#: Budget for ``codex doctor``. Its WebSocket check has a 15 s connect
+#: timeout and the whole report took about 3 s on a healthy host.
+DOCTOR_TIMEOUT_S = 60.0
+
+#: The ``codex doctor --json`` layout this probe reads (codex 0.148.0).
+_DOCTOR_SCHEMA = 1
+
+#: The one doctor check that authenticates against the server.
+_HANDSHAKE_CHECK = 'network.websocket_reachability'
 
 
 def host_auth_path() -> Path:
@@ -266,6 +289,111 @@ def preflight(
             f'authenticate first with:  {RELOGIN_HINT}'
         )
     return None
+
+
+def probe_login(
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    which: Callable[[str], str | None] = shutil.which,
+    timeout_s: float = DOCTOR_TIMEOUT_S,
+) -> str | None:
+    """
+    Check the host's Codex login against the server, before any VM.
+
+    :func:`preflight` reads the access token's ``exp`` and cannot see a
+    login the server has already rejected. On 2026-09-14 the refresh
+    token had expired, and both that check and ``codex login status``
+    said all was well (#26).
+
+    ``codex doctor`` is the only command found that authenticates
+    without spending a turn: its WebSocket handshake check succeeded
+    with a live login and failed with made-up tokens, while its
+    ``auth.credentials`` check passed both. It redacts the handshake's
+    reason, so a network that blocks WebSockets fails the same way;
+    the refusal therefore names :data:`SKIP_LOGIN_CHECK_FLAG` as well
+    as the re-login command.
+
+    When the probe itself cannot answer (no ``codex``, a hang, a report
+    it cannot read), the run goes ahead with a warning. The report is
+    never included in any message.
+
+    :param run: Subprocess runner; ``None`` means ``subprocess.run``,
+        looked up at call time so tests can patch it.
+    :param which: ``shutil.which``-alike (injected in tests).
+    :param timeout_s: Budget for ``codex doctor``.
+    :returns: A warning when the login could not be checked, else
+        ``None``.
+    :raises CodexLoginRejected: If the handshake failed.
+    """
+    if which('codex') is None:
+        return (
+            'codex: the `codex` CLI was not found on PATH, so the login '
+            'was not checked against the server'
+        )
+    call = run if run is not None else subprocess.run
+    try:
+        proc = call(
+            ['codex', 'doctor', '--json'],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            f'codex: `codex doctor` did not finish within '
+            f'{timeout_s:.0f} s, so the login was not checked against '
+            f'the server'
+        )
+    except OSError as exc:
+        return (
+            f'codex: `codex doctor` could not run ({exc.strerror or exc}), '
+            f'so the login was not checked against the server'
+        )
+    status = _handshake_status(proc.stdout or '')
+    if status in ('warning', 'error', 'fail', 'failed'):
+        raise CodexLoginRejected(
+            'the Codex server would not complete an authenticated '
+            'handshake (`codex doctor`: WebSocket check failed). '
+            'Either the login was rejected (an expired refresh token '
+            'looks fine to `codex login status` and to the access '
+            "token's expiry), or this network blocks WebSockets.\n"
+            f'Re-authenticate on this host with:\n  {RELOGIN_HINT}\n'
+            f'If Codex works here and only WebSockets are blocked, pass '
+            f'{SKIP_LOGIN_CHECK_FLAG}.'
+        )
+    if status == 'ok':
+        return None
+    return (
+        f'codex: `codex doctor` gave no usable answer ({status}), so the '
+        f'login was not checked against the server'
+    )
+
+
+def _handshake_status(report: str) -> str:
+    """
+    The WebSocket handshake check's status in a ``codex doctor`` report.
+
+    :param report: The ``--json`` output.
+    :returns: The check's status (``"ok"``, ``"warning"``, ...), or a
+        short reason the report could not be read, for a warning.
+    """
+    try:
+        doc = json.loads(report)
+    except ValueError:
+        return 'its output was not JSON'
+    if not isinstance(doc, dict):
+        return 'its report was not an object'
+    if doc.get('schemaVersion') != _DOCTOR_SCHEMA:
+        return f'unknown report schema {doc.get("schemaVersion")!r}'
+    checks = doc.get('checks')
+    check = checks.get(_HANDSHAKE_CHECK) if isinstance(checks, dict) else None
+    status = check.get('status') if isinstance(check, dict) else None
+    if not isinstance(status, str):
+        return 'its report has no WebSocket check'
+    if status in ('ok', 'warning', 'error', 'fail', 'failed'):
+        return status
+    return f'unknown WebSocket check status {status!r}'
 
 
 #: A bare JWT (three base64url segments). The seeded payload is JSON, so

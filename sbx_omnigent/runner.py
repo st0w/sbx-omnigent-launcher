@@ -10449,6 +10449,49 @@ def preflight_codex_auth(
         echo(f'[preflight] {warning}')
 
 
+def preflight_codex_login(
+    config: pipeline.PipelineConfig,
+    *,
+    skip: bool,
+    echo: Callable[[str], None] = click.echo,
+) -> None:
+    """
+    Refuse to start a Codex pipeline on a login the server rejects.
+
+    :func:`preflight_codex_auth` reads the access token's expiry and
+    cannot see a login the server has already rejected; on 2026-09-14 a
+    dead refresh token passed it, and every Codex turn then failed as a
+    startup timeout (#26). This runs ``codex doctor``'s authenticated
+    handshake instead (see :func:`codex.probe_login`), before any
+    microVM. A pipeline with no Codex agents is a no-op.
+
+    :param config: The parsed pipeline.
+    :param skip: ``--skip-codex-check``: say the login was not checked,
+        and do not probe.
+    :param echo: Output sink (injected in tests).
+    :raises click.ClickException: If the handshake failed; the message
+        names the agents, the re-login command and the skip flag.
+    """
+    names = codex_agent_names(config)
+    if not names:
+        return
+    if skip:
+        echo(
+            f'[preflight] codex: {codex.SKIP_LOGIN_CHECK_FLAG}: the login '
+            f'was not checked against the server.'
+        )
+        return
+    try:
+        warning = codex.probe_login()
+    except codex.CodexAuthError as exc:
+        raise click.ClickException(
+            f'this pipeline has Codex agent(s) '
+            f'({", ".join(names)}) but {exc}'
+        ) from exc
+    if warning:
+        echo(f'[preflight] {warning}')
+
+
 def stop_harvester(proc: subprocess.Popen[bytes] | None) -> None:
     """
     Stop a harvester this run started, if any.
@@ -10712,6 +10755,14 @@ def preflight_agy(
     help='Skip the preflight that refuses to start an agy pipeline on a '
     'stale swap secret (use when the harvester runs on another host).',
 )
+@click.option(
+    '--skip-codex-check',
+    is_flag=True,
+    help='Skip the check that the server accepts the host Codex login '
+    '(the WebSocket handshake in `codex doctor`). For a network that '
+    'blocks WebSockets but reaches Codex over HTTPS. An expired access '
+    'token is still refused.',
+)
 def main(
     config_path: str,
     server: str,
@@ -10729,6 +10780,7 @@ def main(
     no_interactive_plan: bool,
     no_auto_approve: bool,
     skip_agy_check: bool,
+    skip_codex_check: bool,
 ) -> None:
     """Fire a pipeline.yaml; provision-only when it has no task."""
     config = pipeline.load_pipeline(config_path)
@@ -10769,6 +10821,7 @@ def main(
     # Before ANY VM is provisioned: a Codex pipeline on a dead token
     # would otherwise fail every turn, minutes and several microVMs in.
     preflight_codex_auth(config)
+    preflight_codex_login(config, skip=skip_codex_check)
     harvester: subprocess.Popen[bytes] | None = None
     if not skip_agy_check:
         # An agy pipeline needs a live harvester or every agy turn dies
