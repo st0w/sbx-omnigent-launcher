@@ -30,6 +30,7 @@ from sbx_omnigent.swarm_session import (
     _PLAN_APPROVAL_PHRASES,
     SwarmSessionClient,
     SwarmSessionError,
+    SwarmTurnTimeout,
     UrllibTransport,
     _approved_plan_text,
     _assistant_reply_items,
@@ -1334,6 +1335,99 @@ class TestSendAndWait(unittest.TestCase):
                 client.send_and_wait('conv_1', 'go', connect_timeout=0.2)
         finally:
             stop.set()
+
+
+class TestATurnTimeoutIsItsOwnError(unittest.TestCase):
+    """A turn that spent its whole budget raises SwarmTurnTimeout.
+
+    The runner retries a writer whose turn was LOST (a dropped stream,
+    a refused post) but not one that ran out of time, which would spend
+    a second full turn budget (#32). A subclass keeps every existing
+    ``except SwarmSessionError`` catching it.
+    """
+
+    _POST = 'POST /v1/sessions/conv_1/events'
+
+    def test_a_turn_past_its_deadline_is_a_turn_timeout(self) -> None:
+        t = FakeTransport(
+            {
+                self._POST: (202, {'queued': True}),
+                'GET /v1/sessions/conv_1': (200, {'status': 'running'}),
+                'GET /v1/sessions/conv_1/items': (200, {'data': []}),
+            },
+            stream_lines=_HEARTBEAT + _status_frame('running'),
+            gate_stream_on_post=True,
+            hold_open_s=2.0,
+        )
+        client = SwarmSessionClient('http://x:6767', transport=t)
+        with self.assertRaises(SwarmTurnTimeout):
+            client.send_and_wait('conv_1', 'go', timeout=0.5)
+
+    def test_a_wait_already_past_its_deadline_is_a_timeout(self) -> None:
+        # The other raise site: the loop's own deadline check, reached
+        # when handling an event carried the wait past the deadline.
+        # A controlled clock, because a real one lands in the silence
+        # handler first and a test racing it would be a flaky one.
+        reads = iter([0.0, 0.0])
+
+        def clock() -> float:
+            return next(reads, 100.0)
+
+        client = SwarmSessionClient(
+            'http://x:6767', transport=FakeTransport({})
+        )
+        events: queue.Queue[swarm_session._StreamEvent] = queue.Queue()
+        with mock.patch('sbx_omnigent.swarm_session.time.monotonic', clock):
+            with self.assertRaises(SwarmTurnTimeout):
+                client._await_terminal('s', events, 5)
+
+    def test_it_is_still_a_session_error(self) -> None:
+        self.assertTrue(issubclass(SwarmTurnTimeout, SwarmSessionError))
+
+    def _post_raising(self, cause: BaseException) -> SwarmSessionClient:
+        post = self._POST
+
+        class _PostFails(FakeTransport):
+            def request(self, method, url, *, headers, body, timeout):
+                if method == 'POST' and url.endswith('/events'):
+                    raise SwarmSessionError(
+                        f'POST {url} failed: {cause}'
+                    ) from cause
+                return super().request(
+                    method, url, headers=headers, body=body,
+                    timeout=timeout,
+                )
+
+        t = _PostFails({post: (202, {'queued': True})},
+                       stream_lines=_HEARTBEAT)
+        return SwarmSessionClient('http://x:6767', transport=t)
+
+    def test_a_post_that_waits_out_the_budget_is_a_turn_timeout(self):
+        # The post long-polls for the whole turn budget while a managed
+        # session provisions, so its socket timeout IS the turn's.
+        client = self._post_raising(TimeoutError('timed out'))
+        with self.assertRaises(SwarmTurnTimeout):
+            client.send_and_wait('conv_1', 'go', timeout=5)
+
+    def test_a_connect_timeout_on_the_post_is_a_turn_timeout(self) -> None:
+        # urllib wraps a connect-phase timeout in URLError.
+        client = self._post_raising(
+            urllib.error.URLError(TimeoutError('timed out'))
+        )
+        with self.assertRaises(SwarmTurnTimeout):
+            client.send_and_wait('conv_1', 'go', timeout=5)
+
+    def test_a_refused_post_is_not_a_turn_timeout(self) -> None:
+        client = self._post_raising(ConnectionRefusedError('refused'))
+        with self.assertRaises(SwarmSessionError) as caught:
+            client.send_and_wait('conv_1', 'go', timeout=5)
+        self.assertNotIsInstance(caught.exception, SwarmTurnTimeout)
+
+    def test_a_post_timeout_names_the_budget(self) -> None:
+        client = self._post_raising(TimeoutError('timed out'))
+        with self.assertRaises(SwarmTurnTimeout) as caught:
+            client.send_and_wait('conv_1', 'go', timeout=5)
+        self.assertIn('5s', caught.exception.format_message())
 
 
 _TERMINALS = 'GET /v1/sessions/conv_1/resources/terminals'

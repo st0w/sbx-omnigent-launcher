@@ -67,7 +67,11 @@ from sbx_omnigent.swarm import (
     credential_kind_for,
     mount_sentinel,
 )
-from sbx_omnigent.swarm_session import SwarmSessionClient, SwarmSessionError
+from sbx_omnigent.swarm_session import (
+    SwarmSessionClient,
+    SwarmSessionError,
+    SwarmTurnTimeout,
+)
 from sbx_omnigent.worktrees import (
     WorktreeManager,
     _repo_name,
@@ -627,6 +631,23 @@ _REVIEW_TURN_ATTEMPTS = 2
 #: stage.
 _REVIEW_RETRY_BACKOFF_S = 90.0
 
+#: Attempts at one writer's turn when the turn was LOST (see
+#: :class:`LostTurn`) rather than failed by the agent. Observed on a
+#: resume: both parallel writers failed within the same second with
+#: `failed: None`, their runners gone, and the implement stage was lost
+#: over work that was intact on disk (#32).
+#:
+#: Narrower than the reviewer retry on purpose. A writer's turn can run
+#: the whole turn budget, so a turn that TIMED OUT, or where the agent
+#: reported an error, is salvaged and not retried: a second attempt
+#: would spend a second full budget on what will likely fail again.
+_WRITER_TURN_ATTEMPTS = 2
+
+#: Seconds to wait before re-driving a writer whose turn was lost. The
+#: same reasoning as :data:`_REVIEW_RETRY_BACKOFF_S`: long enough to
+#: outlast a provider blip, and paid after the dead guest is freed.
+_WRITER_RETRY_BACKOFF_S = 90.0
+
 #: Asked of a reviewer that finished its turn without stating a verdict.
 #: Since reviewers were told to EXECUTE what they review, they install
 #: toolchains and run instrumented builds — work that outlives the turn,
@@ -1046,6 +1067,16 @@ _FROZEN_TESTS_CONTRACT = (
 
 class PipelineRunError(Exception):
     """A pipeline run failed (setup, a turn, or a git step)."""
+
+
+class LostTurn(PipelineRunError):
+    """
+    A turn that was lost rather than failed by its agent.
+
+    It failed with no error from the agent, or the runner under it went
+    offline. Nothing about it says the next attempt fails too, so a
+    writer retries it (see :data:`_WRITER_TURN_ATTEMPTS`).
+    """
 
 
 class _Blocked(Exception):
@@ -3073,6 +3104,76 @@ class RunResult:
     blocked_stage: str | None = None
     nodes: dict[str, NodeResult] = field(default_factory=dict)
     bindings: list[dict[str, str]] = field(default_factory=list)
+
+
+def _session_failure_note(snap: dict | None) -> str:
+    """
+    What the SESSION says about a turn that gave no reason.
+
+    A failed turn arrives as a status edge carrying no error, which the
+    runner then reports verbatim as ``failed: None`` — the least useful
+    sentence it can produce. The session itself is still readable at
+    that moment and carries three fields nobody consulted:
+    ``last_task_error`` (read only by the swarm CLI), ``runner_online``
+    (read nowhere at all), and ``sandbox_status``.
+
+    Reading them turns "failed: None" into a sentence, and separates the
+    two cases that matter: the AGENT failed, or its runner went away
+    underneath it.
+
+    :param snap: The session snapshot, or ``None`` when unreadable.
+    :returns: A note to append to the error, or ``''``.
+    """
+    if snap is None:
+        return ' (the session could not be read for a reason)'
+    bits: list[str] = []
+    err = snap.get('last_task_error')
+    if isinstance(err, str) and err.strip():
+        bits.append(f'last_task_error={err.strip()[:300]}')
+    if snap.get('runner_online') is False:
+        bits.append(
+            'its RUNNER IS OFFLINE — the turn did not fail so much '
+            'as lose the process running it'
+        )
+    sandbox = snap.get('sandbox_status')
+    if isinstance(sandbox, str) and sandbox:
+        bits.append(f'sandbox={sandbox}')
+    return f' ({"; ".join(bits)})' if bits else ''
+
+
+def _turn_was_lost(error: str | None, snap: dict | None) -> bool:
+    """
+    Whether a failed turn was lost rather than failed by its agent.
+
+    Lost means the runner under the turn went offline, or neither the
+    turn nor the session gives any error. An unreadable session with no
+    error on the turn reads as lost: "failed: None" is exactly the state
+    a retry is for, and the retry costs one turn.
+
+    :param error: The failed turn's error, if any.
+    :param snap: The session snapshot, or ``None`` when unreadable.
+    :returns: Whether the turn was lost.
+    """
+    snap = snap or {}
+    if snap.get('runner_online') is False:
+        return True
+    reported = snap.get('last_task_error')
+    return not (error and error.strip()) and not (
+        isinstance(reported, str) and reported.strip()
+    )
+
+
+def _lost_not_failed(exc: Exception) -> bool:
+    """
+    Whether a writer's failed turn is one worth a second attempt.
+
+    :param exc: What the turn raised.
+    :returns: ``True`` for a lost turn or a turn that never came back,
+        ``False`` for an agent error or a turn that ran out of time.
+    """
+    if isinstance(exc, SwarmSessionError):
+        return not isinstance(exc, SwarmTurnTimeout)
+    return isinstance(exc, LostTurn)
 
 
 class PipelineRunner:
@@ -7031,19 +7132,7 @@ class PipelineRunner:
                 self._wt.reseed_node_worktree(
                     self._run_id, stage.id, seed
                 )
-        assert node.session is not None
-        try:
-            node.output = self._drive(
-                node.session, self._writer_instruction(stage)
-            )
-        except PipelineRunError:
-            # The turn failed, but the agent may already have written
-            # real work into the worktree — a timeout can land AFTER
-            # most of a stage is done. Committing it puts that work on
-            # the node's branch, where it is durable and a resume picks
-            # it up, instead of dying with the worktree.
-            self._commit_partial(stage.id)
-            raise
+        self._drive_writer(stage, node)
         # A native-TUI writer (agy) keeps writing files after its turn
         # reports idle; wait for the worktree to settle so the commit
         # captures the finished tree, not an empty/partial one.
@@ -7058,6 +7147,67 @@ class PipelineRunner:
             self._enforce_tests_only(stage)
         self._require_implementation(stage)
         self._last_branch_node = stage.id
+
+    def _drive_writer(
+        self, stage: pipeline.PipelineStage, node: NodeResult
+    ) -> None:
+        """
+        Drive a writer's turn, retrying once if the turn was lost.
+
+        A failed turn is salvaged every time: the agent may already
+        have written real work into the worktree, and a timeout can
+        land AFTER most of a stage is done. Committing it puts that
+        work on the node's branch, where it is durable and a resume
+        picks it up, instead of dying with the worktree.
+
+        A LOST turn is then retried on a fresh VM mounting the same
+        worktree, which already holds the salvaged commit (see
+        :data:`_WRITER_TURN_ATTEMPTS` for what counts as lost). The
+        VM that lost it is freed first, and when it cannot be freed
+        (``--keep``, or a failed dispose) there is no retry: two agents
+        would be writing into one tree.
+
+        :param stage: The writer stage.
+        :param node: Its node, carrying a live session.
+        :raises PipelineRunError: If the turn failed and was not lost,
+            or the last attempt failed too.
+        :raises SwarmSessionError: Likewise, for a turn that never came
+            back.
+        """
+        for attempt in range(1, _WRITER_TURN_ATTEMPTS + 1):
+            assert node.session is not None
+            try:
+                node.output = self._drive(
+                    node.session, self._writer_instruction(stage)
+                )
+                return
+            except (PipelineRunError, SwarmSessionError) as exc:
+                # SwarmSessionError too: a turn timeout raises it, and
+                # salvaging only PipelineRunError lost exactly the work
+                # the salvage exists for.
+                self._commit_partial(stage.id)
+                if (
+                    attempt == _WRITER_TURN_ATTEMPTS
+                    or not _lost_not_failed(exc)
+                    or not self._free_session(
+                        node.session,
+                        f'{stage.id}: freeing the VM that lost its turn.',
+                    )
+                ):
+                    raise
+                click.echo(
+                    f'[retry] {stage.id}: attempt {attempt} was lost '
+                    f'({exc}); its work is committed to the node branch, '
+                    f'so waiting {_WRITER_RETRY_BACKOFF_S:.0f}s, then '
+                    f'booting a fresh VM on the same worktree.'
+                )
+                # AFTER the guest is freed, so an outage is not waited
+                # out while a dead VM holds its slot.
+                time.sleep(_WRITER_RETRY_BACKOFF_S)
+                assert node.worktree is not None
+                node.session = self._create_session(
+                    stage.run[0], node.worktree, 'rw', stage.id
+                )
 
     def _seed_ref(self, stage: pipeline.PipelineStage) -> str:
         """The hub ref this writer's branch was cut from."""
@@ -8779,7 +8929,8 @@ class PipelineRunner:
             self._verify_launch(session)
             self._record_harness_versions(session)
         if not result.ok:
-            note = self._session_failure_note(session)
+            snap = self._session_snapshot(session)
+            note = _session_failure_note(snap)
             pane_path = self._capture_turn(
                 session,
                 f'the turn failed: {result.error}{note}',
@@ -8797,7 +8948,11 @@ class PipelineRunner:
                 f' — see {pane_path}' if pane_path
                 else self._no_pane_note(session)
             )
-            raise PipelineRunError(
+            error = (
+                LostTurn if _turn_was_lost(result.error, snap)
+                else PipelineRunError
+            )
+            raise error(
                 f'turn on {session} failed: {result.error}{note}{where}'
             )
         return result.reply
@@ -8833,55 +8988,17 @@ class PipelineRunner:
             f"~/.omnigent/logs/runner/runner-*.log'. {kept})"
         )
 
-    def _session_failure_note(self, session: str) -> str:
+    def _session_snapshot(self, session: str) -> dict | None:
         """
-        What the SESSION says about a turn that gave no reason.
-
-        A failed turn arrives as a status edge carrying no error, which
-        the runner then reports verbatim as ``failed: None`` — the least
-        useful sentence it can produce. The session itself is still
-        readable at that moment and carries three fields nobody
-        consulted: ``last_task_error`` (read only by the swarm CLI),
-        ``runner_online`` (read nowhere at all), and ``sandbox_status``.
-
-        Reading them turns "failed: None" into a sentence, and separates
-        the two cases that matter: the AGENT failed, or its runner went
-        away underneath it.
+        The session's state after a failed turn, or ``None``.
 
         :param session: The session whose turn just failed.
-        :returns: A note to append to the error, or ``''``.
+        :returns: The snapshot, or ``None`` when it could not be read.
         """
         try:
-            snap = self._sc.get_status(session)
+            return self._sc.get_status(session)
         except SwarmSessionError:
-            return ' (the session could not be read for a reason)'
-        bits: list[str] = []
-        err = snap.get('last_task_error')
-        if isinstance(err, str) and err.strip():
-            bits.append(f'last_task_error={err.strip()[:300]}')
-        if snap.get('runner_online') is False:
-            bits.append(
-                'its RUNNER IS OFFLINE — the turn did not fail so much '
-                'as lose the process running it'
-            )
-        sandbox = snap.get('sandbox_status')
-        if isinstance(sandbox, str) and sandbox:
-            bits.append(f'sandbox={sandbox}')
-        return f' ({"; ".join(bits)})' if bits else ''
-
-    def _runner_vanished(self, session: str) -> bool:
-        """
-        Whether a failed turn lost its runner rather than failing.
-
-        :param session: The session whose turn just failed.
-        :returns: ``True`` when the runner is known to be offline.
-        """
-        try:
-            return self._sc.get_status(session).get('runner_online') is False
-        except SwarmSessionError:
-            # Unreadable is not evidence either way, and guessing "yes"
-            # would retry every genuine failure.
-            return False
+            return None
 
     def _require_fresh_swap(self, session: str) -> None:
         """

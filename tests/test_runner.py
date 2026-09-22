@@ -32,6 +32,7 @@ from sbx_omnigent.swarm_session import (
     SwarmSessionClient,
     SwarmSessionError,
     SwarmTurnResult,
+    SwarmTurnTimeout,
 )
 from sbx_omnigent.worktrees import WorktreeManager
 
@@ -362,6 +363,11 @@ class FakeSC:
         #: Labels whose turn never returns at all — send_and_wait
         #: raises, as a real turn timeout does.
         self.raise_labels: set[str] = set()
+        #: label -> outcomes for its next turns, one consumed per turn,
+        #: after which turns succeed: 'lost' (failed, no error), 'drop'
+        #: (the stream dropped), 'timeout', or 'error:<text>' (the
+        #: agent reported an error).
+        self.turn_outcomes: dict[str, list[str]] = {}
         #: Labels whose item store keeps GROWING between polls — a
         #: reviewer that is still working (installing a toolchain,
         #: running a build), as opposed to one that has gone quiet.
@@ -528,10 +534,24 @@ class FakeSC:
         if self._label.get(session, '') in self.interrupt_labels:
             raise KeyboardInterrupt
         if self._label.get(session, '') in self.raise_labels:
-            raise SwarmSessionError(
+            raise SwarmTurnTimeout(
                 f'turn on {session} did not complete within 3600s'
             )
         if self._label.get(session, '') in self.fail_labels:
+            return SwarmTurnResult('failed', None, '')
+        scripted = self.turn_outcomes.get(self._label.get(session, ''))
+        if scripted:
+            outcome = scripted.pop(0)
+            if outcome == 'drop':
+                raise SwarmSessionError(f'stream for {session} closed')
+            if outcome == 'timeout':
+                raise SwarmTurnTimeout(
+                    f'turn on {session} did not complete within 3600s'
+                )
+            if outcome.startswith('error:'):
+                return SwarmTurnResult(
+                    'failed', outcome.removeprefix('error:'), ''
+                )
             return SwarmTurnResult('failed', None, '')
         self.sent_calls.append({'session': session, 'label':
                                 self._label.get(session, ''), **kw})
@@ -612,6 +632,11 @@ class _Base(unittest.TestCase):
         backoff = mock.patch.object(R, '_REVIEW_RETRY_BACKOFF_S', 0.0)
         backoff.start()
         self.addCleanup(backoff.stop)
+        writer_backoff = mock.patch.object(
+            R, '_WRITER_RETRY_BACKOFF_S', 0.0
+        )
+        writer_backoff.start()
+        self.addCleanup(writer_backoff.stop)
         # Never `sbx exec` into a real VM. A test that resolves a
         # sandbox name would otherwise read the versions out of
         # whatever box on this machine answers to it (#17).
@@ -2235,8 +2260,11 @@ class TestTurnCapture(_Base):
             {c.args[0] for c in capture.call_args_list}, {'managed-h1'}
         )
         # And the error a human reads has to point at it — a bare
-        # "failed: None" is what cost a day on the codex-3 run.
-        self.assertIn('turns/build.pane.txt', str(caught.exception))
+        # "failed: None" is what cost a day on the codex-3 run. It is a
+        # lost turn, retried once (#32), so the error names the pane of
+        # the attempt that finally failed.
+        self.assertIn('turns/build-2.pane.txt', wt.artifacts)
+        self.assertIn('turns/build-2.pane.txt', str(caught.exception))
 
     def test_a_pane_read_that_raises_keeps_the_real_failure(self) -> None:
         # The turn failure is what a human needs; a diagnostic that
@@ -11187,6 +11215,160 @@ class TestTeardownPreservesAFailedRun(_Base):
         self.assertNotIn('r1', wt.disposed)
 
 
+class _BuildCannotBeFreed(FakeSC):
+    """Every `build` VM refuses to be disposed."""
+
+    def create(
+        self, *, agent_id, workspace=None, title=None,
+        terminal_launch_args=None, model_override=None,
+        reasoning_effort=None, parent_session_id=None,
+    ) -> str:
+        sid = super().create(
+            agent_id=agent_id, workspace=workspace, title=title,
+            terminal_launch_args=terminal_launch_args,
+            model_override=model_override,
+            reasoning_effort=reasoning_effort,
+            parent_session_id=parent_session_id,
+        )
+        if self.label_of(sid) == 'build':
+            self.dispose_raises.add(sid)
+        return sid
+
+
+class TestALostWriterTurnIsRetried(_Base):
+    """A writer whose turn was LOST gets one more on a fresh VM (#32).
+
+    On one resume both parallel writers failed within the same second
+    with `failed: None` and the implement stage was lost. Reviewers
+    already retry (#18); a writer retries only a lost turn: failed with
+    no error, its runner went offline, or its stream dropped. A turn
+    that ran out of time, or where the agent reported an error, is
+    salvaged and not retried, so no stage spends two turn budgets.
+    """
+
+    _REPLIES: ClassVar[dict[str, object]] = {
+        'tests': 'wrote tests', 'build': 'impl',
+    }
+
+    def _sc(self, *outcomes: str, status: dict | None = None) -> FakeSC:
+        sc = FakeSC(dict(self._REPLIES))
+        sc.turn_outcomes['build'] = list(outcomes)
+        if status is not None:
+            sc.status_for_label['build'] = status
+        return sc
+
+    @staticmethod
+    def _boots(sc: FakeSC) -> list[str]:
+        return [sid for sid, lb in sc._label.items() if lb == 'build']
+
+    def _fails(self, sc: FakeSC, wt: FakeWT | None = None, **kw) -> None:
+        with self.assertRaises((R.PipelineRunError, SwarmSessionError)):
+            self._run(_TDD, {}, sc=sc, wt=wt, **kw)
+
+    def test_a_lost_turn_is_retried_and_the_run_completes(self) -> None:
+        result, _sc, _wt = self._run(_TDD, {}, sc=self._sc('lost'))
+        self.assertEqual(result.status, 'completed')
+
+    def test_the_retry_boots_a_fresh_vm(self) -> None:
+        sc = self._sc('lost')
+        self._run(_TDD, {}, sc=sc)
+        self.assertEqual(len(self._boots(sc)), 2)
+
+    def test_the_vm_that_lost_its_turn_is_freed_first(self) -> None:
+        # Never two agents writing into one tree.
+        sc = self._sc('lost')
+        self._run(_TDD, {}, sc=sc)
+        order = [e for e in sc.events if e[1] == 'build'
+                 and e[0] in ('create', 'dispose')]
+        self.assertEqual(order[:3], [
+            ('create', 'build'), ('dispose', 'build'), ('create', 'build'),
+        ])
+
+    def test_the_retry_mounts_the_same_worktree(self) -> None:
+        sc = self._sc('lost')
+        self._run(_TDD, {}, sc=sc)
+        mounts = [c['workspace'] for c in sc.creates
+                  if sc.label_of(c['sid']) == 'build']
+        self.assertEqual(mounts[0], mounts[1])
+
+    def test_the_partial_work_is_committed_before_the_retry(self) -> None:
+        sc, wt = self._sc('lost'), FakeWT()
+        self._run(_TDD, {}, sc=sc, wt=wt)
+        partial = next(
+            i for i, c in enumerate(wt.commits)
+            if c[0] == 'build' and 'partial work' in c[1]
+        )
+        implemented = next(
+            i for i, c in enumerate(wt.commits)
+            if c[0] == 'build' and 'implement' in c[1]
+        )
+        self.assertLess(partial, implemented)
+
+    def test_a_runner_that_went_offline_is_retried(self) -> None:
+        # Even with an error on record: the process running the turn
+        # went away, so the error says nothing about the work.
+        sc = self._sc(
+            'error:runner disconnected',
+            status={'runner_online': False},
+        )
+        result, _sc, _wt = self._run(_TDD, {}, sc=sc)
+        self.assertEqual(result.status, 'completed')
+
+    def test_a_dropped_stream_is_retried(self) -> None:
+        result, _sc, _wt = self._run(_TDD, {}, sc=self._sc('drop'))
+        self.assertEqual(result.status, 'completed')
+
+    def test_the_retry_is_announced(self) -> None:
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            self._run(_TDD, {}, sc=self._sc('lost'))
+        said = ' '.join(str(c.args[0]) for c in echo.call_args_list)
+        self.assertIn('[retry] build', said)
+
+    def test_a_turn_timeout_is_not_retried(self) -> None:
+        sc = self._sc('timeout')
+        self._fails(sc)
+        self.assertEqual(len(self._boots(sc)), 1)
+
+    def test_an_agent_error_is_not_retried(self) -> None:
+        sc = self._sc('error:the model refused')
+        self._fails(sc)
+        self.assertEqual(len(self._boots(sc)), 1)
+
+    def test_an_error_on_the_session_is_an_agent_error(self) -> None:
+        # `failed: None` on the turn, but the session says why.
+        sc = self._sc('lost', status={'last_task_error': 'quota spent'})
+        self._fails(sc)
+        self.assertEqual(len(self._boots(sc)), 1)
+
+    def test_a_second_lost_turn_fails_the_stage(self) -> None:
+        sc = self._sc('lost', 'lost')
+        self._fails(sc)
+        self.assertEqual(len(self._boots(sc)), 2)
+
+    def test_keep_never_retries(self) -> None:
+        # --keep leaves the old VM up, and a second agent would write
+        # into the same tree as the first.
+        sc = self._sc('lost')
+        self._fails(sc, keep=True)
+        self.assertEqual(len(self._boots(sc)), 1)
+
+    def test_a_vm_that_cannot_be_freed_is_never_retried(self) -> None:
+        sc = _BuildCannotBeFreed(dict(self._REPLIES))
+        sc.turn_outcomes['build'] = ['lost']
+        self._fails(sc)
+        self.assertEqual(len(self._boots(sc)), 1)
+
+    def test_a_timed_out_writer_is_salvaged(self) -> None:
+        # A turn timeout raises SwarmSessionError, not PipelineRunError,
+        # and the salvage only caught the second: the work was never
+        # committed, and a resume re-cut the clone over it.
+        wt = FakeWT()
+        self._fails(self._sc('timeout'), wt=wt)
+        self.assertTrue(any(
+            c[0] == 'build' and 'partial work' in c[1] for c in wt.commits
+        ))
+
+
 class TestPartialWorkSalvage(_Base):
     """A failed turn must not take the agent's work down with it."""
 
@@ -11211,7 +11393,9 @@ class TestPartialWorkSalvage(_Base):
         partials = [
             c for c in wt.commits if 'partial work' in c[1]
         ]
-        self.assertEqual([c[0] for c in partials], ['build'])
+        # Once per attempt: `failed: None` is a lost turn, which a
+        # writer retries once (#32), and each attempt is salvaged.
+        self.assertEqual([c[0] for c in partials], ['build', 'build'])
 
     def test_partial_commit_is_attributed_to_the_node(self) -> None:
         # The NODE, never the agent — a judge reads this out of git log

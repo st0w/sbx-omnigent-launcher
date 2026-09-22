@@ -586,6 +586,31 @@ class SwarmSessionError(click.ClickException):
     """A swarm-session operation failed (HTTP, timeout, or protocol)."""
 
 
+class SwarmTurnTimeout(SwarmSessionError):
+    """
+    A turn spent its whole budget without completing.
+
+    Distinct from a turn that was LOST (a dropped stream, a refused
+    post): retrying a lost turn costs one turn, retrying this one costs
+    a second full budget, and the runner retries only the first (#32).
+    """
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """
+    Whether *exc* was caused by a socket timeout.
+
+    :param exc: A transport error, usually a :class:`SwarmSessionError`
+        raised ``from`` the urllib failure.
+    :returns: ``True`` for a read timeout (``TimeoutError``) or a
+        connect timeout (``URLError`` wrapping one).
+    """
+    cause: object = exc.__cause__
+    if isinstance(cause, urllib.error.URLError):
+        cause = cause.reason
+    return isinstance(cause, TimeoutError)
+
+
 @dataclass(frozen=True)
 class SwarmTurnResult:
     """
@@ -1630,7 +1655,18 @@ class SwarmSessionClient:
             # The post long-polls while a managed session provisions
             # (returns only when the runner binds), so give it the full
             # turn budget rather than the short unary default.
-            self._post_message(session_id, message, timeout=timeout)
+            try:
+                self._post_message(session_id, message, timeout=timeout)
+            except SwarmSessionError as exc:
+                if not _is_timeout(exc):
+                    raise
+                # Its socket timeout is the turn budget, so this turn
+                # has spent it, the same as one that ran past it.
+                raise SwarmTurnTimeout(
+                    f'turn on {session_id} did not start within '
+                    f'{timeout:.0f}s: the message post waited the whole '
+                    f'turn budget for a runner'
+                ) from exc
             result, started = self._await_terminal(
                 session_id,
                 events,
@@ -1867,7 +1903,7 @@ class SwarmSessionClient:
         while True:
             now = time.monotonic()
             if now >= deadline:
-                raise SwarmSessionError(
+                raise SwarmTurnTimeout(
                     f'turn on {session_id} did not complete within '
                     f'{timeout:.0f}s'
                 )
@@ -1941,7 +1977,7 @@ class SwarmSessionClient:
                 SwarmTurnResult(_STATUS_FAILED, None, wait_state.reply),
                 False,
             )
-        raise SwarmSessionError(
+        raise SwarmTurnTimeout(
             f'turn on {session_id} did not complete within {timeout:.0f}s'
         ) from None
 

@@ -502,6 +502,15 @@ the commit step comes *after* the turn, so a stage that produced a complete
 test suite and then overran its budget would leave an empty branch and a full
 worktree.
 
+**A writer whose turn was lost gets one more.** A turn is lost when it failed
+with no error from the agent (`failed: None`), its runner went offline, or its
+stream dropped. The runner commits the partial work, frees that VM, waits 90
+seconds, and drives the stage again on a fresh VM mounting the same worktree. A
+turn that ran out of time, or where the agent reported an error, is not
+retried: a second attempt would spend a second full turn budget on something
+likely to fail the same way. Nor is a turn under `--keep`, or one whose VM
+could not be freed, since two agents would then be writing into one tree.
+
 **A run that does not finish keeps its directory.** Teardown always disposes the
 microVMs — they are expensive and useless once the process ends — but the run
 directory holds the hub clone with every node branch, plus `state.json`, and
