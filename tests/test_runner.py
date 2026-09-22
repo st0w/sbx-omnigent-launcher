@@ -11,6 +11,7 @@ Run: .venv/bin/python -m unittest tests.test_runner
 from __future__ import annotations
 
 import contextlib
+import io
 import shutil
 import subprocess
 import tempfile
@@ -27,7 +28,12 @@ from click.testing import CliRunner, Result
 
 from sbx_omnigent import pipeline
 from sbx_omnigent import runner as R
-from sbx_omnigent.swarm_session import SwarmSessionError, SwarmTurnResult
+from sbx_omnigent.swarm_session import (
+    SwarmSessionClient,
+    SwarmSessionError,
+    SwarmTurnResult,
+)
+from sbx_omnigent.worktrees import WorktreeManager
 
 
 def _assert_plan_committed(case, wt, worktree, path, marker):
@@ -614,6 +620,15 @@ class _Base(unittest.TestCase):
         )
         self.read_versions = versions.start()
         self.addCleanup(versions.stop)
+        # Never read this host's snapshot store or run its `sbx ls`. A
+        # disk refusal names leaked guest disks, and without this the
+        # six tests that refuse asked the real sbx on whatever machine
+        # ran the suite, and depended on its store.
+        advice = mock.patch.object(
+            R.orphans, 'orphan_advice', return_value=None
+        )
+        self.orphan_advice = advice.start()
+        self.addCleanup(advice.stop)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
@@ -9285,9 +9300,14 @@ class TestResumeReclaimsBeforeMeasuring(_Base):
         def __init__(self, state):
             self._state = state
             self.removed: list[tuple[str, list[str]]] = []
+            self.written: list[dict] = []
 
         def read_run_state(self, run_id):
             return self._state
+
+        def write_run_state(self, run_id, payload):
+            self.written.append(payload)
+            return True
 
         def dispose_node_worktrees(self, run_id, node_ids):
             self.removed.append((run_id, list(node_ids)))
@@ -9354,6 +9374,88 @@ class TestResumeReclaimsBeforeMeasuring(_Base):
     def test_no_state_means_nothing_to_do(self) -> None:
         freed, sc, _wt, _said = self._reclaim(None)
         self.assertEqual((freed, sc.disposed), (0, []))
+
+    def test_disposed_vms_leave_the_run_state(self) -> None:
+        # Left in, the runner disposed every one a second time and
+        # logged that as success, since a 404 counts as disposed (#32).
+        _f, _sc, wt, _said = self._reclaim(self._state())
+        self.assertEqual(wt.written[-1]['sessions'], [])
+
+    def test_a_vm_that_failed_to_dispose_stays_tracked(self) -> None:
+        # It may still be up, so the runner's own pass tries it again.
+        _f, _sc, wt, _said = self._reclaim(
+            self._state(), sc=self._SC(raises={'s1'})
+        )
+        self.assertEqual(wt.written[-1]['sessions'], ['s1'])
+
+    def test_the_rest_of_the_state_is_kept(self) -> None:
+        state = self._state()
+        _f, _sc, wt, _said = self._reclaim(dict(state))
+        self.assertEqual(wt.written[-1], {**state, 'sessions': []})
+
+    def test_keep_rewrites_nothing(self) -> None:
+        _f, _sc, wt, _said = self._reclaim(self._state(), keep=True)
+        self.assertEqual(wt.written, [])
+
+    def test_no_sessions_rewrites_nothing(self) -> None:
+        _f, _sc, wt, _said = self._reclaim(self._state(sessions=[]))
+        self.assertEqual(wt.written, [])
+
+
+class _DisposeRecorder(SwarmSessionClient):
+    """A session client that only records what it disposes."""
+
+    def __init__(self) -> None:
+        super().__init__('http://unused')
+        self.disposed: list[str] = []
+
+    def dispose(self, session_id: str) -> None:
+        self.disposed.append(session_id)
+
+
+class TestAResumeDisposesEachVmOnce(_Base):
+    """The reclaim and the runner's own pass used to dispose the same
+    sessions, so a resume logged `disposed N/N` twice (#32)."""
+
+    def test_each_vm_is_disposed_once_across_both_passes(self) -> None:
+        wm = WorktreeManager(
+            canonical_root=str(self.root / 'c'),
+            worktree_root=str(self.root / 'w'),
+        )
+        wm.write_run_state('r1', {
+            'version': R.RUN_STATE_VERSION,
+            'sessions': ['s1', 's2'],
+        })
+        sc = _DisposeRecorder()
+        R.reclaim_for_resume(
+            run_id='r1', canonical_root=str(self.root / 'c'),
+            worktree_root=str(self.root / 'w'), server='http://x',
+            keep=False, default_branch='main', client=sc, manager=wm,
+            echo=lambda _line: None,
+        )
+        cfg = self._cfg(_LINEAR)
+        runner = R.PipelineRunner(
+            cfg, session_client=sc, worktree_manager=wm, run_id='r1',
+            agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            runner._load_state()
+        self.assertEqual(sc.disposed, ['s1', 's2'])
+
+
+class TestADiskRefusalNamesLeakedDisks(_Base):
+    def test_the_orphan_advice_is_in_the_refusal(self) -> None:
+        # Nothing checked this: the advice could be dropped from the
+        # message and every test stayed green.
+        self.orphan_advice.return_value = '3 leaked guest disk(s)'
+        with self.assertRaises(click.ClickException) as caught:
+            R.preflight_disk(
+                self._cfg(_LINEAR), usage=lambda _p: _Usage(0)
+            )
+        self.assertIn(
+            '3 leaked guest disk(s)', caught.exception.format_message()
+        )
 
 
 class TestPreflightIsResumeAware(_Base):
