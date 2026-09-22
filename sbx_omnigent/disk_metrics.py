@@ -41,7 +41,18 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol
+
+
+class DiskUsage(Protocol):
+    """What :func:`shutil.disk_usage` returns, as far as this reads."""
+
+    @property
+    def free(self) -> int:
+        """Free bytes on the filesystem."""
+        ...
 
 #: Set to any non-empty value to record. See the module docstring for
 #: why this is not on by default.
@@ -66,7 +77,7 @@ def dir_bytes(
     path: str | Path,
     *,
     timeout_s: float = DEFAULT_TIMEOUT_S,
-    run: object = subprocess.run,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> int | None:
     """
     Disk a directory occupies, in bytes, or ``None``.
@@ -81,7 +92,7 @@ def dir_bytes(
     :returns: Bytes, or ``None`` when it could not be measured.
     """
     try:
-        proc = run(  # type: ignore[operator]
+        proc = run(
             ['du', '-skx', str(path)],
             capture_output=True,
             text=True,
@@ -130,8 +141,8 @@ def sample(
     free_path: str | Path | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
     now: float | None = None,
-    measure: object = dir_bytes,
-    usage: object = shutil.disk_usage,
+    measure: Callable[..., int | None] = dir_bytes,
+    usage: Callable[[str | Path], DiskUsage] = shutil.disk_usage,
 ) -> list[dict]:
     """
     One measurement of everything a run is holding right now.
@@ -160,7 +171,7 @@ def sample(
         base['chunk'] = chunk
     out: list[dict] = []
     for child in node_dirs(run_dir):
-        size = measure(child, timeout_s=timeout_s)  # type: ignore[operator]
+        size = measure(child, timeout_s=timeout_s)
         if size is None:
             continue
         rec = {**base, 'what': 'worktree', 'node': child.name, 'bytes': size}
@@ -176,7 +187,7 @@ def sample(
         try:
             out.append(
                 {**base, 'what': 'host-free',
-                 'bytes': usage(free_path).free}  # type: ignore[operator]
+                 'bytes': usage(free_path).free}
             )
         except OSError:
             pass

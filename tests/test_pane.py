@@ -1,9 +1,9 @@
-# ruff: noqa: RUF001
 """Tests for reading a native harness's TUI pane out of its VM.
 
-The pointer glyphs below are the real characters these CLIs draw;
-RUF001 is silenced file-wide because swapping them for ASCII would stop
-these fixtures being captures."""
+The pointer glyphs below are the real characters these CLIs draw. The
+heavy right-pointing angle (U+276F) is written as an escape: it reads as
+a greater-than sign in source, and swapping it for ASCII would stop the
+fixtures being captures."""
 
 from __future__ import annotations
 
@@ -13,26 +13,37 @@ import unittest
 from sbx_omnigent import pane
 
 
-class _Proc:
-    """Minimal stand-in for a CompletedProcess."""
+class _Proc(subprocess.CompletedProcess[str]):
+    """A finished process with the given output."""
 
     def __init__(self, stdout: str = '', returncode: int = 0) -> None:
-        self.stdout = stdout
-        self.returncode = returncode
+        super().__init__(args=[], returncode=returncode, stdout=stdout)
 
 
-def _runner(proc=None, raises=None):
-    """A subprocess.run stand-in that records its argv."""
-    calls: list[list[str]] = []
+class _Runner:
+    """A subprocess.run stand-in that records each argv."""
 
-    def run(argv, **kwargs):
-        calls.append(argv)
-        if raises is not None:
-            raise raises
-        return proc if proc is not None else _Proc()
+    def __init__(
+        self,
+        proc: _Proc | None = None,
+        raises: BaseException | None = None,
+    ) -> None:
+        self.calls: list[list[str]] = []
+        self._proc = proc if proc is not None else _Proc()
+        self._raises = raises
 
-    run.calls = calls  # type: ignore[attr-defined]
-    return run
+    def __call__(self, argv: list[str], **kwargs: object) -> _Proc:
+        self.calls.append(argv)
+        if self._raises is not None:
+            raise self._raises
+        return self._proc
+
+
+def _runner(
+    proc: _Proc | None = None, raises: BaseException | None = None
+) -> _Runner:
+    """A recording runner returning *proc*, or raising *raises*."""
+    return _Runner(proc, raises)
 
 
 class TestCaptureScript(unittest.TestCase):
@@ -135,7 +146,7 @@ Use up/down to move, press enter to confirm"""
 
 CLAUDE_TRUST = """ Quick safety check: is this a project you trust?
 
- ❯ 1. Yes, I trust this folder
+ \u276f 1. Yes, I trust this folder
    2. No, exit
 
  Enter to confirm · Esc to cancel"""
@@ -143,12 +154,12 @@ CLAUDE_TRUST = """ Quick safety check: is this a project you trust?
 CLAUDE_APIKEY = """    Detected a custom API key in your environment
 
       1. Yes
-    ❯ 2. No (recommended)
+    \u276f 2. No (recommended)
 
     Enter to confirm · Esc to cancel"""
 
 HEALTHY = """● Auto mode lets Claude handle permission prompts automatically.
-❯ Reply with exactly: OK
+\u276f Reply with exactly: OK
   ⏵⏵ don't ask on (shift+tab to cycle)"""
 
 

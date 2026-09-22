@@ -51,6 +51,8 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
+from sbx_omnigent import agy
+
 #: Harness ids that mean "this agent runs the Codex CLI". Mirrors
 #: :data:`sbx_omnigent.agy.AGY_HARNESSES`; the launcher and swarm use it
 #: to decide which credential a VM gets.
@@ -286,7 +288,4 @@ def redact(text: str) -> str:
     :param text: Raw captured output.
     :returns: Text safe to surface in an error message.
     """
-    # Local by necessity: a module-level import here is a cycle.
-    from sbx_omnigent import agy  # noqa: PLC0415
-
     return agy.detail(_JWT_RE.sub('<jwt-redacted>', text))

@@ -11,20 +11,26 @@ subscribe-before-post ordering. Run:
 from __future__ import annotations
 
 import contextlib
+import http.server
 import json
+import os
+import queue
+import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from collections.abc import Iterator
 from unittest import mock
 
-from sbx_omnigent import pipeline
+from sbx_omnigent import pipeline, swarm_session
 from sbx_omnigent.runner import main as runner_main
 from sbx_omnigent.swarm_session import (
     _DEFAULT_TERMINAL_SETTLE_S,
     _PLAN_APPROVAL_PHRASES,
     SwarmSessionClient,
     SwarmSessionError,
+    UrllibTransport,
     _approved_plan_text,
     _assistant_reply_items,
     _elicitation_ids,
@@ -355,6 +361,240 @@ _HEARTBEAT = [
     'data: {"type":"session.heartbeat"}',
     '',
 ]
+
+
+class _Handler(http.server.BaseHTTPRequestHandler):
+    """A tiny server: JSON, a stream, and a 404."""
+
+    def do_GET(self) -> None:
+        if self.path == '/v1/thing':
+            self._reply(200, b'{"ok": true}')
+        elif self.path == '/stream':
+            self._reply(200, b'data: one\ndata: two\n')
+        else:
+            self._reply(404, b'{"error": "nope"}')
+
+    def _reply(self, status: int, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+
+class TestUrllibTransportOnlySpeaksHttp(unittest.TestCase):
+    """The transport opens http and https URLs and nothing else.
+
+    ``urllib.request.urlopen`` also opens ``file://``, ``ftp://`` and
+    ``data:`` URLs. Every URL here is the configured server address
+    plus an API path, so the transport uses an opener that cannot open
+    anything else.
+    """
+
+    def setUp(self) -> None:
+        self.server = http.server.ThreadingHTTPServer(
+            ('127.0.0.1', 0), _Handler
+        )
+        thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True
+        )
+        thread.start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.base = f'http://127.0.0.1:{self.server.server_port}'
+
+    def _secret_file(self) -> str:
+        fd, path = tempfile.mkstemp()
+        os.write(fd, b'secret')
+        os.close(fd)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_a_request_reaches_the_server(self) -> None:
+        status, body = UrllibTransport().request(
+            'GET', f'{self.base}/v1/thing', headers={}, body=None,
+            timeout=5,
+        )
+        self.assertEqual((status, json.loads(body)), (200, {'ok': True}))
+
+    def test_an_http_error_is_returned_not_raised(self) -> None:
+        status, _body = UrllibTransport().request(
+            'GET', f'{self.base}/missing', headers={}, body=None,
+            timeout=5,
+        )
+        self.assertEqual(status, 404)
+
+    def test_a_stream_is_read_line_by_line(self) -> None:
+        lines = list(UrllibTransport().iter_lines(
+            f'{self.base}/stream', headers={}, read_timeout=5
+        ))
+        self.assertEqual(lines, ['data: one\n', 'data: two\n'])
+
+    def test_a_non_http_url_is_refused(self) -> None:
+        path = self._secret_file()
+        for url in (f'file://{path}', 'ftp://example.com/x',
+                    'data:,secret', 'localhost:6767/v1', ''):
+            with self.subTest(url=url):
+                with self.assertRaises(SwarmSessionError):
+                    UrllibTransport().request(
+                        'GET', url, headers={}, body=None, timeout=5
+                    )
+                with self.assertRaises(SwarmSessionError):
+                    list(UrllibTransport().iter_lines(
+                        url, headers={}, read_timeout=5
+                    ))
+
+    def test_a_missing_stream_fails_rather_than_yielding_the_error(
+        self,
+    ) -> None:
+        # An HTTP error on the stream is a failure to open it, not a
+        # body to parse as events.
+        with self.assertRaises(SwarmSessionError):
+            list(UrllibTransport().iter_lines(
+                f'{self.base}/missing', headers={}, read_timeout=5
+            ))
+
+    def test_the_transport_cannot_read_a_file_past_its_check(self) -> None:
+        # With the scheme check out of the way, the transport's own
+        # opener is what refuses a local file.
+        path = self._secret_file()
+        with mock.patch.object(
+            swarm_session, '_HTTP_SCHEMES',
+            frozenset({'http', 'https', 'file'}),
+        ):
+            with self.assertRaises(SwarmSessionError):
+                UrllibTransport().request(
+                    'GET', f'file://{path}', headers={}, body=None,
+                    timeout=5,
+                )
+            with self.assertRaises(SwarmSessionError):
+                list(UrllibTransport().iter_lines(
+                    f'file://{path}', headers={}, read_timeout=5
+                ))
+
+    def test_the_opener_itself_cannot_read_a_file(self) -> None:
+        # Independent of the scheme check: the handler that would read
+        # a local file is not in the opener at all.
+        path = self._secret_file()
+        opener = swarm_session._http_only_opener()
+        for url in (f'file://{path}', 'data:,secret'):
+            with self.subTest(url=url):
+                with self.assertRaises(urllib.error.URLError) as caught:
+                    opener.open(url, timeout=5)
+                self.assertIn('unknown url type', str(caught.exception))
+
+
+class TestTurnWaitTiming(unittest.TestCase):
+    """The turn wait's clocks, driven directly with timed events.
+
+    Each case feeds `_await_terminal` a scripted event stream on a
+    schedule, so the watchdogs and graces that only matter over time
+    are pinned by behaviour rather than read off the code.
+    """
+
+    def _client(self) -> SwarmSessionClient:
+        return SwarmSessionClient('http://x:6767', transport=FakeTransport({}))
+
+    @staticmethod
+    def _feed(
+        events: queue.Queue[swarm_session._StreamEvent],
+        script: list[tuple[float, swarm_session._StreamEvent]],
+    ) -> threading.Thread:
+        """Put each event on *events* at its offset in seconds."""
+        def run() -> None:
+            start = time.monotonic()
+            for at, event in script:
+                time.sleep(max(0.0, start + at - time.monotonic()))
+                events.put(event)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread
+
+    def _await(self, script, **kw):
+        events: queue.Queue[swarm_session._StreamEvent] = queue.Queue()
+        feeder = self._feed(events, script)
+        try:
+            return self._client()._await_terminal('s', events, **kw)
+        finally:
+            feeder.join(timeout=5)
+
+    E = swarm_session._StreamEvent
+
+    def test_a_running_edge_reopens_a_pending_grace(self) -> None:
+        # agy: completed, then an id-less idle before any reply arms a
+        # short grace. A running edge means the turn resumed, so the
+        # grace must not end it; the late reply is the real one.
+        result, started = self._await([
+            (0.0, self.E('completed')),
+            (0.0, self.E('status', status='idle')),
+            (0.02, self.E('status', status='running')),
+            (0.4, self.E('reply', reply='the real reply')),
+            (0.4, self.E('status', status='idle')),
+        ], timeout=5, idle_reply_grace=0.1)
+        self.assertEqual(result.reply, 'the real reply')
+        self.assertTrue(started)
+
+    def test_an_empty_reply_is_not_a_start(self) -> None:
+        # agy emits an empty delta as a cold-start cascade rotates away.
+        # Counting it as a start disarms the stall watchdog, and the
+        # turn then waits out its whole budget.
+        result, started = self._await(
+            [(0.0, self.E('reply', reply=''))],
+            timeout=5, stall_grace_s=0.3,
+        )
+        self.assertEqual(result.status, 'failed')
+        self.assertFalse(started)
+
+    def test_any_frame_restarts_the_stall_clock(self) -> None:
+        # Status edges before the turn starts are activity: a cold TUI's
+        # early chatter must not burn the stall grace.
+        script = [
+            (0.1 * i, self.E('status', status='running'))
+            for i in range(1, 8)
+        ]
+        script += [
+            (0.8, self.E('reply', reply='done')),
+            (0.8, self.E('status', status='idle')),
+        ]
+        result, started = self._await(script, timeout=5, stall_grace_s=0.3)
+        self.assertEqual((result.status, result.reply), ('idle', 'done'))
+        self.assertTrue(started)
+
+    def test_an_approval_restarts_the_silence_clock(self) -> None:
+        # After a prompt is approved the turn is moving again. Measuring
+        # silence from before the approval would call it abandoned
+        # while it is working.
+        client = self._client()
+        calls: list[str] = []
+        start = time.monotonic()
+
+        def classify(_session_id: str) -> tuple[str, str]:
+            elapsed = time.monotonic() - start
+            if 'asking' not in calls and elapsed >= 0.6:
+                calls.append('asking')
+                return 'asking', 'Allow Bash?'
+            if 'asking' in calls:
+                return 'abandoned', ''
+            return 'working', ''
+
+        events: queue.Queue[swarm_session._StreamEvent] = queue.Queue()
+        feeder = self._feed(events, [
+            (0.0, self.E('reply', reply='started')),
+            (1.3, self.E('status', status='idle', response_id='r1')),
+        ])
+        with (
+            mock.patch.object(swarm_session, '_IDLE_CONFIRM_S', 0.1),
+            mock.patch.object(swarm_session, '_ABANDON_CONFIRM_S', 1.0),
+            mock.patch.object(client, '_classify_settled', classify),
+            mock.patch.object(client, '_approve_pending', return_value=1),
+        ):
+            result, started = client._await_terminal('s', events, 5)
+        feeder.join(timeout=5)
+        self.assertEqual((result.status, result.reply), ('idle', 'started'))
+        self.assertTrue(started)
 
 
 class TestParseSse(unittest.TestCase):
@@ -1074,7 +1314,13 @@ class TestSendAndWait(unittest.TestCase):
         stop = threading.Event()
 
         class _HangingTransport(FakeTransport):
-            def iter_lines(self, url, *, headers, read_timeout):  # type: ignore[no-untyped-def]
+            def iter_lines(
+                self,
+                url: str,
+                *,
+                headers: dict[str, str],
+                read_timeout: float,
+            ) -> Iterator[str]:
                 stop.wait(timeout=2)
                 return
                 yield  # unreachable; makes this a generator

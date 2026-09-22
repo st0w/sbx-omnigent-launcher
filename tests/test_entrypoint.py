@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import io
 import os
+import types
 import unittest
 from typing import ClassVar
 from unittest import mock
 
-from sbx_omnigent._compat import load_agy_bridge
+from sbx_omnigent.defaults import DEFAULT_EGRESS_ALLOW
 from sbx_omnigent.entrypoint import (
     _BUILTIN_AGENT_DIRS_ENV,
     _NO_SWARM_AGENTS_ENV,
@@ -28,10 +29,7 @@ from sbx_omnigent.entrypoint import (
     register_bundled_agents,
     warn_on_global_allow_rules,
 )
-from sbx_omnigent.launcher import (
-    DEFAULT_EGRESS_ALLOW,
-    DEFAULT_PROVISION_STAGGER_S,
-)
+from sbx_omnigent.launcher import DEFAULT_PROVISION_STAGGER_S
 
 
 class TestBundledAgentDirs(unittest.TestCase):
@@ -213,23 +211,39 @@ class TestAgyEnterprisePatch(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _as_bool(bad, 'x')
 
-    def test_patch_forces_enterprise_true(self) -> None:
-        # Resolved through the shim, not a fixed module path: the
-        # bridge moved when Omnigent regrouped its top-level modules,
-        # and a test that names one path would only prove the patch
-        # works on one release.
-        bridge = load_agy_bridge()
-        if bridge is None:
-            self.skipTest('this Omnigent ships no agy bridge')
+    @staticmethod
+    def _bridge(state: object) -> types.SimpleNamespace:
+        """A stand-in agy bridge carrying *state* as its seed."""
+        return types.SimpleNamespace(_AGY_ONBOARDING_COMPLETE_STATE=state)
 
-        state = bridge._AGY_ONBOARDING_COMPLETE_STATE
-        original = state.get('enterpriseOnboardingComplete')
-        try:
-            state['enterpriseOnboardingComplete'] = False
+    def _patch_with(self, bridge: types.SimpleNamespace | None) -> None:
+        with mock.patch(
+            'sbx_omnigent.entrypoint.load_agy_bridge', return_value=bridge
+        ):
             install_agy_enterprise_onboarding_patch()
-            self.assertIs(state['enterpriseOnboardingComplete'], True)
-        finally:
-            state['enterpriseOnboardingComplete'] = original
+
+    def test_patch_forces_enterprise_true(self) -> None:
+        # A stand-in bridge, so this runs whether or not the installed
+        # Omnigent ships one; the shim that finds the real one is
+        # tested in tests/test_compat.py.
+        state: dict[str, object] = {'enterpriseOnboardingComplete': False}
+        self._patch_with(self._bridge(state))
+        self.assertIs(state['enterpriseOnboardingComplete'], True)
+
+    def test_patch_leaves_other_seed_keys_alone(self) -> None:
+        state: dict[str, object] = {
+            'enterpriseOnboardingComplete': False, 'other': 'kept',
+        }
+        self._patch_with(self._bridge(state))
+        self.assertEqual(state['other'], 'kept')
+
+    def test_patch_no_op_when_the_seed_is_not_a_mapping(self) -> None:
+        # A bridge whose constant changed shape must not break startup.
+        bridge = self._bridge(('not', 'a', 'dict'))
+        self._patch_with(bridge)
+        self.assertEqual(
+            bridge._AGY_ONBOARDING_COMPLETE_STATE, ('not', 'a', 'dict')
+        )
 
     def test_patch_no_op_when_bridge_missing(self) -> None:
         # An Omnigent with no agy bridge under ANY known path ->

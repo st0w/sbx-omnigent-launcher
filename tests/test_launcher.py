@@ -16,12 +16,13 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Sequence
 from unittest import mock
 
 import click
 
 from sbx_omnigent import launcher as launcher_mod
-from sbx_omnigent._compat import repo_workspace
+from sbx_omnigent._compat import RepoWorkspaceLike, repo_workspace
 from sbx_omnigent.launcher import _MOUNT_SENTINEL_PREFIX, SbxLauncher
 
 
@@ -233,15 +234,25 @@ class TestStartHostDispatch(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
 
-    def _run(self, **kwargs: object) -> str:
-        defaults: dict[str, object] = {
-            'token': 't',
-            'host_id': 'h',
-            'host_name': 'n',
-            'server_url': 'http://x:6767',
-        }
-        defaults.update(kwargs)
-        return self.launcher.start_host('box', **defaults)  # type: ignore[arg-type]
+    def _run(
+        self,
+        *,
+        repos: Sequence[RepoWorkspaceLike] = (),
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+    ) -> str:
+        return self.launcher.start_host(
+            'box',
+            token='t',
+            host_id='h',
+            host_name='n',
+            server_url='http://x:6767',
+            repos=repos,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+        )
 
     def test_sentinel_rw_mounts_worktree(self) -> None:
         with (
@@ -547,15 +558,25 @@ class TestStartHostRepoSequenceShape(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
 
-    def _run(self, **kwargs: object) -> str:
-        defaults: dict[str, object] = {
-            'token': 't',
-            'host_id': 'h',
-            'host_name': 'n',
-            'server_url': 'http://x:6767',
-        }
-        defaults.update(kwargs)
-        return self.launcher.start_host('box', **defaults)  # type: ignore[arg-type]
+    def _run(
+        self,
+        *,
+        repos: Sequence[RepoWorkspaceLike] = (),
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+    ) -> str:
+        return self.launcher.start_host(
+            'box',
+            token='t',
+            host_id='h',
+            host_name='n',
+            server_url='http://x:6767',
+            repos=repos,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+        )
 
     def test_sentinel_rw_mounts_worktree(self) -> None:
         repo = repo_workspace(_sentinel(self.swarm), 'rw', 'swarm-a')
@@ -661,7 +682,14 @@ def _upstream_repos_start_host(
 class TestDelegationBindsToUpstreamSignature(unittest.TestCase):
     """What we send upward must bind to the new base's parameters."""
 
-    def _sent(self, **kwargs: object) -> dict[str, object]:
+    def _sent(
+        self,
+        *,
+        repos: Sequence[RepoWorkspaceLike] = (),
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+    ) -> dict[str, object]:
         launcher = SbxLauncher()
         with (
             mock.patch.object(launcher, '_create_sandbox'),
@@ -683,7 +711,10 @@ class TestDelegationBindsToUpstreamSignature(unittest.TestCase):
                 host_id='h',
                 host_name='n',
                 server_url='http://x:6767',
-                **kwargs,  # type: ignore[arg-type]
+                repos=repos,
+                repo_url=repo_url,
+                repo_branch=repo_branch,
+                repo_name=repo_name,
             )
         return dict(base.call_args.kwargs)
 
@@ -720,7 +751,15 @@ class TestBaseDelegationShape(unittest.TestCase):
     def setUp(self) -> None:
         self.launcher = SbxLauncher()
 
-    def _delegate(self, *, takes_repos: bool, **kwargs: object) -> mock.Mock:
+    def _delegate(
+        self,
+        *,
+        takes_repos: bool,
+        repos: Sequence[RepoWorkspaceLike] = (),
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+    ) -> mock.Mock:
         """Run the non-sentinel path and return the base-class mock."""
         with (
             mock.patch.object(self.launcher, '_create_sandbox'),
@@ -742,7 +781,10 @@ class TestBaseDelegationShape(unittest.TestCase):
                 host_id='h',
                 host_name='n',
                 server_url='http://x:6767',
-                **kwargs,  # type: ignore[arg-type]
+                repos=repos,
+                repo_url=repo_url,
+                repo_branch=repo_branch,
+                repo_name=repo_name,
             )
         return base
 

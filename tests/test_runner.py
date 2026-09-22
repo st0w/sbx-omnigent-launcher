@@ -2222,6 +2222,21 @@ class TestTurnCapture(_Base):
         # "failed: None" is what cost a day on the codex-3 run.
         self.assertIn('turns/build.pane.txt', str(caught.exception))
 
+    def test_a_pane_read_that_raises_keeps_the_real_failure(self) -> None:
+        # The turn failure is what a human needs; a diagnostic that
+        # raises must not replace it with its own error.
+        runner, sc, wt = self._runner({'plan': 'P'})
+        sc.fail_labels.add('build')
+        sc.default_host_id = 'h1'
+        sc.host_names['h1'] = 'managed-h1'
+        with mock.patch.object(
+            R.pane, 'capture_pane', side_effect=RuntimeError('boom')
+        ):
+            with self.assertRaises(R.PipelineRunError) as caught:
+                runner.run()
+        self.assertIn('failed', str(caught.exception))
+        self.assertIn('the turn failed', wt.artifacts['turns/build.md'])
+
     def test_a_routine_capture_does_not_pay_for_a_pane(self) -> None:
         # A healthy run loops back through review rounds; reading a pane
         # on each one is an sbx round-trip for nothing.
@@ -8352,10 +8367,13 @@ class TestTheApprovedTextIsNeverDiscarded(unittest.TestCase):
         )
 
     def test_it_no_longer_raises_when_the_approved_text_is_a_plan(self):
-        try:
-            R.select_plan_of_record('Approved and complete.', [], self._plan())
-        except R.PipelineRunError:  # pragma: no cover - the regression
-            self.fail('discarded an approved plan it was holding')
+        # The regression raised PipelineRunError here, discarding an
+        # approved plan it was holding.
+        plan = self._plan()
+        self.assertEqual(
+            R.select_plan_of_record('Approved and complete.', [], plan),
+            plan,
+        )
 
     def test_a_compliant_consolidation_still_wins(self) -> None:
         # The common case must not move: a consolidation turn that
@@ -8861,6 +8879,20 @@ class TestLaunchIsVerified(_Base):
     def test_an_unreadable_pane_does_not_warn(self) -> None:
         _r, said, _wt = self._run_with_pane(None)
         self.assertNotIn('[launch]', said)
+
+    def test_a_pane_read_that_raises_never_fails_the_run(self) -> None:
+        # capture_pane is total by contract; this pins the guard for
+        # the day it is not.
+        sc = FakeSC(dict(_LINEAR_REPLIES))
+        sc.default_host_id = 'h1'
+        sc.host_names['h1'] = 'managed-h1'
+        with mock.patch.object(
+            R.pane, 'capture_pane', side_effect=RuntimeError('boom')
+        ):
+            result, _sc, _wt = self._run(
+                _LINEAR, dict(_LINEAR_REPLIES), sc=sc
+            )
+        self.assertEqual(result.status, 'completed')
 
 
 _KNOWN_GOOD = dict(R.harness_versions.KNOWN_GOOD)

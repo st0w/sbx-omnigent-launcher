@@ -86,6 +86,30 @@ class TestModuleEntryPoints(unittest.TestCase):
         self.assertEqual(found, sorted(_MAIN_MODULES))
 
 
+class TestEveryModuleImportsOnItsOwn(unittest.TestCase):
+    """Each module imports first, in a fresh interpreter.
+
+    An import cycle only shows when the module in the cycle is the one
+    imported first, so each is imported alone. This is what makes it
+    safe to keep every import at module level.
+    """
+
+    def test_every_module_imports_first_in_a_fresh_interpreter(
+        self,
+    ) -> None:
+        modules = sorted(
+            path.stem for path in _PACKAGE_DIR.glob('*.py')
+            if path.stem != '__init__'
+        )
+        self.assertIn('defaults', modules)
+        for name in modules:
+            with self.subTest(module=name):
+                result = _python('-c', f'import sbx_omnigent.{name}')
+                self.assertEqual(
+                    result.returncode, 0, result.stderr[-800:]
+                )
+
+
 class TestPackageRootImportsNothing(unittest.TestCase):
     """The root cause, pinned directly: the package init stays empty."""
 

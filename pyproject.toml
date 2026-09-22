@@ -52,10 +52,6 @@ exclude = [
 
 
 [tool.ruff.lint]
-# Q001 (multiline) and Q002 (docstring) are allowed to stay double-quoted
-# (PEP 257 docstrings); only inline strings must be single-quoted (Q000).
-ignore = ["Q001", "Q002"]
-
 select = [
     "E", "W",  # pycodestyle errors, warnings
     "F",       # pyflakes
@@ -74,10 +70,12 @@ select = [
 # 72-char cap on comment and docstring lines (enforced by W505).
 max-doc-length = 72
 
+# Inline strings are single-quoted; docstrings and other multiline
+# strings are double-quoted (PEP 257). All three are enforced.
 [tool.ruff.lint.flake8-quotes]
 inline-quotes = "single"
-multiline-quotes = "single"
-docstring-quotes = "single"
+multiline-quotes = "double"
+docstring-quotes = "double"
 
 
 [tool.ruff.format]

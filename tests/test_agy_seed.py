@@ -233,7 +233,7 @@ class TestSettingsAndBridge(unittest.TestCase):
 #: the needle is never found — the shape a human's reply to an
 #: interactive planner hits. A long paste instead collapses to
 #: "[Pasted text #N ... chars]". Both rendered; neither was seen.
-_FAKE_BRIDGE = '''\
+_FAKE_BRIDGE = """\
 _SEP = "\\u2500"
 
 
@@ -289,7 +289,7 @@ def _commit_paste(pane, needle, baseline_region, mid_turn=False, content=""):
     if not draft_seen and not mid_turn:
         raise RuntimeError("agy did not render the pasted message")
     return True
-'''
+"""
 
 _RULE = '─' * 40
 _NEEDLE = 'we will plan to eventually'

@@ -60,6 +60,7 @@ from sbx_omnigent import (
     readback,
     verify,
 )
+from sbx_omnigent.defaults import DEFAULT_EGRESS_ALLOW, DEFAULT_HOST_IMAGE
 from sbx_omnigent.swarm import (
     _launch_args_for,
     credential_kind_for,
@@ -3881,11 +3882,6 @@ class PipelineRunner:
         :param spec: The configured gate.
         :returns: The :class:`~sbx_omnigent.verify.VerifyOutcome`.
         """
-        from sbx_omnigent.launcher import (  # noqa: PLC0415
-            DEFAULT_EGRESS_ALLOW,
-            DEFAULT_HOST_IMAGE,
-        )
-
         node_id = f'{winner}-verify'
         workspace = self._wt.create_node_worktree(
             self._run_id, node_id, from_node=winner, replace=True
@@ -4677,9 +4673,12 @@ class PipelineRunner:
         # failed turn is the one whose versions matter most (#17).
         versions = self._read_harness_versions(sandbox)
         self._note_harness_versions(session, versions)
+        # capture_pane never raises by contract. Guarded anyway: this
+        # runs while a turn is already failing, and a regression in the
+        # diagnostic must not replace the failure it was diagnosing.
         try:
             text = pane.capture_pane(sandbox)
-        except Exception:  # pragma: no cover - capture_pane is total
+        except Exception:
             return None
         if not text:
             return None
@@ -5050,7 +5049,9 @@ class PipelineRunner:
             written = disk_metrics.append(
                 self._wt.metrics_path(self._run_id), records
             )
-        except Exception:  # pragma: no cover - sample() is total
+        except Exception:
+            # sample() never raises by contract. Guarded anyway:
+            # instrumentation must never be what fails a run.
             return
         if written:
             click.echo(
@@ -8517,9 +8518,11 @@ class PipelineRunner:
         sandbox = self._sandbox_for_session(session)
         if sandbox is None:
             return
+        # capture_pane never raises by contract. Guarded anyway: this
+        # read-back only warns, and must never be what fails a run.
         try:
             text = pane.capture_pane(sandbox) or ''
-        except Exception:  # pragma: no cover - capture_pane is total
+        except Exception:
             return
         mode = None
         if agent.harness not in agy.AGY_HARNESSES | codex.CODEX_HARNESSES:
@@ -8542,9 +8545,11 @@ class PipelineRunner:
         :param sandbox: The microVM name.
         :returns: ``{cli: version}``, empty when nothing could be read.
         """
+        # read_versions never raises by contract. Guarded anyway: the
+        # record is for later comparison, and must never fail a run.
         try:
             return harness_versions.read_versions(sandbox)
-        except Exception:  # pragma: no cover - read_versions is total
+        except Exception:
             return {}
 
     def _record_harness_versions(self, session: str) -> None:

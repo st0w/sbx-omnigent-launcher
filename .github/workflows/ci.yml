@@ -20,6 +20,9 @@ on:
   pull_request:
     branches: [main]
 
+# Every action is pinned to a full commit SHA, not a tag: a tag can be
+# moved to other code by whoever controls the action's repository. The
+# comment names the release the SHA was taken from.
 permissions:
   contents: read
 
@@ -28,8 +31,8 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
         with:
           enable-cache: true
       # Pinned in pyproject under [tool.ruff]; line-length 79 and the rule
@@ -41,8 +44,8 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
         with:
           enable-cache: true
       # Catches a broken pyproject, a bad license expression, and package-data

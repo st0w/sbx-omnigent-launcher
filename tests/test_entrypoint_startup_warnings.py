@@ -14,8 +14,8 @@ import unittest
 from typing import ClassVar
 
 from sbx_omnigent import entrypoint
+from sbx_omnigent.defaults import DEFAULT_EGRESS_ALLOW, SBX_BUNDLE_GAP_HOSTS
 from sbx_omnigent.entrypoint import _build_sbx_config
-from sbx_omnigent.launcher import DEFAULT_EGRESS_ALLOW, SBX_BUNDLE_GAP_HOSTS
 
 
 def _stderr_of(fn, *args, **kwargs) -> str:
