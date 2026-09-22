@@ -9,6 +9,8 @@ comparison trees, merge, publish). Run:
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import shutil
 import subprocess
@@ -597,6 +599,139 @@ class TestPipelineWorktrees(unittest.TestCase):
     def test_node_without_run_errors(self) -> None:
         with self.assertRaises(click.ClickException):
             self.mgr.create_node_worktree('nope', 'build')
+
+
+def _is_ancestor(repo: str, ancestor: str, descendant: str) -> bool:
+    """Whether *ancestor* is reachable from *descendant* in *repo*."""
+    proc = subprocess.run(
+        ['git', '-C', repo, 'merge-base', '--is-ancestor',
+         ancestor, descendant],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
+
+
+class TestAnAgentsRewriteNeverRewritesTheHub(unittest.TestCase):
+    """An agent that amends, rebases or squashes commits the launcher
+    already pushed made the next push non-fast-forward, and the stage
+    died after its work was done (#32). The hub branch now only moves
+    forward: a rewrite is recorded as a merge holding the agent's tree.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix='wt-rw-'))
+        src = self.tmp / 'src'
+        _init_repo(src)
+        self.mgr = WorktreeManager(
+            canonical_root=str(self.tmp / 'canon'),
+            worktree_root=str(self.tmp / 'wt'),
+            default_branch='main',
+        )
+        self.mgr.create_run('run1', str(src))
+        self.wt = Path(self.mgr.create_node_worktree('run1', 'build'))
+        self.hub = os.path.join(self.mgr.run_dir('run1'), 'repo')
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _salvage(self) -> str:
+        """The launcher commits and pushes the agent's partial work."""
+        (self.wt / 'impl.py').write_text('partial\n', encoding='utf-8')
+        self.mgr.commit_node('run1', 'build', message='salvage')
+        tip = self.mgr.hub_branch_tip('run1', 'build')
+        assert tip is not None
+        return tip
+
+    def _agent(self, *args: str) -> None:
+        _git(self.wt, '-c', 'user.name=agent', '-c', 'user.email=a@x',
+             *args)
+
+    def _amend(self) -> str:
+        """The agent amends the salvage commit, as seen live."""
+        (self.wt / 'impl.py').write_text('finished\n', encoding='utf-8')
+        self._agent('add', '-A')
+        self._agent('commit', '--amend', '-m', 'implement it')
+        return _git(self.wt, 'rev-parse', 'HEAD').strip()
+
+    def _commit_node(self) -> tuple[bool, str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            moved = self.mgr.commit_node('run1', 'build', message='m')
+        return moved, out.getvalue()
+
+    def test_an_amended_commit_reaches_the_hub(self) -> None:
+        self._salvage()
+        amended = self._amend()
+        moved, _said = self._commit_node()
+        self.assertTrue(moved)
+        tip = self.mgr.hub_branch_tip('run1', 'build')
+        assert tip is not None
+        self.assertEqual(
+            _git(Path(self.hub), 'rev-parse', f'{tip}^{{tree}}'),
+            _git(self.wt, 'rev-parse', f'{amended}^{{tree}}'),
+        )
+
+    def test_the_hub_only_moves_forward(self) -> None:
+        salvage = self._salvage()
+        amended = self._amend()
+        self._commit_node()
+        tip = self.mgr.hub_branch_tip('run1', 'build')
+        assert tip is not None
+        # Nothing is discarded: both histories are still reachable.
+        self.assertTrue(_is_ancestor(self.hub, salvage, tip))
+        self.assertTrue(_is_ancestor(self.hub, amended, tip))
+
+    def test_the_merge_is_announced(self) -> None:
+        salvage = self._salvage()
+        self._amend()
+        _moved, said = self._commit_node()
+        self.assertIn('build', said)
+        self.assertIn(salvage[:12], said)
+
+    def test_the_merge_is_made_by_the_launcher(self) -> None:
+        # The clone may carry no git identity of its own.
+        self._salvage()
+        self._amend()
+        self._commit_node()
+        tip = self.mgr.hub_branch_tip('run1', 'build')
+        assert tip is not None
+        self.assertEqual(
+            _git(Path(self.hub), 'log', '-1', '--format=%an', tip).strip(),
+            'pipeline-orchestrator',
+        )
+
+    def test_an_ordinary_push_announces_nothing(self) -> None:
+        self._salvage()
+        (self.wt / 'more.py').write_text('x\n', encoding='utf-8')
+        moved, said = self._commit_node()
+        self.assertTrue(moved)
+        self.assertEqual(said, '')
+
+    def test_an_ordinary_push_makes_no_merge(self) -> None:
+        self._salvage()
+        (self.wt / 'more.py').write_text('x\n', encoding='utf-8')
+        self._commit_node()
+        tip = self.mgr.hub_branch_tip('run1', 'build')
+        assert tip is not None
+        parents = _git(Path(self.hub), 'log', '-1', '--format=%P', tip)
+        self.assertEqual(len(parents.split()), 1)
+
+    def test_a_clone_behind_the_hub_is_refused(self) -> None:
+        # A merge would silently undo work already on the hub.
+        self._salvage()
+        (self.wt / 'more.py').write_text('x\n', encoding='utf-8')
+        self._commit_node()
+        tip = self.mgr.hub_branch_tip('run1', 'build')
+        assert tip is not None
+        self._agent('reset', '--hard', 'HEAD~1')
+        behind = _git(self.wt, 'rev-parse', 'HEAD').strip()
+        with self.assertRaises(click.ClickException) as caught:
+            self.mgr.commit_node('run1', 'build', message='m')
+        message = caught.exception.format_message()
+        self.assertIn(tip[:12], message)
+        self.assertIn(behind[:12], message)
+        self.assertEqual(self.mgr.hub_branch_tip('run1', 'build'), tip)
 
 
 class TestRetainingLosingBranches(unittest.TestCase):
