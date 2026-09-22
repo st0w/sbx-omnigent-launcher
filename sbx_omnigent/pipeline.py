@@ -362,27 +362,14 @@ class PublishSpec:
         or ``'none'`` (leave the branch, publish nothing).
     :param branch: Stage id whose branch is published; ``None`` = the
         last writer/selected branch (resolved by the runner).
-    :param stack: In a campaign, base each module's pull request on the
-        PREVIOUS module's published branch instead of the repo's base
-        branch.
 
-        Without it, every module's PR targets ``main``, so a module
-        opened while earlier ones are still unmerged shows their code
-        as its own: on a live five-module build, m2's request came out
-        at 55 files and 12,524 added lines when its own work was 28
-        files. That is not reviewable, and it is exactly the case for
-        anyone who wants requests to queue up rather than merge one at
-        a time.
-
-        Safe when they DO merge promptly, too: GitHub re-targets an
-        open request to the base's own base once that base is merged
-        and deleted, and the runner falls back to the repo's base
-        branch when the intended one is already gone.
+    Every pull request targets the pipeline's ``base_branch``. Chunks
+    used to be stacked on each other, and merging one PR with its
+    branch deleted closed the next; see :func:`_parse_publish`.
     """
 
     mode: str = 'none'
     branch: str | None = None
-    stack: bool = True
 
 
 @dataclass(frozen=True)
@@ -632,11 +619,22 @@ def _parse_publish(raw: object) -> PublishSpec:
     mode = (_opt_str(entry.get('mode'), 'publish.mode') or 'pr').lower()
     if mode not in ('pr', 'local', 'none'):
         raise PipelineError(f'publish.mode {mode!r} must be pr|local|none')
-    stack = entry.get('stack', True)
+    # Stacking based each chunk's PR on the previous chunk's branch.
+    # Merging that PR with its branch deleted closed the next one, which
+    # cannot be reopened while its base is gone. `false` is what every
+    # chunk now does, so an existing config saying so still loads.
+    stack = entry.get('stack', False)
     if not isinstance(stack, bool):
         raise PipelineError('publish.stack must be true or false')
+    if stack:
+        raise PipelineError(
+            'publish.stack is no longer supported: every pull request '
+            'now targets base_branch. A PR stacked on the previous '
+            "chunk's branch was closed when that PR merged with its "
+            'branch deleted. Remove the key, or set it to false; each '
+            "chunk's PR links a view of its own changes instead."
+        )
     return PublishSpec(
-        stack=stack,
         mode=mode, branch=_opt_str(entry.get('branch'), 'publish.branch')
     )
 

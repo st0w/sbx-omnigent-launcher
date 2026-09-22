@@ -53,7 +53,7 @@ name: my-pipeline          # optional; defaults to the file stem. Namespace root
 repo: /path/to/project     # or a GitHub URL — worktrees are cut from here
 base_branch: main          # optional; default branch to cut from / publish onto
 publish: pr                # pr | local | none  (or a mapping; see below)
-                           #   { mode: pr, branch: pick, stack: true }
+                           #   { mode: pr, branch: pick }
 plan_artifact: docs/plans/my-pipeline.md   # optional; where the approved plan is
                                            # committed (default docs/plans/<name>.md)
 
@@ -168,26 +168,25 @@ Stage keys:
 
 Or a mapping to publish a specific node's branch: `publish: { mode: pr, branch: pick }`.
 
-**In a campaign, each module's request is stacked on the one below it.** Every
-module used to target the repo's base branch, which is correct only once the
-previous module has merged. While earlier requests are open, a later one shows
-their code as its own — measured on a live five-module build, the AWS module's
-request came out at **55 files and +12,524 lines** when its own work was 28
-files. Nobody can review that.
+**Reviewing a campaign's pull requests.** Every module's request targets
+`base_branch`, so you never choose what to merge into, and merging one with its
+branch deleted never affects another.
 
-So module *N*'s request is opened against `pipeline/<run>-<module N-1>`, and it
-shows only what that module added. GitHub re-targets it to the real base once
-the branch below it merges, so the stack unwinds itself bottom-up.
+A module is built on the one before it, so while the earlier request is still
+open, a later one also shows the earlier module's changes. From the second
+module on, the description starts with a note that names the earlier request and
+links **that module's changes only**: GitHub's view of this request's own commits,
+which you can review and comment on as usual. The link is built from commit ids,
+so deleting branches never breaks it.
 
-It is also safe if you merge promptly and **delete** each branch, which is the
-common case: a base that is gone would make `gh pr create` fail outright, so the
-runner checks the remote first and falls back to the repo's base branch, saying
-so. A lookup it cannot perform at all counts as absent — falling back always
-yields a valid request, whereas assuming the base is still there loses the
-publish.
+Once the earlier request has merged, the later one shows only its own changes. A
+merge commit does that by itself. After a squash or rebase merge, press **Update
+branch** on the later request (or run `gh pr update-branch <number>`) first.
 
-Turn it off with `publish: { mode: pr, stack: false }` to have every module
-target the repo's base branch as before.
+Modules used to be *stacked*: each request's base was the previous module's
+branch. Merging that request with its branch deleted closed the next one, which
+cannot be reopened while its base is gone, so `publish.stack: true` is now
+refused at load. `stack: false` is accepted and changes nothing.
 
 `pr` mode needs a **GitHub** target. That is the pipeline's `repo:` by default, so
 a local-path `repo:` plus `mode: pr` cannot open a PR — the runner refuses this at

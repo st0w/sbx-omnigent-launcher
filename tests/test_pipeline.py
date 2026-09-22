@@ -494,22 +494,30 @@ class TestLoadPipeline(_Base):
                 self._gated('verify:\n  command: t\n  setup: [a, b]\n')
             )
 
-    def test_publish_stacks_by_default(self) -> None:
-        # Right in both worlds: if modules merge promptly GitHub
-        # re-targets the request, and if they queue the diffs stay
-        # readable. A plain string mode gets it too.
-        base = 'repo: ./p\nagents:\n  a: {template: coder}\n'
-        self.assertTrue(self._load(base + 'publish: pr\n').publish.stack)
-        self.assertTrue(
-            self._load(base + 'publish:\n  mode: pr\n').publish.stack
-        )
+    def test_stacking_is_refused(self) -> None:
+        # A stacked PR's base is the previous chunk's branch, and
+        # merging that PR with its branch deleted closes this one.
+        with self.assertRaises(P.PipelineError) as caught:
+            self._load(
+                'repo: ./p\nagents:\n  a: {template: coder}\n'
+                'publish:\n  mode: pr\n  stack: true\n'
+            )
+        msg = str(caught.exception)
+        self.assertIn('publish.stack', msg)
+        self.assertIn('base_branch', msg)
 
-    def test_publish_stacking_can_be_turned_off(self) -> None:
-        cfg = self._load(
+    def test_stack_false_still_loads(self) -> None:
+        # Already every chunk's behaviour, so an existing config that
+        # says so keeps working.
+        self._load(
             'repo: ./p\nagents:\n  a: {template: coder}\n'
             'publish:\n  mode: pr\n  stack: false\n'
         )
-        self.assertFalse(cfg.publish.stack)
+
+    def test_a_publish_block_without_stack_loads(self) -> None:
+        base = 'repo: ./p\nagents:\n  a: {template: coder}\n'
+        self._load(base + 'publish: pr\n')
+        self._load(base + 'publish:\n  mode: pr\n')
 
     def test_a_non_boolean_stack_is_refused(self) -> None:
         for bad in ("'yes'", '1', '[]'):

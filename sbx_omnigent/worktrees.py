@@ -193,6 +193,21 @@ def looks_like_auth_failure(text: str) -> bool:
     return any(marker in lowered for marker in _AUTH_FAILURE_MARKERS)
 
 
+def pr_number(pr_url: str, slug: str) -> int | None:
+    """
+    The number of a pull request on *slug*, from its URL.
+
+    :param pr_url: A URL as ``gh pr create`` prints it.
+    :param slug: ``owner/repo`` the PR must belong to.
+    :returns: The number, or ``None`` for anything else.
+    """
+    match = re.fullmatch(
+        rf'https://github\.com/{re.escape(slug)}/pull/(\d+)/?',
+        pr_url.strip(),
+    )
+    return int(match.group(1)) if match else None
+
+
 def github_slug(repo_url: str) -> str:
     """
     Extract ``owner/repo`` from a GitHub URL for ``gh -R``.
@@ -1868,7 +1883,6 @@ class WorktreeManager:
         title: str,
         body: str,
         base_branch: str | None = None,
-        base_fallback: str | None = None,
         remote_branch: str | None = None,
         draft: bool = True,
         open_pr: bool = True,
@@ -1890,10 +1904,6 @@ class WorktreeManager:
         :param title: PR title (GitHub mode).
         :param body: PR body (GitHub mode).
         :param base_branch: PR base; ``None`` uses the default branch.
-        :param base_fallback: Base to use when *base_branch* no longer
-            exists on the remote — the stacked case, where the previous
-            module's branch was merged and DELETED before this one
-            published. ``None`` uses the default branch.
         :param remote_branch: Destination branch on the remote; ``None``
             uses ``pipeline/<run>``.
         :param draft: Open the PR as a draft (GitHub mode).
@@ -1908,18 +1918,6 @@ class WorktreeManager:
             raise click.ClickException(f'no run {run_id!r}: {repo}')
         src = self.node_branch(run_id, node_id)
         base = base_branch or self._default_branch
-        if (
-            open_pr
-            and base_branch
-            and base_branch != self._default_branch
-            and not self._remote_has_branch(repo_url, base_branch)
-        ):
-            base = base_fallback or self._default_branch
-            click.echo(
-                f'[publish] base {base_branch!r} is no longer on the '
-                f'remote (merged and deleted?) — opening against '
-                f'{base!r} instead.'
-            )
         dst = remote_branch or f'pipeline/{run_id}'
         if dst == base:
             raise click.ClickException(
@@ -1950,32 +1948,25 @@ class WorktreeManager:
         )
         return self._run_publish(cmd).strip()
 
-    def _remote_has_branch(self, repo_url: str, branch: str) -> bool:
+    def edit_pr_body(self, repo_url: str, pr_url: str, body: str) -> None:
         """
-        Whether *branch* still exists on the remote.
+        Replace the description of a pull request this run opened.
 
-        Asked before stacking a pull request onto another module's
-        branch: that branch is routinely merged and DELETED between one
-        module publishing and the next, and opening a request against a
-        base that is gone fails outright.
-
-        A lookup that cannot be performed at all counts as absent. That
-        is the safe direction — falling back to the repo's base branch
-        always yields a valid (if noisier) request, whereas assuming
-        the base is still there loses the publish entirely.
-
-        :param repo_url: The push target.
-        :param branch: Branch name to look for.
-        :returns: Whether the remote has it.
+        :param repo_url: The push target the PR was opened on.
+        :param pr_url: The URL ``gh pr create`` printed.
+        :param body: The new description.
+        :raises click.ClickException: If *pr_url* is not a PR of
+            *repo_url*, or ``gh`` fails.
         """
-        try:
-            out = self._run_publish(
-                ['git', 'ls-remote', '--heads', repo_url,
-                 f'refs/heads/{branch}']
+        slug = github_slug(repo_url)
+        number = pr_number(pr_url, slug)
+        if number is None:
+            raise click.ClickException(
+                f'{pr_url.strip()!r} is not a pull request of {slug}'
             )
-        except click.ClickException:
-            return False
-        return bool(out.strip())
+        self._run_publish(
+            ['gh', 'pr', 'edit', str(number), '-R', slug, '--body', body]
+        )
 
     def _remove_under_root(self, path: str) -> None:
         """

@@ -27,6 +27,7 @@ from sbx_omnigent.worktrees import (
     clone_copy_command,
     github_slug,
     looks_like_auth_failure,
+    pr_number,
 )
 
 _GIT_ENV = {
@@ -915,27 +916,25 @@ class TestRunState(unittest.TestCase):
         self.assertFalse(self.mgr.write_run_state('r2', {'version': 1}))
 
 
-class TestStackedPullRequestBase(unittest.TestCase):
-    """A module's request is based on the module below it, and that
-    branch is routinely merged AND DELETED before the next one
-    publishes — a request against a base that is gone fails outright,
-    so the runner always names a way back."""
+class TestPublishNodeUsesTheBaseItIsGiven(unittest.TestCase):
+    """A chunk's PR targets the base it is given, and nothing is probed.
+
+    The base used to be the previous chunk's branch, checked on the
+    remote first with a fallback. Every PR now targets `base_branch`,
+    which a merge never deletes.
+    """
 
     def setUp(self) -> None:
-        self.tmp = tempfile.mkdtemp(prefix='wt-stack-')
+        self.tmp = tempfile.mkdtemp(prefix='wt-base-')
         os.makedirs(os.path.join(self.tmp, 'worktrees', 'r1', 'repo'))
         self.calls: list[list[str]] = []
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _mgr(self, *, base_exists: bool, lookup_fails: bool = False):
+    def _mgr(self):
         def rec(cmd, *, cwd=None, env=None):
             self.calls.append(cmd)
-            if 'ls-remote' in cmd:
-                if lookup_fails:
-                    raise click.ClickException('could not read remote')
-                return 'abc123\trefs/heads/x\n' if base_exists else ''
             return 'https://github.com/org/repo/pull/9\n'
 
         return WorktreeManager(
@@ -945,8 +944,8 @@ class TestStackedPullRequestBase(unittest.TestCase):
             run=rec,
         )
 
-    def _publish(self, mgr, **kw):
-        return mgr.publish_node(
+    def _publish(self, **kw):
+        return self._mgr().publish_node(
             'r1', 'refactor', 'https://github.com/org/repo.git',
             title='T', body='B', remote_branch='pipeline/r1-m1', **kw,
         )
@@ -955,43 +954,75 @@ class TestStackedPullRequestBase(unittest.TestCase):
         pr = next(c for c in self.calls if c[0] == 'gh')
         return pr[pr.index('--base') + 1]
 
-    def test_a_live_base_is_used(self) -> None:
-        self._publish(
-            self._mgr(base_exists=True),
-            base_branch='pipeline/r1-m0', base_fallback='main',
-        )
-        self.assertEqual(self._pr_base(), 'pipeline/r1-m0')
+    def test_the_given_base_is_used(self) -> None:
+        self._publish(base_branch='release')
+        self.assertEqual(self._pr_base(), 'release')
 
-    def test_a_deleted_base_falls_back(self) -> None:
-        self._publish(
-            self._mgr(base_exists=False),
-            base_branch='pipeline/r1-m0', base_fallback='main',
-        )
+    def test_no_base_means_the_default_branch(self) -> None:
+        self._publish()
         self.assertEqual(self._pr_base(), 'main')
 
-    def test_an_unreadable_remote_falls_back_too(self) -> None:
-        # Guessing the base is still there loses the publish; falling
-        # back always yields a valid (if noisier) request.
-        self._publish(
-            self._mgr(base_exists=True, lookup_fails=True),
-            base_branch='pipeline/r1-m0', base_fallback='main',
-        )
-        self.assertEqual(self._pr_base(), 'main')
-
-    def test_the_default_base_is_never_looked_up(self) -> None:
-        # The first module bases on the repo's own branch; probing the
-        # remote for it would be a pointless round trip.
-        self._publish(self._mgr(base_exists=False))
+    def test_the_remote_is_never_probed(self) -> None:
+        self._publish(base_branch='main')
         self.assertFalse([c for c in self.calls if 'ls-remote' in c])
-        self.assertEqual(self._pr_base(), 'main')
 
-    def test_a_local_push_never_probes_the_remote(self) -> None:
-        # No request is opened, so there is no base to validate.
-        self._publish(
-            self._mgr(base_exists=False),
-            base_branch='pipeline/r1-m0', open_pr=False,
+
+class TestEditPrBody(unittest.TestCase):
+    """The runner edits a chunk's PR once its number is known."""
+
+    def setUp(self) -> None:
+        self.calls: list[list[str]] = []
+
+        def rec(cmd, *, cwd=None, env=None):
+            self.calls.append(cmd)
+            return ''
+
+        self.mgr = WorktreeManager(
+            canonical_root='/nonexistent/repos',
+            worktree_root='/nonexistent/worktrees',
+            default_branch='main',
+            run=rec,
         )
-        self.assertFalse([c for c in self.calls if 'ls-remote' in c])
+
+    def test_it_edits_that_pr_on_that_repo(self) -> None:
+        self.mgr.edit_pr_body(
+            'https://github.com/org/repo.git',
+            'https://github.com/org/repo/pull/640\n',
+            'the body',
+        )
+        self.assertEqual(
+            self.calls,
+            [['gh', 'pr', 'edit', '640', '-R', 'org/repo',
+              '--body', 'the body']],
+        )
+
+    def test_a_url_that_is_not_a_pr_of_that_repo_is_refused(self) -> None:
+        for url in (
+            'Pushed pipeline/r1-m1 (m1-build)',
+            'https://github.com/other/repo/pull/640',
+            'https://github.com/org/repo/pull/640/files',
+            'https://github.com/org/repo/pull/abc',
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(click.ClickException):
+                    self.mgr.edit_pr_body(
+                        'https://github.com/org/repo.git', url, 'b'
+                    )
+        self.assertEqual(self.calls, [])
+
+
+class TestPrNumber(unittest.TestCase):
+    def test_a_pr_url_of_the_repo_yields_its_number(self) -> None:
+        self.assertEqual(
+            pr_number('https://github.com/org/repo/pull/12', 'org/repo'),
+            12,
+        )
+
+    def test_anything_else_yields_none(self) -> None:
+        for url in ('', 'https://github.com/org/repo/issues/12',
+                    'https://github.com/org/other/pull/12'):
+            with self.subTest(url=url):
+                self.assertIsNone(pr_number(url, 'org/repo'))
 
 
 class TestRunArtifact(unittest.TestCase):
