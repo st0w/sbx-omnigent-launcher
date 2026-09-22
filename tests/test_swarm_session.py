@@ -568,13 +568,20 @@ class TestTurnWaitTiming(unittest.TestCase):
         # After a prompt is approved the turn is moving again. Measuring
         # silence from before the approval would call it abandoned
         # while it is working.
+        #
+        # Real time, so the margins are what keep it deterministic. The
+        # last frame is at 0 s, the prompt is approved at 2.0 s and the
+        # turn goes idle at 3.0 s, with a 2.0 s abandon window. Without
+        # the restart it is abandoned at ~2.0 s, a second before the
+        # idle; with it, not before 4.0 s, a second after. The margins
+        # were 0.3 s each way, and it failed once on a loaded host.
         client = self._client()
         calls: list[str] = []
         start = time.monotonic()
 
         def classify(_session_id: str) -> tuple[str, str]:
             elapsed = time.monotonic() - start
-            if 'asking' not in calls and elapsed >= 0.6:
+            if 'asking' not in calls and elapsed >= 2.0:
                 calls.append('asking')
                 return 'asking', 'Allow Bash?'
             if 'asking' in calls:
@@ -584,11 +591,11 @@ class TestTurnWaitTiming(unittest.TestCase):
         events: queue.Queue[swarm_session._StreamEvent] = queue.Queue()
         feeder = self._feed(events, [
             (0.0, self.E('reply', reply='started')),
-            (1.3, self.E('status', status='idle', response_id='r1')),
+            (3.0, self.E('status', status='idle', response_id='r1')),
         ])
         with (
             mock.patch.object(swarm_session, '_IDLE_CONFIRM_S', 0.1),
-            mock.patch.object(swarm_session, '_ABANDON_CONFIRM_S', 1.0),
+            mock.patch.object(swarm_session, '_ABANDON_CONFIRM_S', 2.0),
             mock.patch.object(client, '_classify_settled', classify),
             mock.patch.object(client, '_approve_pending', return_value=1),
         ):
