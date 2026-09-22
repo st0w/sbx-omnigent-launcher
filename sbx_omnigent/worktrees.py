@@ -1729,8 +1729,99 @@ class WorktreeManager:
         # the hub, reported "changed 0 file(s)" three times and failed
         # the run over work sitting on disk the whole time. A push with
         # nothing to send is a cheap no-op.
+        if before is not None:
+            self._integrate_rewrite(
+                path,
+                node_id,
+                hub_tip=before,
+                identity=(committer_name, committer_email),
+            )
         self._run(['git', '-C', path, 'push', 'origin', branch])
         return self.hub_branch_tip(run_id, node_id) != before
+
+    def _integrate_rewrite(
+        self,
+        path: str,
+        node_id: str,
+        *,
+        hub_tip: str,
+        identity: tuple[str, str],
+    ) -> None:
+        """
+        Make the clone's branch fast-forward the hub's, never force.
+
+        An agent has full git access to its own clone. When it amends,
+        rebases or squashes commits the launcher already pushed, the
+        clone no longer descends from the hub tip, and a plain push is
+        rejected as non-fast-forward. That killed a stage after its
+        work was done (#32).
+
+        The hub branch is never rewritten. Instead the clone records a
+        merge of the hub tip with ``-s ours``: its tree is exactly the
+        agent's, and both histories stay reachable. The push that
+        follows is an ordinary fast-forward.
+
+        A clone that is BEHIND the hub is refused. The agent threw away
+        commits the hub already holds, and a merge would silently undo
+        that work on the hub.
+
+        :param path: The node's clone.
+        :param node_id: The node, for messages.
+        :param hub_tip: The hub branch's tip before this push.
+        :param identity: ``(name, email)`` for the merge commit; the
+            clone may carry no git identity of its own.
+        :raises click.ClickException: If the clone is behind the hub,
+            or on a git error.
+        """
+        # The clone can be missing the hub tip's objects; fetch first so
+        # the ancestry checks below answer the real question.
+        self._run(['git', '-C', path, 'fetch', '--quiet', 'origin', hub_tip])
+        head = self._run(['git', '-C', path, 'rev-parse', 'HEAD']).strip()
+        if self._is_ancestor(path, hub_tip, head):
+            return
+        if self._is_ancestor(path, head, hub_tip):
+            raise click.ClickException(
+                f'node {node_id!r}: its clone is at {head[:12]}, BEHIND '
+                f'the hub tip {hub_tip[:12]}. The agent discarded '
+                f'commits the hub already holds; merging would undo '
+                f'them there, so nothing was pushed.'
+            )
+        name, email = identity
+        self._run([
+            'git', '-C', path,
+            '-c', f'user.name={name}', '-c', f'user.email={email}',
+            'merge', '-s', 'ours', '--no-edit',
+            '-m', f'Record an agent rewrite of {hub_tip[:12]}',
+            '-m', 'The agent rewrote commits already on the hub. This '
+                  'merge keeps its tree unchanged and both histories '
+                  'reachable, so the hub branch only moves forward.',
+            hub_tip,
+        ])
+        click.echo(
+            f'[worktree] {node_id}: the agent rewrote commits already on '
+            f'the hub (tip {hub_tip[:12]}); recorded its tree as a merge '
+            f'instead of rewriting the hub.'
+        )
+
+    def _is_ancestor(self, path: str, ancestor: str, descendant: str) -> bool:
+        """
+        Whether *ancestor* is reachable from *descendant* in *path*.
+
+        :param path: A git repository.
+        :param ancestor: A commit.
+        :param descendant: A commit.
+        :returns: ``True`` only on a positive answer. A git error reads
+            as ``False``, and the caller's next git command then fails
+            loudly on the same problem.
+        """
+        try:
+            self._run([
+                'git', '-C', path, 'merge-base', '--is-ancestor',
+                ancestor, descendant,
+            ])
+        except click.ClickException:
+            return False
+        return True
 
     def create_review_snapshot(
         self, run_id: str, node_id: str, *, label: str
