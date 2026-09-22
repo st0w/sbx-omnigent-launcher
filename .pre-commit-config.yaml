@@ -25,7 +25,7 @@ repos:
   # elsewhere never block unrelated work. Editing a file with old findings
   # does surface them -- that is the point, and it is how the debt drains.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.5
+    rev: v0.16.7
     hooks:
       - id: ruff-check
 
