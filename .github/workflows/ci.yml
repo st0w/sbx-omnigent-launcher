@@ -22,7 +22,8 @@ on:
 
 # Every action is pinned to a full commit SHA, not a tag: a tag can be
 # moved to other code by whoever controls the action's repository. The
-# comment names the release the SHA was taken from.
+# comment names the release the SHA was taken from. Dependabot
+# (.github/dependabot.yml) keeps both current.
 permissions:
   contents: read
 
@@ -31,8 +32,8 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
         with:
           enable-cache: true
       # Pinned in pyproject under [tool.ruff]; line-length 79 and the rule
@@ -44,8 +45,8 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5.4.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
         with:
           enable-cache: true
       # Catches a broken pyproject, a bad license expression, and package-data
