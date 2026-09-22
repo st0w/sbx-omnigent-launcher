@@ -511,6 +511,13 @@ retried: a second attempt would spend a second full turn budget on something
 likely to fail the same way. Nor is a turn under `--keep`, or one whose VM
 could not be freed, since two agents would then be writing into one tree.
 
+**A rejected credential is named, not retried.** When any turn fails, the runner
+reads the tail of the runner log inside that VM. If it shows an authentication
+failure, such as `401 Unauthorized` or a token that "could not be refreshed",
+the error says so and names how to renew that harness's credential. A harness
+with a dead credential otherwise fails as one that never started, with no pane
+to read. Such a turn is never retried, since a fresh VM would fail the same way.
+
 **A run that does not finish keeps its directory.** Teardown always disposes the
 microVMs — they are expensive and useless once the process ends — but the run
 directory holds the hub clone with every node branch, plus `state.json`, and

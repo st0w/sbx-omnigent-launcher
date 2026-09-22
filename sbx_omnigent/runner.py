@@ -53,6 +53,7 @@ from sbx_omnigent import (
     agy,
     codex,
     disk_metrics,
+    guest_log,
     harness_versions,
     orphans,
     pane,
@@ -8931,9 +8932,10 @@ class PipelineRunner:
         if not result.ok:
             snap = self._session_snapshot(session)
             note = _session_failure_note(snap)
+            auth = self._auth_failure_note(session)
             pane_path = self._capture_turn(
                 session,
-                f'the turn failed: {result.error}{note}',
+                f'the turn failed: {result.error}{note}{auth}',
                 with_pane=True,
             )
             # Name the pane IN the error. A bare "failed: None" is what
@@ -8948,14 +8950,55 @@ class PipelineRunner:
                 f' — see {pane_path}' if pane_path
                 else self._no_pane_note(session)
             )
+            # A rejected credential is not a lost turn: retrying it on a
+            # fresh VM would only fail the same way.
             error = (
-                LostTurn if _turn_was_lost(result.error, snap)
+                LostTurn if not auth and _turn_was_lost(result.error, snap)
                 else PipelineRunError
             )
             raise error(
-                f'turn on {session} failed: {result.error}{note}{where}'
+                f'turn on {session} failed: '
+                f'{result.error}{note}{auth}{where}'
             )
         return result.reply
+
+    def _auth_failure_note(self, session: str) -> str:
+        """
+        What the VM's runner log says, if a credential was rejected.
+
+        A dead credential fails as a harness that never starts, with no
+        pane to read; on 2026-09-14 the runner log in the VM already
+        held the ``401`` (#26). Reads that log and, when it shows an
+        authentication failure, names it and the remedy for this
+        agent's harness.
+
+        Best-effort like the pane capture: it runs while a turn is
+        already failing, so any error here yields no note rather than a
+        different failure. ``KeyboardInterrupt`` still gets out.
+
+        :param session: The session whose turn just failed.
+        :returns: A parenthesised note for the failure message, or
+            ``''``.
+        """
+        sandbox = self._sandbox_for_session(session)
+        if sandbox is None:
+            return ''
+        try:
+            phrase = guest_log.auth_failure(
+                guest_log.read_runner_log(sandbox)
+            )
+        except Exception:
+            return ''
+        if phrase is None:
+            return ''
+        agent = self._session_agent.get(session)
+        harness = agent.harness if agent is not None else ''
+        return (
+            f' (the runner log in {sandbox} shows an authentication '
+            f'failure, "{phrase}": the credential this agent runs on '
+            f'was rejected. To renew it, '
+            f'{guest_log.relogin_hint(harness)})'
+        )
 
     def _no_pane_note(self, session: str) -> str:
         """

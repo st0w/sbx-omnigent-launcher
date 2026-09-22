@@ -651,6 +651,12 @@ class _Base(unittest.TestCase):
         )
         self.probe_login = probe.start()
         self.addCleanup(probe.stop)
+        # Never `sbx exec` a real VM for its runner log.
+        runner_log = mock.patch.object(
+            R.guest_log, 'read_runner_log', return_value=None
+        )
+        self.runner_log = runner_log.start()
+        self.addCleanup(runner_log.stop)
         # Never read this host's snapshot store or run its `sbx ls`. A
         # disk refusal names leaked guest disks, and without this the
         # six tests that refuse asked the real sbx on whatever machine
@@ -12526,6 +12532,73 @@ class TestTheCodexLoginIsCheckedAgainstTheServer(_Base):
             )
         self.assertEqual(res.exit_code, 1, res.output)
         drive.assert_not_called()
+
+
+class TestAnAuthFailureIsNamed(_Base):
+    """On 9/14 a dead Codex login failed as a startup timeout, while the
+    runner log in the VM already said `401 Unauthorized` (#26)."""
+
+    _LOG = (
+        'runner started\n'
+        'failed to connect to websocket: HTTP error: 401 Unauthorized\n'
+    )
+
+    def _failing(
+        self, log: str | None, text: str = _CODEX_ONLY, *, host: bool = True
+    ) -> tuple[R.PipelineRunError, FakeSC]:
+        sc = FakeSC({'tests': 'wrote tests'})
+        sc.fail_labels = {'build'}
+        if host:
+            sc.default_host_id = 'h1'
+            sc.host_names['h1'] = 'managed-h1'
+        self.runner_log.return_value = log
+        with mock.patch.object(R.pane, 'capture_pane', return_value=None):
+            with self.assertRaises(R.PipelineRunError) as caught:
+                self._run(text, {}, sc=sc)
+        return caught.exception, sc
+
+    @staticmethod
+    def _boots(sc: FakeSC) -> int:
+        return sum(1 for lb in sc._label.values() if lb == 'build')
+
+    def test_the_failure_names_the_auth_problem(self) -> None:
+        exc, _sc = self._failing(self._LOG)
+        self.assertIn('authentication failure', str(exc))
+        self.assertIn('401 unauthorized', str(exc))
+
+    def test_it_names_the_codex_remedy(self) -> None:
+        exc, _sc = self._failing(self._LOG)
+        self.assertIn(R.codex.RELOGIN_HINT, str(exc))
+
+    def test_it_names_the_claude_remedy_for_a_claude_agent(self) -> None:
+        exc, _sc = self._failing(self._LOG, _TDD)
+        self.assertIn('claude setup-token', str(exc))
+
+    def test_it_reads_the_failed_sessions_vm(self) -> None:
+        self._failing(self._LOG)
+        self.runner_log.assert_called_with('managed-h1')
+
+    def test_a_dead_credential_is_not_retried(self) -> None:
+        # `failed: None` alone is a lost turn and retried (#87); a
+        # rejected credential would only fail again.
+        _exc, sc = self._failing(self._LOG)
+        self.assertEqual(self._boots(sc), 1)
+
+    def test_a_clean_log_changes_nothing(self) -> None:
+        exc, sc = self._failing('runner started\nidle\n')
+        self.assertNotIn('authentication failure', str(exc))
+        self.assertEqual(self._boots(sc), 2)   # still a lost turn
+
+    def test_no_vm_means_no_read(self) -> None:
+        exc, _sc = self._failing(self._LOG, host=False)
+        self.runner_log.assert_not_called()
+        self.assertNotIn('authentication failure', str(exc))
+
+    def test_a_read_that_raises_keeps_the_real_failure(self) -> None:
+        self.runner_log.side_effect = RuntimeError('diagnostic broke')
+        exc, _sc = self._failing(self._LOG)
+        self.assertIn('failed: None', str(exc))
+        self.assertNotIn('diagnostic broke', str(exc))
 
 
 if __name__ == '__main__':
