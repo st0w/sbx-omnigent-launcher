@@ -74,8 +74,8 @@ max-doc-length = 72
 # strings are double-quoted (PEP 257). All three are enforced.
 [tool.ruff.lint.flake8-quotes]
 inline-quotes = "single"
-multiline-quotes = "double"
-docstring-quotes = "double"
+multiline-quotes = "single"
+docstring-quotes = "single"
 
 
 [tool.ruff.format]
