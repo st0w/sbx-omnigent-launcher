@@ -70,6 +70,7 @@ from sbx_omnigent.worktrees import (
     WorktreeManager,
     _repo_name,
     github_slug,
+    pr_number,
 )
 
 #: Terminal VERDICT / SELECT markers agents end their reply with. The
@@ -1069,6 +1070,36 @@ def _recorded_version(entry: dict[str, object], cli: str) -> str | None:
     return version if isinstance(version, str) else None
 
 
+#: A git object id, the only thing let into a link in a PR description.
+_COMMIT_RE = re.compile(r'[0-9a-f]{7,64}')
+
+
+def _restore_chunk_publishes(raw: object) -> dict[str, dict[str, str]]:
+    """
+    Rebuild each published chunk's record from run state.
+
+    :param raw: The ``chunk_publishes`` value from the state file.
+    :returns: ``{chunk: {'seed': commit, 'pr': url}}``. An entry that is
+        not a mapping is dropped; a malformed field becomes ``''`` so
+        the next chunk's PR simply goes without its link.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    restored: dict[str, dict[str, str]] = {}
+    for chunk, entry in raw.items():
+        if not isinstance(chunk, str) or not isinstance(entry, dict):
+            continue
+        seed = entry.get('seed')
+        pr = entry.get('pr')
+        restored[chunk] = {
+            'seed': seed
+            if isinstance(seed, str) and _COMMIT_RE.fullmatch(seed)
+            else '',
+            'pr': pr if isinstance(pr, str) else '',
+        }
+    return restored
+
+
 def _restore_harness_versions(raw: object) -> dict[str, dict[str, object]]:
     """
     Rebuild the recorded harness versions from run state.
@@ -1858,6 +1889,29 @@ def parse_findings(text: str | None) -> tuple[str, ...]:
         not a failure, and the caller decides what to do about it.
     """
     return _lift_marked_items(text, _FINDINGS_HEADER_RE)
+
+
+@dataclass(frozen=True)
+class ChunkSpan:
+    """
+    What a chained chunk's pull request adds on the previous chunk.
+
+    :param chunk: The chunk publishing.
+    :param prior: The chunk it is built on.
+    :param prior_pr: That chunk's PR URL, or ``''``.
+    :param start: The commit this chunk was built on, or ``''``.
+    :param end: The commit this chunk's PR pushed, or ``''``.
+    :param slug: ``owner/repo`` the PRs are on.
+    :param base: The branch both PRs target.
+    """
+
+    chunk: str
+    prior: str
+    prior_pr: str
+    start: str
+    end: str
+    slug: str
+    base: str
 
 
 @dataclass(frozen=True)
@@ -2756,9 +2810,24 @@ def _pr_finding_lines(
     ] + [f'- {url} — {title}' for url, title in findings]
 
 
+def _pr_head_lines(summary: str, series_note: str | None) -> list[str]:
+    """
+    The opening lines of a PR description: summary, then series note.
+
+    :param summary: One-line description of what shipped.
+    :param series_note: A chained chunk's note, or ``None``.
+    :returns: Lines, each block followed by a blank line.
+    """
+    lines = [summary.strip(), '']
+    if series_note:
+        lines += [series_note, '']
+    return lines
+
+
 def render_pr_body(
     *,
     summary: str,
+    series_note: str | None = None,
     task: str | None = None,
     plan_doc: str | None = None,
     session_doc: str | None = None,
@@ -2785,6 +2854,8 @@ def render_pr_body(
     built thing actually running.
 
     :param summary: One-line description of what shipped.
+    :param series_note: For a chained chunk, how its PR relates to the
+        previous one; shown straight after the summary.
     :param task: The original ask, when it adds to the summary.
     :param plan_doc: Repo path of the approved design, if committed.
     :param session_doc: Repo path of the planning session record.
@@ -2795,9 +2866,8 @@ def render_pr_body(
         evidence; ``None`` when the pipeline has no gate.
     :returns: The markdown body.
     """
-    parts = [
-        summary.strip(),
-        '',
+    parts = _pr_head_lines(summary, series_note)
+    parts += [
         'Built by an automated pipeline. Everything below is captured '
         'output from commands that ran in a fresh sandbox, on a clean '
         'clone of this branch, with no credentials — evidence, not a '
@@ -3066,6 +3136,10 @@ class PipelineRunner:
         self._completed: set[str] = set()
         #: Chunk ids already built AND published.
         self._completed_chunks: set[str] = set()
+        #: Per published chunk: the commit the NEXT chunk is built on
+        #: (``seed``) and its PR URL (``pr``). Lets the next chunk's PR
+        #: link its own changes only.
+        self._chunk_publishes: dict[str, dict[str, str]] = {}
         #: Nodes withdrawn because their review never reached consensus
         #: — the blocked review stage and the writer it was vetting. A
         #: forfeited candidate is excluded from judging: comparing a
@@ -3447,6 +3521,11 @@ class PipelineRunner:
             )
         self._completed = set(state.get('completed') or [])
         self._completed_chunks = set(state.get('completed_chunks') or [])
+        # Absent before chunk PRs linked their own changes. Empty means
+        # the next PR goes without the link, so RUN_STATE_VERSION stays.
+        self._chunk_publishes = _restore_chunk_publishes(
+            state.get('chunk_publishes')
+        )
         # Absent from a state written before this key existed, which
         # restores the old (empty) behaviour rather than failing — so
         # RUN_STATE_VERSION does NOT move and an in-flight run stays
@@ -3653,6 +3732,10 @@ class PipelineRunner:
                 for label, entry in self._harness_versions.items()
             },
             'completed_chunks': sorted(self._completed_chunks),
+            'chunk_publishes': {
+                chunk: dict(entry)
+                for chunk, entry in self._chunk_publishes.items()
+            },
             # Which writers already cleared a review gate IN THIS RUN.
             # Held in memory it was lost on --resume, and the judge was
             # then told nothing — so it started a verification build it
@@ -4261,6 +4344,10 @@ class PipelineRunner:
         """Publish one chunk's winner to ``pipeline/<run>-<chunk>``."""
         if self._config.publish.mode == 'none':
             return
+        # The campaign branch was just moved to this winner, BEFORE the
+        # doc commits below: it is the exact commit the next chunk is
+        # built on, which is where the next PR's own changes start.
+        seed = self._wt.hub_branch_tip(self._run_id, 'campaign') or ''
         plan, plan_path = self._chunk_plan_of_record(sub, first=first)
         if plan:
             self._wt.write_tracked_file(
@@ -4286,55 +4373,55 @@ class PipelineRunner:
         review_doc = self._commit_review_records(winner, plan_path)
         self._publish_findings(winner, review_doc)
         pick_doc = self._commit_judge_record(winner, plan_path)
+        open_pr = self._config.publish.mode == 'pr'
+        span = self._chunk_span(winner) if open_pr else None
+        body = self._pr_body(
+            winner, plan_path,
+            summary=f'**[{sub.id}]** {sub.title}',
+            review_doc=review_doc,
+            pick_doc=pick_doc,
+            series_note=self._series_note(span, None) if span else None,
+        )
         result = self._wt.publish_node(
             self._run_id, winner, self._publish_repo,
             title=(
                 f'[pipeline] {self._config.name} — {sub.id}: '
                 f'{short_title(sub.title)}'
             ),
-            body=self._pr_body(
-                winner, plan_path,
-                summary=f'**[{sub.id}]** {sub.title}',
-                review_doc=review_doc,
-                pick_doc=pick_doc,
-            ),
-            base_branch=self._stack_base(),
-            base_fallback=self._config.base_branch,
+            body=body,
+            # Always the configured base. Stacking on the previous
+            # chunk's branch closed this PR when that one merged with
+            # its branch deleted.
+            base_branch=self._config.base_branch,
             remote_branch=self._chunk_remote_branch(sub.id),
-            open_pr=self._config.publish.mode == 'pr',
+            open_pr=open_pr,
         )
+        self._chunk_publishes[sub.id] = {
+            'seed': seed if _COMMIT_RE.fullmatch(seed) else '',
+            'pr': result.strip() if open_pr else '',
+        }
         self._published.append(result)
+        if span is not None:
+            self._link_chunk_changes(span, result, body)
         self._save_state()
 
     def _chunk_remote_branch(self, chunk_id: str) -> str:
         """:returns: The remote branch a module publishes to."""
         return f'pipeline/{self._run_id}-{chunk_id}'
 
-    def _stack_base(self) -> str | None:
+    def _prior_chunk(self) -> str | None:
         """
-        The base this module's pull request should open against.
+        The chunk that published last before the active one.
 
-        Every module's request used to target the repo's base branch,
-        which is right only once the previous one has merged. While
-        earlier requests are open, a later one shows their code as its
-        own — measured on a live build at 55 files and +12,524 lines
-        for a module whose own work was 28 files. Basing it on the
-        module below shows just that module, and GitHub re-targets it
-        to the real base once that branch merges.
-
-        DERIVED from the modules that have published rather than
-        remembered, so it needs no state of its own and a campaign
-        resumed from an older run still stacks instead of dropping the
-        next module back onto the repo's base branch. The module list
+        Derived from the chunks that have published rather than
+        remembered, so a resumed campaign finds it too. The module list
         supplies the order; a set of published ids alone would not
         (``m10`` sorts before ``m2``).
 
-        :returns: The remote branch of the last module to publish
-            before the active one, or ``None`` for the repo's base
-            branch (the first module, or stacking off).
+        :returns: Its id, or ``None`` for the first chunk.
         """
         active = self._active_subtask
-        if not self._config.publish.stack or active is None:
+        if active is None:
             return None
         prior = None
         for sub in self._subtasks:
@@ -4342,7 +4429,117 @@ class PipelineRunner:
                 break
             if sub.id in self._completed_chunks:
                 prior = sub.id
-        return self._chunk_remote_branch(prior) if prior else None
+        return prior
+
+    def _chunk_span(self, winner: str) -> ChunkSpan | None:
+        """
+        What the active chunk's PR adds on top of the previous chunk.
+
+        :param winner: The node whose branch this chunk publishes.
+        :returns: The span, or ``None`` for the first chunk. Its commits
+            are ``''`` when either end is unknown or not a git object
+            id, and the PR then goes without the link.
+        """
+        prior = self._prior_chunk()
+        active = self._active_subtask
+        if prior is None or active is None:
+            return None
+        record = self._chunk_publishes.get(prior, {})
+        start = record.get('seed', '')
+        end = self._wt.hub_branch_tip(self._run_id, winner) or ''
+        linkable = bool(
+            _COMMIT_RE.fullmatch(start) and _COMMIT_RE.fullmatch(end)
+        )
+        return ChunkSpan(
+            chunk=active.id,
+            prior=prior,
+            prior_pr=record.get('pr', ''),
+            start=start if linkable else '',
+            end=end if linkable else '',
+            slug=github_slug(self._publish_repo),
+            base=self._config.base_branch or 'main',
+        )
+
+    @staticmethod
+    def _series_note(span: ChunkSpan, number: int | None) -> str:
+        """
+        The top of a chained chunk's PR description.
+
+        :param span: What this chunk adds on the previous one.
+        :param number: This PR's number once it exists. Before then the
+            link is GitHub's read-only comparison; after, the view of
+            this PR's own commits, which can be reviewed and commented
+            on like the PR itself.
+        :returns: A markdown block quote.
+        """
+        prior_number = pr_number(span.prior_pr, span.slug)
+        prior_ref = (
+            f'#{prior_number}' if prior_number
+            else f"[{span.prior}]'s pull request"
+        )
+        lines = [
+            f'> **Part of a series.** This PR targets `{span.base}` and '
+            f'is built on **[{span.prior}]** ({prior_ref}), so until that '
+            f"merges it also shows [{span.prior}]'s changes.",
+        ]
+        if span.start and span.end:
+            url = (
+                f'https://github.com/{span.slug}/pull/{number}/files/'
+                f'{span.start}..{span.end}'
+                if number
+                else f'https://github.com/{span.slug}/compare/'
+                f'{span.start}...{span.end}'
+            )
+            lines += [
+                '>',
+                f"> **[Review [{span.chunk}]'s changes only]({url})**: "
+                f"its own commits, without [{span.prior}]'s.",
+            ]
+        lines += [
+            '>',
+            f'> Merge {prior_ref} first. Once it has merged, this PR '
+            f'shows only its own changes. If it was squashed or rebased, '
+            f'press **Update branch** on this PR first.',
+        ]
+        return '\n'.join(lines)
+
+    def _link_chunk_changes(
+        self, span: ChunkSpan, pr_url: str, body: str
+    ) -> None:
+        """
+        Point the note at this PR's own view of its commits.
+
+        Best-effort: the PR already exists and links the comparison
+        view, so a failed edit is reported and the run carries on.
+
+        :param span: What this chunk adds on the previous one.
+        :param pr_url: The URL ``gh pr create`` printed.
+        :param body: The description the PR was opened with.
+        """
+        if not (span.start and span.end):
+            return
+        number = pr_number(pr_url, span.slug)
+        edited = (
+            body.replace(
+                self._series_note(span, None),
+                self._series_note(span, number),
+            )
+            if number
+            else body
+        )
+        try:
+            if number is None:
+                raise click.ClickException(
+                    f'{pr_url.strip()!r} is not a pull request URL'
+                )
+            self._wt.edit_pr_body(self._publish_repo, pr_url, edited)
+        except click.ClickException as exc:
+            click.echo(
+                f'[publish] {span.chunk}: opened {pr_url.strip()} but '
+                f'could not add the link to its own changes '
+                f'({exc.message}). Its description links the comparison '
+                f'view instead.'
+            )
 
     def _pr_body(
         self,
@@ -4353,6 +4550,7 @@ class PipelineRunner:
         task: str | None = None,
         review_doc: str | None = None,
         pick_doc: str | None = None,
+        series_note: str | None = None,
     ) -> str:
         """
         The pull-request body for a branch about to publish.
@@ -4363,11 +4561,13 @@ class PipelineRunner:
         :param summary: One-line description of what shipped.
         :param task: The original ask, when it adds to the summary.
         :param review_doc: Repo path of the committed reviewer reports.
+        :param series_note: What a chained chunk's PR says first.
         :returns: The markdown body.
         """
         has_plan = self._planner_node_id() is not None
         return render_pr_body(
             summary=summary,
+            series_note=series_note,
             task=task,
             review_doc=review_doc,
             reviews=self._chunk_reviews(),

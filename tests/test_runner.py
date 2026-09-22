@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zlib
 from pathlib import Path
 from typing import ClassVar
 from unittest import mock
@@ -85,6 +86,15 @@ class FakeWT:
         self.cache_refreshed: list[str] = []
         #: (alias_id, target_id) for each judge branch alias.
         self.aliases: list[tuple[str, str]] = []
+        #: Hub branch tips by node id; unset nodes get a stable fake.
+        self.tips: dict[str, str | None] = {}
+        #: Tips a test forces, which commits do not move.
+        self.tip_overrides: dict[str, str | None] = {}
+        #: publish_node returns a PR URL instead of a push summary.
+        self.return_pr_urls = False
+        #: (pr_url, body) per edit_pr_body call.
+        self.pr_edits: list[tuple[str, str]] = []
+        self.edit_raises = False
         #: (node_id, remote_branch) for every publish_node call.
         self.publishes: list[tuple[str, str | None]] = []
         #: Each run-state snapshot written, in order.
@@ -235,6 +245,11 @@ class FakeWT:
         self.events.append(('commit', node_id))
         self.commits.append((node_id, message, author))
         self.dirty_nodes.discard(node_id)
+        # A commit moves the branch, as it would on the hub.
+        self.tips[node_id] = (
+            f'{zlib.crc32(f"{node_id}:{len(self.commits)}".encode()):08x}'
+            * 5
+        )
         return True
 
     def create_judge_worktree(
@@ -245,20 +260,38 @@ class FakeWT:
 
     def alias_node_branch(self, run_id, alias_id, target_id) -> str:
         self.aliases.append((alias_id, target_id))
+        # A snapshot, like `git branch -f`: later commits on the target
+        # do not move the alias.
+        self.tips[alias_id] = self.hub_branch_tip(run_id, target_id)
         return f'pl/{run_id}/{alias_id}'
 
     def publish_node(
         self, run_id, node_id, repo, *, title, body, base_branch=None,
-        base_fallback=None, remote_branch=None, draft=True, open_pr=True,
+        remote_branch=None, draft=True, open_pr=True,
     ) -> str:
         self.published = (node_id, repo, open_pr)
-        #: (remote, base, fallback) per publish, in order — the stack.
-        self.pr_bases.append((remote_branch, base_branch, base_fallback))
+        #: (remote, base) per publish, in order.
+        self.pr_bases.append((remote_branch, base_branch))
         dst = remote_branch or f'pipeline/{run_id}'
         self.publishes.append((node_id, remote_branch))
         self.pr_titles.append(title)
         self.pr_bodies.append(body)
+        if open_pr and self.return_pr_urls:
+            number = 600 + len(self.publishes)
+            return f'https://github.com/org/proj/pull/{number}'
         return f'Pushed {dst} ({node_id})'
+
+    def hub_branch_tip(self, run_id, node_id):
+        if node_id in self.tip_overrides:
+            return self.tip_overrides[node_id]
+        if node_id in self.tips:
+            return self.tips[node_id]
+        return f'{zlib.crc32(node_id.encode()):08x}' * 5
+
+    def edit_pr_body(self, repo_url, pr_url, body) -> None:
+        self.pr_edits.append((pr_url, body))
+        if self.edit_raises:
+            raise click.ClickException('gh: HTTP 403')
 
     def metrics_path(self, run_id) -> str:
         return f'/can/_metrics/{run_id}.jsonl'
@@ -3131,53 +3164,67 @@ class TestReviewRecords(_Base):
         self.assertIsNone(R.ReviewRecord.from_dict({}))
 
 
-class TestStackedPullRequests(_Base):
-    """Every module's request used to target the repo's base branch,
-    which is right only once the previous one has merged. While earlier
-    requests are open a later one shows their code as its own —
-    measured live at 55 files / +12,524 for a module whose own work was
-    28 files. Basing each on the module below it shows just that
-    module."""
+def _pr_modules() -> str:
+    """_PER_MODULE opening real pull requests on a GitHub repository.
 
-    def _modules(self, text=None, **kw):
+    A function: _PER_MODULE is defined further down this module.
+    """
+    return _PER_MODULE.replace(
+        'repo: ./proj', 'repo: https://github.com/org/proj.git'
+    ).replace('publish: local', 'base_branch: main\npublish: pr')
+
+
+def _three_modules() -> str:
+    """Three chained chunks, opening pull requests."""
+    return _pr_modules().replace(
+        '  - {id: m1, title: storage and schema}\n',
+        '  - {id: m1, title: storage and schema}\n'
+        '  - {id: m2, title: api}\n',
+    )
+
+
+class TestChunkPullRequestsTargetTheBaseBranch(_Base):
+    """Every chunk's PR targets `base_branch`, never another chunk.
+
+    Chunks used to be stacked: each PR's base was the previous chunk's
+    branch. Merging that PR and deleting its branch in the same step
+    closed the next PR, and a PR whose base is gone cannot be reopened.
+    Restored and reopened, it then merged into the side branch instead
+    of `main`. A base that a merge deletes is never safe.
+    """
+
+    def _modules(self, text=None, *, wt=None, replies=None):
         return self._run(
             text or _PER_MODULE,
-            {'m0-plan': 'D0', 'm1-plan': 'D1'},
+            replies or {'m0-plan': 'D0', 'm1-plan': 'D1', 'm2-plan': 'D2'},
             interactive_plan=False,
-            **kw,
+            wt=wt,
         )
 
-    def test_each_module_bases_on_the_one_below_it(self) -> None:
-        _r, _sc, wt = self._modules()
-        self.assertEqual(
-            [(remote, base) for remote, base, _f in wt.pr_bases],
-            [
-                # The first has nothing below it: the repo's base.
-                ('pipeline/r1-m0', None),
-                ('pipeline/r1-m1', 'pipeline/r1-m0'),
-            ],
-        )
-
-    def test_the_fallback_is_always_the_repo_base(self) -> None:
-        # The branch below is routinely merged AND DELETED before the
-        # next module publishes; a request against a base that is gone
-        # fails outright, so the runner always names a way back.
-        _r, _sc, wt = self._modules()
-        self.assertEqual(
-            [fallback for _r, _b, fallback in wt.pr_bases],
-            [self._cfg(_PER_MODULE).base_branch] * 2,
-        )
-
-    def test_stacking_off_targets_the_repo_base_every_time(self) -> None:
+    def test_a_chained_chunk_targets_the_configured_base(self) -> None:
+        # THE regression: [m5b] was published against [m5a]'s branch.
         _r, _sc, wt = self._modules(
-            _PER_MODULE.replace(
-                'publish: local',
-                'publish:\n  mode: local\n  stack: false',
-            )
+            _PER_MODULE.replace('publish: local',
+                                'base_branch: main\npublish: local')
         )
         self.assertEqual(
-            [base for _r, base, _f in wt.pr_bases], [None, None]
+            wt.pr_bases,
+            [('pipeline/r1-m0', 'main'), ('pipeline/r1-m1', 'main')],
         )
+
+    def test_no_chunk_ever_targets_a_pipeline_branch(self) -> None:
+        wt = FakeWT()
+        wt.return_pr_urls = True
+        self._modules(_three_modules(), wt=wt)
+        self.assertEqual(len(wt.pr_bases), 3)
+        for remote, base in wt.pr_bases:
+            with self.subTest(chunk=remote):
+                self.assertEqual(base, 'main')
+
+    def test_an_unset_base_branch_means_the_repo_default(self) -> None:
+        # None is publish_node's "the manager's default branch".
+        _r, _sc, wt = self._modules()
+        self.assertEqual([b for _r, b in wt.pr_bases], [None, None])
 
     def _runner_at(self, active: str, published: set[str]):
         cfg = self._cfg(_PER_MODULE)
@@ -3193,32 +3240,167 @@ class TestStackedPullRequests(_Base):
         )
         return runner
 
-    def test_a_resumed_campaign_continues_the_stack(self) -> None:
-        # Derived from what has published, so a campaign resumed from a
-        # state file written before stacking existed still stacks —
-        # rather than dropping the next module back onto the repo base
-        # and going cumulative again.
-        self.assertEqual(
-            self._runner_at('m1', {'m0'})._stack_base(), 'pipeline/r1-m0'
-        )
+    def test_the_prior_chunk_is_the_last_one_published(self) -> None:
+        self.assertEqual(self._runner_at('m1', {'m0'})._prior_chunk(), 'm0')
 
-    def test_the_first_module_has_nothing_below_it(self) -> None:
-        self.assertIsNone(self._runner_at('m0', set())._stack_base())
+    def test_the_first_chunk_has_no_prior(self) -> None:
+        self.assertIsNone(self._runner_at('m0', set())._prior_chunk())
 
-    def test_it_takes_the_last_module_in_ORDER_not_sorted(self) -> None:
-        # A set of ids alone would pick the wrong base: 'm10' sorts
+    def test_the_prior_is_taken_in_ORDER_not_sorted(self) -> None:
+        # A set of ids alone would pick the wrong one: 'm10' sorts
         # before 'm2'. The module list supplies the real order.
         runner = self._runner_at('m1', {'m0'})
         runner._subtasks = [
             pipeline.Subtask(id=i, title=i) for i in ('m2', 'm10', 'm1')
         ]
         runner._completed_chunks = {'m2', 'm10'}
-        self.assertEqual(runner._stack_base(), 'pipeline/r1-m10')
+        self.assertEqual(runner._prior_chunk(), 'm10')
 
-    def test_an_unpublished_module_is_never_a_base(self) -> None:
-        # m0 blocked and never shipped; m1 must not stack onto a branch
-        # no request exists for.
-        self.assertIsNone(self._runner_at('m1', set())._stack_base())
+    def test_an_unpublished_chunk_is_never_the_prior(self) -> None:
+        self.assertIsNone(self._runner_at('m1', set())._prior_chunk())
+
+
+class TestAChunkPullRequestLinksItsOwnChanges(_Base):
+    """A PR against `main` also shows every unmerged chunk before it.
+
+    So from the second chunk on, the description links GitHub's view of
+    this PR's commits since the previous chunk: that chunk's changes
+    alone, reviewable and commentable, before or after the previous PR
+    lands. It is built from commit ids, so deleting branches never
+    breaks it.
+    """
+
+    def _race(self, wt=None, text=None):
+        wt = wt if wt is not None else FakeWT()
+        wt.return_pr_urls = True
+        with mock.patch.object(R.click, 'echo') as echo:
+            result, _sc, wt = self._run(
+                text or _pr_modules(),
+                {'m0-plan': 'D0', 'm1-plan': 'D1', 'm2-plan': 'D2'},
+                interactive_plan=False, wt=wt,
+            )
+        said = [str(c.args[0]) for c in echo.call_args_list if c.args]
+        return result, wt, said
+
+    def _tip(self, wt, node):
+        return wt.hub_branch_tip('r1', node)
+
+    def test_the_first_chunk_has_no_series_note(self) -> None:
+        _r, wt, _said = self._race()
+        self.assertNotIn('this chunk', wt.pr_bodies[0].lower())
+        self.assertFalse(
+            [u for u, _b in wt.pr_edits if u.endswith('/pull/601')]
+        )
+
+    def test_the_link_covers_exactly_this_chunk(self) -> None:
+        # From the commit the chunk was BUILT on (the campaign branch
+        # when the previous chunk published, before its doc commits)
+        # to the commit this PR pushed.
+        _r, wt, _said = self._race()
+        seed = wt.states[-1]['chunk_publishes']['m0']['seed']
+        tip = self._tip(wt, 'm1-build')
+        url, body = wt.pr_edits[-1]
+        self.assertEqual(url, 'https://github.com/org/proj/pull/602')
+        self.assertIn(
+            f'https://github.com/org/proj/pull/602/files/{seed}..{tip}',
+            body,
+        )
+
+    def test_the_start_is_before_the_prior_chunks_doc_commits(
+        self,
+    ) -> None:
+        # The next chunk is cut from the campaign branch, which moved to
+        # [m0]'s winner BEFORE its plan and review records were
+        # committed. Starting from [m0]'s final commit would name one
+        # that is not in [m1]'s history at all.
+        _r, wt, _said = self._race()
+        seed = wt.states[-1]['chunk_publishes']['m0']['seed']
+        self.assertNotEqual(seed, self._tip(wt, 'm0-build'))
+        self.assertIn(
+            ('m0-build', 'docs: add plan of record',
+             'planner <planner@pipeline.local>'),
+            wt.commits,
+        )
+
+    def test_before_the_edit_it_links_the_comparison(self) -> None:
+        # The PR number is only known once it exists, so it opens with
+        # the read-only comparison and is edited to the in-PR view.
+        _r, wt, _said = self._race()
+        seed = wt.states[-1]['chunk_publishes']['m0']['seed']
+        tip = self._tip(wt, 'm1-build')
+        self.assertIn(
+            f'https://github.com/org/proj/compare/{seed}...{tip}',
+            wt.pr_bodies[1],
+        )
+
+    def test_it_names_the_prior_pr_and_how_to_shrink_this_one(self) -> None:
+        _r, wt, _said = self._race()
+        _url, body = wt.pr_edits[-1]
+        self.assertIn('#601', body)
+        self.assertIn('Update branch', body)
+        self.assertIn('`main`', body)
+
+    def test_three_chunks_each_link_from_their_own_prior(self) -> None:
+        _r, wt, _said = self._race(text=_three_modules())
+        m2_body = wt.pr_edits[-1][1]
+        seed = wt.states[-1]['chunk_publishes']['m1']['seed']
+        self.assertIn(
+            f'/pull/603/files/{seed}..{self._tip(wt, "m2-build")}',
+            m2_body,
+        )
+        self.assertIn('#602', m2_body)
+        self.assertNotIn('#601', m2_body)
+
+    def test_a_failed_edit_keeps_the_pr_and_says_so(self) -> None:
+        wt = FakeWT()
+        wt.edit_raises = True
+        result, wt, said = self._race(wt=wt)
+        self.assertEqual(result.status, 'completed')
+        self.assertTrue(
+            [ln for ln in said if 'could not add' in ln and '602' in ln],
+            said,
+        )
+
+    def test_a_local_publish_has_no_pr_to_link(self) -> None:
+        wt = FakeWT()
+        _r, _sc, wt = self._run(
+            _PER_MODULE, {'m0-plan': 'D0', 'm1-plan': 'D1'},
+            interactive_plan=False, wt=wt,
+        )
+        self.assertEqual(wt.pr_edits, [])
+        self.assertNotIn('this chunk', wt.pr_bodies[1].lower())
+
+    def test_a_commit_that_is_not_a_sha_is_never_linked(self) -> None:
+        # Both ends go into a URL in a markdown body; only a git object
+        # id is accepted there.
+        wt = FakeWT()
+        wt.tip_overrides['m1-build'] = 'main) [x](https://evil'
+        _r, wt, _said = self._race(wt=wt)
+        self.assertEqual(wt.pr_edits, [])
+        self.assertNotIn('evil', wt.pr_bodies[1])
+
+    def test_the_seed_and_pr_are_kept_for_a_resume(self) -> None:
+        _r, wt, _said = self._race()
+        kept = wt.states[-1]['chunk_publishes']
+        self.assertEqual(
+            set(kept['m0']), {'seed', 'pr'}
+        )
+        self.assertRegex(kept['m0']['seed'], r'^[0-9a-f]{40}$')
+        self.assertEqual(
+            kept['m0']['pr'], 'https://github.com/org/proj/pull/601'
+        )
+
+    def test_a_malformed_record_is_dropped_on_restore(self) -> None:
+        self.assertEqual(R._restore_chunk_publishes(None), {})
+        self.assertEqual(
+            R._restore_chunk_publishes({
+                'm0': {'seed': 'abc1234', 'pr': 'https://x/pull/1'},
+                'bad': 'nope',
+                'worse': {'seed': 'not a sha', 'pr': 3},
+            }),
+            {'m0': {'seed': 'abc1234', 'pr': 'https://x/pull/1'},
+             'worse': {'seed': '', 'pr': ''}},
+        )
 
 
 class TestReviewRecordsPerModule(_Base):

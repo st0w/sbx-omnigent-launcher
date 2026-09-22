@@ -163,10 +163,10 @@ python -m sbx_omnigent.runner -c examples/quickstart/pipeline.yaml \
   --worktree-root  /srv/swarm/worktrees      # must equal sbx.worktree_root
 ```
 
-In a **campaign**, each module's pull request is stacked on the module below it
-(`publish.stack`, on by default), so it shows only that module's work rather than
-every unmerged module before it. See
-[`docs/PIPELINES.md`](./docs/PIPELINES.md#publish).
+In a **campaign**, every module's pull request targets `base_branch`, and from the
+second module on its description links a view of that module's changes alone. You
+can review each one before or after the previous one lands, and merge each with
+its branch deleted. See [`docs/PIPELINES.md`](./docs/PIPELINES.md#publish).
 
 The coder implements your task on an isolated branch, the reviewer reads it `:ro`
 and must `VERDICT: APPROVED` (a block loops findings back for another round), and
@@ -193,7 +193,7 @@ version: 1
 name: my-pipeline          # optional; defaults to the file stem (the agent namespace)
 repo: /path/to/project     # or a GitHub URL — worktrees are cut from here
 base_branch: main          # optional; branch to cut from / publish onto
-publish: pr                # pr | local | none  (or a { mode, branch, stack } map)
+publish: pr                # pr | local | none  (or a { mode, branch } map)
 
 task: |                    # optional — omit task+acceptance for provision-only
   What to build.
