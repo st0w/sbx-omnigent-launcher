@@ -1,0 +1,44 @@
+# Weekly version updates for everything this repository pins.
+#
+# Every ecosystem waits seven days after a release before proposing it.
+# A compromised or broken release is usually found and yanked within
+# days, and the cooldown keeps it out of this repository in that window.
+# Security updates are not delayed: `cooldown` applies only to version
+# updates.
+version: 2
+
+updates:
+  # CI actions, pinned to full commit SHAs. Dependabot updates the SHA
+  # and the version comment beside it together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  # The hook revisions in .pre-commit-config.yaml.
+  - package-ecosystem: pre-commit
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  # The AWS provider constraint in deploy/aws.
+  - package-ecosystem: terraform
+    directory: /deploy/aws
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  # pyproject.toml and uv.lock. The package declares no runtime
+  # dependencies today (it runs inside Omnigent's environment), so this
+  # watches for any that are added.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
