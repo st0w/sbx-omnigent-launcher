@@ -9995,7 +9995,8 @@ def reclaim_for_resume(
       are on the hub and their pull requests are open
 
     Best-effort throughout: a resume must not fail because something it
-    was cleaning is already gone.
+    was cleaning is already gone. The disposed sessions are removed from
+    the run state, so the runner does not dispose them again.
 
     :param run_id: The run being resumed.
     :param canonical_root: Host dir holding the bare mirrors.
@@ -10028,17 +10029,24 @@ def reclaim_for_resume(
     sessions = [s for s in state.get('sessions') or [] if isinstance(s, str)]
     if sessions:
         sc = client or SwarmSessionClient(server)
-        gone = 0
+        left: list[str] = []
         for session in sessions:
             try:
                 sc.dispose(session)
-                gone += 1
             except SwarmSessionError:
-                pass  # already torn down, or the server lost it
+                # Already torn down, or the server lost it. It may
+                # still be up, so it stays tracked.
+                left.append(session)
         echo(
-            f'[resume] disposed {gone}/{len(sessions)} microVM(s) the '
-            f'previous attempt left running, before measuring disk.'
+            f'[resume] disposed {len(sessions) - len(left)}/'
+            f'{len(sessions)} microVM(s) the previous attempt left '
+            f'running, before measuring disk.'
         )
+        # The runner disposes whatever the state still lists (see
+        # PipelineRunner._dispose_stale_sessions). Left in, it disposed
+        # every one of these a second time and logged that as success,
+        # since a 404 counts as disposed (#32).
+        wt.write_run_state(run_id, {**state, 'sessions': left})
     freed = 0
     done = [
         c for c in state.get('completed_chunks') or []
