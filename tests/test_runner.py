@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -22,7 +23,7 @@ from typing import ClassVar
 from unittest import mock
 
 import click
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 
 from sbx_omnigent import pipeline
 from sbx_omnigent import runner as R
@@ -7223,6 +7224,7 @@ class TestAgyPreflight(_Base):
         cfg_path.write_text(_LINEAR, encoding='utf-8')
         missing = self.root / 'no-such-stamp.json'
         with mock.patch.object(R.agy, 'HARVEST_STAMP', missing), \
+                mock.patch.object(R, 'preflight_sbx'), \
                 mock.patch.object(R, 'preflight_disk'), \
                 mock.patch.object(R, 'SwarmSessionClient') as client:
             res = CliRunner().invoke(
@@ -7243,6 +7245,7 @@ class TestAgyPreflight(_Base):
         cfg_path.write_text(_LINEAR, encoding='utf-8')
         missing = self.root / 'no-such-stamp.json'
         with mock.patch.object(R.agy, 'HARVEST_STAMP', missing), \
+                mock.patch.object(R, 'preflight_sbx'), \
                 mock.patch.object(R, 'preflight_disk'), \
                 mock.patch.object(R, 'SwarmSessionClient') as client:
             CliRunner().invoke(
@@ -7763,7 +7766,8 @@ class TestAgyAutoHarvest(_Base):
         proc = FakeHarvester()
         with mock.patch.object(
             R, 'ensure_agy_harvester', return_value=proc
-        ), mock.patch.object(R, 'preflight_disk'), \
+        ), mock.patch.object(R, 'preflight_sbx'), \
+                mock.patch.object(R, 'preflight_disk'), \
                 mock.patch.object(R, '_drive') as drive:
             res = CliRunner().invoke(
                 R.main,
@@ -7783,7 +7787,8 @@ class TestAgyAutoHarvest(_Base):
         proc = FakeHarvester()
         with mock.patch.object(
             R, 'ensure_agy_harvester', return_value=proc
-        ), mock.patch.object(R, 'preflight_disk'), \
+        ), mock.patch.object(R, 'preflight_sbx'), \
+                mock.patch.object(R, 'preflight_disk'), \
                 mock.patch.object(
             R, '_drive', side_effect=RuntimeError('boom')
         ):
@@ -9586,7 +9591,8 @@ class TestDiskPreflight(_Base):
     def test_cli_passes_keep_to_the_disk_guard(self) -> None:
         cfg_path = self.root / 'pipeline.yaml'
         cfg_path.write_text(_LINEAR, encoding='utf-8')
-        with mock.patch.object(R, 'preflight_disk') as guard, \
+        with mock.patch.object(R, 'preflight_sbx'), \
+                mock.patch.object(R, 'preflight_disk') as guard, \
                 mock.patch.object(R, 'ensure_agy_harvester'), \
                 mock.patch.object(R, '_drive'):
             CliRunner().invoke(
@@ -9606,6 +9612,7 @@ class TestDiskPreflight(_Base):
         with mock.patch.object(
             R, 'preflight_disk', side_effect=AssertionError('ran')
         ) as guard, mock.patch.object(R, 'ensure_agy_harvester'), \
+                mock.patch.object(R, 'preflight_sbx'), \
                 mock.patch.object(R, '_drive'):
             res = CliRunner().invoke(
                 R.main,
@@ -11835,7 +11842,8 @@ class TestPublishTokenIsValidatedEarlyAndReadLate(unittest.TestCase):
         shutil.rmtree(self.root, ignore_errors=True)
 
     def _invoke(self, *extra: str):
-        with mock.patch.object(R, 'preflight_disk'), \
+        with mock.patch.object(R, 'preflight_sbx'), \
+                mock.patch.object(R, 'preflight_disk'), \
                 mock.patch.object(R, 'preflight_codex_auth'), \
                 mock.patch.object(R, '_drive') as drive:
             res = CliRunner().invoke(
@@ -12025,6 +12033,79 @@ class BlockedReviewForfeitsOneCandidate(unittest.TestCase):
         runner._forfeited.add('impl-b')
 
         self.assertEqual(runner._judge_candidates(pick), ['impl-a'])
+
+
+class TestSbxPreflight(_Base):
+    """A stuck sbx daemon refuses the run before sbx is used (#28)."""
+
+    def _invoke(self, *extra: str) -> Result:
+        cfg_path = self.root / 'pipeline.yaml'
+        cfg_path.write_text(_LINEAR, encoding='utf-8')
+        return CliRunner().invoke(
+            R.main,
+            [
+                '-c', str(cfg_path),
+                '--canonical-root', str(self.root / 'c'),
+                '--worktree-root', str(self.root / 'w'),
+                *extra,
+            ],
+        )
+
+    @staticmethod
+    def _sbx_ls(
+        *, hung: bool
+    ) -> contextlib.AbstractContextManager[mock.MagicMock]:
+        """Patch the process runner so `sbx ls` hangs or answers."""
+        if hung:
+            return mock.patch.object(
+                R.sbx_cli.subprocess, 'run',
+                side_effect=subprocess.TimeoutExpired(['sbx', 'ls'], 20.0),
+            )
+        return mock.patch.object(
+            R.sbx_cli.subprocess, 'run',
+            return_value=subprocess.CompletedProcess(
+                ['sbx', 'ls'], 0, 'SANDBOX\n', ''
+            ),
+        )
+
+    def test_a_stuck_daemon_refuses_before_the_other_gates(self) -> None:
+        with self._sbx_ls(hung=True), \
+                mock.patch.object(R, 'preflight_disk') as disk, \
+                mock.patch.object(R, 'ensure_agy_harvester') as harvester, \
+                mock.patch.object(R, '_drive') as drive:
+            res = self._invoke()
+        self.assertEqual(res.exit_code, 1)
+        self.assertIn('sbx daemon is not responding', res.output)
+        disk.assert_not_called()
+        harvester.assert_not_called()
+        drive.assert_not_called()
+
+    def test_the_refusal_names_the_remedy(self) -> None:
+        with self._sbx_ls(hung=True), \
+                mock.patch.object(R, '_drive'):
+            res = self._invoke()
+        self.assertIn('sbx daemon stop && sbx daemon start', res.output)
+
+    def test_a_resume_is_refused_before_it_reclaims(self) -> None:
+        # The reclaim disposes VMs through the server, which is itself
+        # an sbx call that would hang.
+        with self._sbx_ls(hung=True), \
+                mock.patch.object(R, 'reclaim_for_resume') as reclaim, \
+                mock.patch.object(R, '_resume_worktree_count',
+                                  return_value=0), \
+                mock.patch.object(R, '_drive'):
+            res = self._invoke('--resume')
+        self.assertEqual(res.exit_code, 1)
+        reclaim.assert_not_called()
+
+    def test_a_healthy_daemon_lets_the_run_proceed(self) -> None:
+        with self._sbx_ls(hung=False), \
+                mock.patch.object(R, 'preflight_disk'), \
+                mock.patch.object(R, 'ensure_agy_harvester'), \
+                mock.patch.object(R, '_drive') as drive:
+            res = self._invoke()
+        self.assertEqual(res.exit_code, 0, res.output)
+        drive.assert_called_once()
 
 
 if __name__ == '__main__':
