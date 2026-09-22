@@ -58,6 +58,7 @@ from sbx_omnigent import (
     pane,
     pipeline,
     readback,
+    sbx_cli,
     verify,
 )
 from sbx_omnigent.defaults import DEFAULT_EGRESS_ALLOW, DEFAULT_HOST_IMAGE
@@ -10261,6 +10262,24 @@ def codex_agent_names(config: pipeline.PipelineConfig) -> list[str]:
     )
 
 
+def preflight_sbx() -> None:
+    """
+    Refuse to start unless the sbx daemon answers (#28).
+
+    Runs before anything else touches sbx. A stuck daemon otherwise
+    shows up minutes later as a pipeline turn failing with
+    ``runner_unavailable``, because ``sbx create`` never returned. That
+    error does not name sbx, so the cause had to be diagnosed by hand.
+
+    :raises sbx_cli.SbxNotResponding: If ``sbx ls`` does not answer
+        within :data:`sbx_cli.PROBE_TIMEOUT_S`. The message says how to
+        recover the daemon.
+    :raises click.ClickException: If ``sbx`` cannot be run, or its
+        listing fails.
+    """
+    sbx_cli.require_responsive()
+
+
 def preflight_codex_auth(
     config: pipeline.PipelineConfig,
     *,
@@ -10601,6 +10620,9 @@ def main(
     # then and a run that publishes at the end has no way to notice
     # (TASKS.md #43).
     publish_token_provider()
+    # Before anything touches sbx, including the resume reclaim below,
+    # which disposes VMs through the server.
+    preflight_sbx()
     on_disk = 0
     if resume:
         # BEFORE the gate, not inside runner.run() behind it: a resume

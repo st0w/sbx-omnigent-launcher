@@ -394,7 +394,9 @@ class TestCreateStagger(unittest.TestCase):
         overlap: list[str] = []
         guard = threading.Lock()
 
-        def fake_run_local(command: list[str], *, action: str) -> None:
+        def fake_run_local(
+            command: list[str], *, action: str, timeout_s: float
+        ) -> None:
             with guard:
                 active.append(1)
                 if len(active) > 1:

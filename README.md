@@ -325,6 +325,12 @@ no restart. Key runner flags: `--keep` (leave VMs up), `--run-id`,
 `--server`. Full flag table and the provision-only mode (omit `task:`) are in
 [`docs/PIPELINES.md`](./docs/PIPELINES.md).
 
+Before anything touches sbx, the runner checks that the sbx daemon answers (a
+bounded `sbx ls`). A stuck daemon refuses the run with the steps to recover it,
+instead of failing a turn minutes later with `runner_unavailable`. Every `sbx`
+call the launcher makes has a timeout, and a call that runs out names the
+daemon the same way. Nothing restarts the daemon for you.
+
 By default the push and the PR use whatever git/`gh` credentials the host already
 has — that is, **yours**. To have the pipeline ship under its own account instead,
 give the runner a token without putting it on the command line; see

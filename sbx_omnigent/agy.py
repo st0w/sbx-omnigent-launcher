@@ -41,6 +41,7 @@ from typing import ClassVar, TypedDict, Unpack
 
 import click
 
+from sbx_omnigent import sbx_cli
 from sbx_omnigent._compat import AGY_BRIDGE_MODULES
 from sbx_omnigent.defaults import DEFAULT_HOST_IMAGE
 
@@ -1155,7 +1156,16 @@ class Harvester:
         try:
             proc = self.run(
                 argv, input=token, capture_output=True, text=True,
+                timeout=sbx_cli.MANAGE_TIMEOUT_S,
             )
+        except subprocess.TimeoutExpired as exc:
+            # A harvest error, so the refresh loop backs off and retries
+            # rather than dying on a daemon that may recover (#28).
+            raise AgyHarvestError(
+                sbx_cli.not_responding_message(
+                    argv, sbx_cli.MANAGE_TIMEOUT_S
+                )
+            ) from exc
         except OSError as exc:
             raise AgyHarvestError(
                 f'could not exec sbx secret set-custom: {exc}'
@@ -1224,16 +1234,27 @@ class Harvester:
             self.sleep(self.interval_s)
 
 
-def _run_local(argv: list[str], *, action: str) -> None:
+def _run_local(
+    argv: list[str], *, action: str, timeout_s: float | None = None
+) -> None:
     """
     Run a local ``sbx`` management command, raising on failure.
 
     :param argv: Full argv.
     :param action: Human phrase for the error message.
+    :param timeout_s: Budget for an ``sbx`` call, from one of
+        :mod:`sbx_cli`'s tiers; ``None`` only for a local command such
+        as ``mkdir``, which does not go through the daemon.
     :raises click.ClickException: On a non-zero exit or exec failure.
+    :raises sbx_cli.SbxNotResponding: If the command does not finish
+        within *timeout_s*.
     """
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True)
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout_s
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise sbx_cli.SbxNotResponding(argv, exc.timeout) from exc
     except OSError as exc:
         raise click.ClickException(f'failed to {action}: {exc}') from exc
     if proc.returncode != 0:
@@ -1360,6 +1381,7 @@ def bootstrap(
                 '--template', image, '--name', box, '--quiet',
             ],
             action=f'create trusted box {box!r}',
+            timeout_s=sbx_cli.CREATE_TIMEOUT_S,
         )
     _run_local(
         [
@@ -1367,6 +1389,7 @@ def bootstrap(
             ','.join(TRUSTED_BOX_LOGIN_EGRESS),
         ],
         action=f'apply login egress allowlist to {box!r}',
+        timeout_s=sbx_cli.MANAGE_TIMEOUT_S,
     )
     # Seed the swap secret with the inert placeholder value so the entry
     # exists (harvest then updates its value). Placeholder-as-value is

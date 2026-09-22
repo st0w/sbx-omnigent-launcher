@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 import click
 
+from sbx_omnigent import sbx_cli
 from sbx_omnigent.pipeline import _sanitize
 
 #: Max length of a generated sandbox name (kept well under any sbx
@@ -328,6 +329,37 @@ def build_script(setup: str | None, command: str) -> str:
     return '\n'.join(parts) + '\n'
 
 
+def _manage(
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    argv: list[str],
+    *,
+    timeout_s: float,
+    failure: str,
+) -> None:
+    """
+    Run one ``sbx`` management call for the gate, or raise.
+
+    :param run: Command runner.
+    :param argv: The ``sbx`` argv.
+    :param timeout_s: Budget, from one of :mod:`sbx_cli`'s tiers.
+    :param failure: What could not be done, e.g. ``"could not scope
+        egress for 'v'"``; the error message starts with it.
+    :raises VerifyError: If the call exits non-zero, or does not finish
+        within *timeout_s* (the message then names the daemon).
+    """
+    try:
+        proc = run(argv, timeout=timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        raise VerifyError(
+            f'{failure}: {sbx_cli.not_responding_message(argv, timeout_s)}'
+        ) from exc
+    if proc.returncode != 0:
+        raise VerifyError(
+            f'{failure} (rc={proc.returncode}): '
+            f'{(proc.stderr or "").strip()}'
+        )
+
+
 def create_command(
     name: str,
     workspace: str,
@@ -406,30 +438,25 @@ def run_verification(
     :returns: The :class:`VerifyOutcome`.
     :raises VerifyError: If the sandbox could not be created or scoped.
     """
-    created = run(
+    _manage(
+        run,
         create_command(
             name, workspace, image=image, cpus=cpus, memory=memory
-        )
+        ),
+        timeout_s=sbx_cli.CREATE_TIMEOUT_S,
+        failure=f'could not create the verification sandbox {name!r}',
     )
-    if created.returncode != 0:
-        raise VerifyError(
-            f'could not create the verification sandbox {name!r} '
-            f'(rc={created.returncode}): {(created.stderr or "").strip()}'
-        )
     try:
         if egress:
-            scoped = run(
+            _manage(
+                run,
                 [
                     'sbx', 'policy', 'allow', 'network',
                     '--sandbox', name, ','.join(egress),
-                ]
+                ],
+                timeout_s=sbx_cli.MANAGE_TIMEOUT_S,
+                failure=f'could not scope egress for {name!r}',
             )
-            if scoped.returncode != 0:
-                raise VerifyError(
-                    f'could not scope egress for {name!r} '
-                    f'(rc={scoped.returncode}): '
-                    f'{(scoped.stderr or "").strip()}'
-                )
         def _step(label: str, program: str) -> StepOutcome:
             try:
                 proc = run(
@@ -492,6 +519,9 @@ def run_verification(
         )
     finally:
         try:
-            run(['sbx', 'rm', '--force', name])
+            run(
+                ['sbx', 'rm', '--force', name],
+                timeout=sbx_cli.MANAGE_TIMEOUT_S,
+            )
         except (OSError, subprocess.SubprocessError, click.ClickException):
             pass

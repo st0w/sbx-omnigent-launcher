@@ -41,7 +41,7 @@ from omnigent.onboarding.sandboxes.base import (
 )
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
-from sbx_omnigent import agy, claude, codex
+from sbx_omnigent import agy, claude, codex, sbx_cli
 from sbx_omnigent import swarm as swarm_mod
 from sbx_omnigent._compat import repo_workspace
 from sbx_omnigent.defaults import DEFAULT_HOST_IMAGE
@@ -459,8 +459,9 @@ class SbxLauncher(ExecModelHostLauncher):
                 'run `sbx login`.'
             )
         # `sbx ls` is a cheap liveness+auth probe; it exits non-zero
-        # when the daemon is unreachable or the user is not signed in.
-        probe = subprocess.run(['sbx', 'ls'], capture_output=True, text=True)
+        # when the daemon is unreachable or the user is not signed in,
+        # and never returns at all when the daemon is stuck (#28).
+        probe = sbx_cli.run(['sbx', 'ls'], timeout_s=sbx_cli.PROBE_TIMEOUT_S)
         if probe.returncode != 0:
             raise click.ClickException(
                 '`sbx` is installed but not usable — run `sbx login` '
@@ -790,7 +791,11 @@ class SbxLauncher(ExecModelHostLauncher):
         with _CREATE_LOCK:
             self._await_create_stagger()
             try:
-                self._run_local(command, action=f'create sandbox {name!r}')
+                self._run_local(
+                    command,
+                    action=f'create sandbox {name!r}',
+                    timeout_s=sbx_cli.CREATE_TIMEOUT_S,
+                )
             finally:
                 _LAST_CREATE_DONE[0] = time.monotonic()
 
@@ -949,12 +954,11 @@ class SbxLauncher(ExecModelHostLauncher):
                 f'  {codex.RELOGIN_HINT}'
             ) from exc
         try:
-            proc = subprocess.run(
+            proc = sbx_cli.run(
                 ['sbx', 'exec', name, 'python3', '-c',
                  codex.build_seed_script()],
-                input=payload,
-                capture_output=True,
-                text=True,
+                timeout_s=sbx_cli.MANAGE_TIMEOUT_S,
+                input_text=payload,
             )
         except OSError as exc:
             raise click.ClickException(
@@ -994,11 +998,10 @@ class SbxLauncher(ExecModelHostLauncher):
             not report success.
         """
         try:
-            proc = subprocess.run(
+            proc = sbx_cli.run(
                 ['sbx', 'exec', name, 'python3', '-c',
                  claude.build_settings_seed_script()],
-                capture_output=True,
-                text=True,
+                timeout_s=sbx_cli.MANAGE_TIMEOUT_S,
             )
         except OSError as exc:
             raise click.ClickException(
@@ -1026,10 +1029,9 @@ class SbxLauncher(ExecModelHostLauncher):
             non-zero, or does not print *marker*.
         """
         try:
-            proc = subprocess.run(
+            proc = sbx_cli.run(
                 ['sbx', 'exec', name, 'python3', '-c', script],
-                capture_output=True,
-                text=True,
+                timeout_s=sbx_cli.MANAGE_TIMEOUT_S,
             )
         except OSError as exc:
             raise click.ClickException(
@@ -1119,11 +1121,13 @@ class SbxLauncher(ExecModelHostLauncher):
         :returns: The command's exit code and captured output.
         :raises click.ClickException: If *check* is ``True`` and the
             command exits non-zero.
+        :raises sbx_cli.SbxNotResponding: If the command does not finish
+            within :data:`sbx_cli.COMMAND_TIMEOUT_S`. This carries
+            Omnigent's ``git clone``, so the budget is the longest tier.
         """
-        proc = subprocess.run(
+        proc = sbx_cli.run(
             ['sbx', 'exec', sandbox_id, '--', 'sh', '-c', command],
-            capture_output=True,
-            text=True,
+            timeout_s=sbx_cli.COMMAND_TIMEOUT_S,
         )
         if check and proc.returncode != 0:
             raise click.ClickException(
@@ -1239,8 +1243,9 @@ class SbxLauncher(ExecModelHostLauncher):
         Remove a sandbox, releasing its microVM.
 
         Best-effort: teardown should not raise if the sandbox is
-        already gone. Set :data:`_KEEP_SANDBOXES_ENV` to skip removal
-        and keep the box (and its host log) for debugging.
+        already gone, or if the sbx daemon is stuck; a stuck daemon is
+        reported on stderr instead. Set :data:`_KEEP_SANDBOXES_ENV` to
+        skip removal and keep the box (and its host log) for debugging.
 
         :param sandbox_id: The sandbox to remove.
         """
@@ -1253,15 +1258,26 @@ class SbxLauncher(ExecModelHostLauncher):
                 err=True,
             )
             return
-        self._run_local(
-            ['sbx', 'rm', '--force', sandbox_id],
-            action=f'remove sandbox {sandbox_id!r}',
-            check=False,
-        )
+        try:
+            self._run_local(
+                ['sbx', 'rm', '--force', sandbox_id],
+                action=f'remove sandbox {sandbox_id!r}',
+                check=False,
+            )
+        except sbx_cli.SbxNotResponding as exc:
+            click.echo(
+                f'[sbx-omnigent] could not remove sandbox {sandbox_id!r}: '
+                f'{exc.format_message()}',
+                err=True,
+            )
 
     @staticmethod
     def _run_local(
-        command: list[str], *, action: str, check: bool = True
+        command: list[str],
+        *,
+        action: str,
+        check: bool = True,
+        timeout_s: float = sbx_cli.MANAGE_TIMEOUT_S,
     ) -> None:
         """
         Run a local ``sbx`` management command on the server host.
@@ -1271,10 +1287,13 @@ class SbxLauncher(ExecModelHostLauncher):
         :param action: Human phrase for error messages, e.g.
             ``"create sandbox 'x'"``.
         :param check: When ``True``, raise on a non-zero exit.
+        :param timeout_s: Budget, from one of :mod:`sbx_cli`'s tiers.
         :raises click.ClickException: If *check* is ``True`` and the
             command exits non-zero.
+        :raises sbx_cli.SbxNotResponding: If the command does not finish
+            within *timeout_s*, whatever *check* is.
         """
-        proc = subprocess.run(command, capture_output=True, text=True)
+        proc = sbx_cli.run(command, timeout_s=timeout_s)
         if check and proc.returncode != 0:
             raise click.ClickException(
                 f'failed to {action} (rc={proc.returncode}): '
