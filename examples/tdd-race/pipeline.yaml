@@ -28,7 +28,7 @@ agents:
   plan:
     template: planner
     harness: antigravity-native
-    model: gemini-3.5-flash
+    model: gemini-3.8-flash-high
   tdd:
     template: tdd-writer
     model: claude-sonnet-5
@@ -41,7 +41,7 @@ agents:
   impl_agy:
     template: coder
     harness: antigravity-native
-    model: gemini-3.5-flash
+    model: gemini-3.8-flash-high
   judge:
     template: judge
     model: claude-opus-4-8

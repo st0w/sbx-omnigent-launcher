@@ -7,16 +7,16 @@ command fires it.
 
 ```
 plan ──▶ build ──▶ review (consensus) ──▶ publish
-(agy)   (Sonnet5)   sec: Sonnet 5  +  bugs: Gemini 3.5
+(agy)   (Sonnet5)   sec: Sonnet 5  +  bugs: Gemini 3.8
                     ── block? loop findings back to build ──
 ```
 
 | Role | Harness | Model | Effort |
 | --- | --- | --- | --- |
-| `plan` | antigravity-native | Gemini 3.5 Flash | — (agy default) |
+| `plan` | antigravity-native | Gemini 3.8 Flash | high (in the model id) |
 | `build` | claude-native | Claude Sonnet 5 | **medium** |
 | `sec` | claude-native | Claude Sonnet 5 | — |
-| `bugs` | antigravity-native | Gemini 3.5 Flash | — (agy default) |
+| `bugs` | antigravity-native | Gemini 3.8 Flash | high (in the model id) |
 
 Every role pins its own model; the `build` coder also pins reasoning effort
 (`medium`) — `sec` is Claude too but leaves effort at the default, and agy's
@@ -71,17 +71,17 @@ stands the VMs up and prints the role→session bindings for you to drive by han
 
 ## What you should see
 
-The `plan` stage (Gemini 3.5) posts a design + questions and **waits for your
+The `plan` stage (Gemini 3.8) posts a design + questions and **waits for your
 `APPROVED`** in the `mixed-models/plan` session; while you plan, the writer VM is
 pre-warmed in the background. On approval, the planner emits a clean consolidated
 plan, `build` (Sonnet 5, medium) implements it on its **own isolated branch**,
-and `sec` (Sonnet 5) and `bugs` (Gemini 3.5) review it `:ro` — both must end
+and `sec` (Sonnet 5) and `bugs` (Gemini 3.8) review it `:ro` — both must end
 `VERDICT: APPROVED`; a block loops their findings back to `build` for another
 round. On consensus the runner commits `build`'s branch, **also commits the
 approved plan to `docs/plans/mixed-models.md`** on that branch (so the design
 ships with the code — override the path with `plan_artifact:`), and publishes it.
 Every microVM is torn down at the end unless you passed `--keep`.
 
-To confirm the pins: `plan`/`bugs` launched `agy --model gemini-3.5-flash`,
+To confirm the pins: `plan`/`bugs` launched `agy --model gemini-3.8-flash-high`,
 `build`/`sec` both launched `claude --model claude-sonnet-5`, and
 `build` ran at medium effort.

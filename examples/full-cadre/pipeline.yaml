@@ -47,7 +47,7 @@ agents:
   plan:                         # read-only design; interactive (blocks on your APPROVED)
     template: planner
     harness: antigravity-native
-    model: gemini-3.5-flash
+    model: gemini-3.8-flash-high
   tdd:                          # writes a FAILING test suite from the plan (tests only)
     template: tdd-writer
     model: claude-sonnet-5
@@ -59,14 +59,14 @@ agents:
   impl_agy:                     # competing coder B — own isolated branch off the tests
     template: coder
     harness: antigravity-native
-    model: gemini-3.5-flash
+    model: gemini-3.8-flash-high
   sec:                          # security auditor (read-only); ends with VERDICT:
     template: security-reviewer
     model: claude-sonnet-5
   bugs:                         # correctness/bug auditor (read-only); ends with VERDICT:
     template: bug-reviewer
     harness: antigravity-native
-    model: gemini-3.5-flash
+    model: gemini-3.8-flash-high
   judge:                        # picks the winning branch to publish; ends with SELECT:
     template: judge
     model: claude-opus-4-8

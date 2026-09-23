@@ -7,7 +7,7 @@ branch — and a **judge** picks the winner to publish.
 
 ```
 plan ─▶ tests ─┬─▶ impl-a  (Claude Sonnet 5, own branch) ─┐
- (agy)  (TDD)   └─▶ impl-b  (agy / Gemini 3.5, own branch) ─┴─▶ pick (judge) ─▶ publish
+ (agy)  (TDD)   └─▶ impl-b  (agy / Gemini 3.8, own branch) ─┴─▶ pick (judge) ─▶ publish
 ```
 
 Both coders' worktrees are **cut from the tests branch** (inheritance), so each
@@ -18,10 +18,10 @@ one; the orchestrator publishes that branch. See
 
 | Node | Agent (template) | Harness | Model | Writes? |
 | --- | --- | --- | --- | --- |
-| `plan` | planner | antigravity-native | Gemini 3.5 Flash | no (`:ro` design) |
+| `plan` | planner | antigravity-native | Gemini 3.8 Flash, high | no (`:ro` design) |
 | `tests` | tdd-writer + `skills/tdd` | claude-native | Claude Sonnet 5, high | yes — tests only |
 | `impl-a` | coder | claude-native | Claude Sonnet 5, high | yes — own branch |
-| `impl-b` | coder | antigravity-native | Gemini 3.5 Flash | yes — own branch |
+| `impl-b` | coder | antigravity-native | Gemini 3.8 Flash, high | yes — own branch |
 | `pick` | judge | claude-native | Claude Opus 4.8 | no (selects a branch) |
 
 The `tests` agent carries a per-agent [`skills/tdd`](./skills/tdd/SKILL.md)
@@ -69,7 +69,7 @@ Add `--keep` to leave the microVMs + worktrees up for inspection afterwards.
 
 ## What you should see
 
-The `plan` stage (Gemini 3.5) posts a design + questions and **waits for your
+The `plan` stage (Gemini 3.8) posts a design + questions and **waits for your
 `APPROVED`** in the `tdd-race/plan` session; while you plan, the tests and both
 impl VMs are pre-warmed in the background. On approval, the planner emits a clean
 consolidated plan and the DAG runs: `tests` (Sonnet 5) writes a test suite on its

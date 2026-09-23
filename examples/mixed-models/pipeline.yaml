@@ -26,10 +26,10 @@ acceptance: |
   malformed/empty input; changes nothing else in net.py.
 
 agents:
-  plan:  { template: planner,           harness: antigravity-native, model: gemini-3.5-flash }
+  plan:  { template: planner,           harness: antigravity-native, model: gemini-3.8-flash-high }
   build: { template: coder,             model: claude-sonnet-5, effort: medium }
   sec:   { template: security-reviewer, model: claude-sonnet-5 }
-  bugs:  { template: bug-reviewer,      harness: antigravity-native, model: gemini-3.5-flash }
+  bugs:  { template: bug-reviewer,      harness: antigravity-native, model: gemini-3.8-flash-high }
 
 stages:
   - { id: plan,  run: plan }                                   # read-only design

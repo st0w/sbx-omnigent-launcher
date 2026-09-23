@@ -47,7 +47,7 @@ agents:
   plan:                         # read-only design; interactive PER MODULE
     template: planner
     harness: antigravity-native
-    model: gemini-3.5-flash
+    model: gemini-3.8-flash-high
   tdd:                          # writes the module's FAILING suite from its plan
     template: tdd-writer
     model: claude-sonnet-5
@@ -59,7 +59,7 @@ agents:
   impl_b:                       # competing coder B
     template: coder
     harness: antigravity-native
-    model: gemini-3.5-flash
+    model: gemini-3.8-flash-high
   sec:                          # security auditor (read-only); ends with VERDICT:
     template: security-reviewer
     model: claude-opus-4-8
@@ -67,7 +67,7 @@ agents:
   bugs:                         # correctness auditor (read-only); ends with VERDICT:
     template: bug-reviewer
     harness: antigravity-native
-    model: gemini-3.5-flash
+    model: gemini-3.8-flash-high
   judge:                        # picks the winning branch; ends with SELECT:
     template: judge
     model: claude-sonnet-5

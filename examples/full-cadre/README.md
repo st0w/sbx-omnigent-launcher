@@ -14,12 +14,12 @@ plan ─▶ tests ─┬─▶ impl-a (Claude) ─▶ review-a [sec+bugs] ─┐
 
 | Node | Template | Harness | Model | Role |
 | --- | --- | --- | --- | --- |
-| `plan` | planner | antigravity-native | Gemini 3.5 Flash | read-only design (interactive) |
+| `plan` | planner | antigravity-native | Gemini 3.8 Flash, high | read-only design (interactive) |
 | `tests` | tdd-writer | claude-native | Claude Sonnet 5, high | writes a failing test suite |
 | `impl-a` | coder | claude-native | Claude Sonnet 5, high | competing coder, own branch |
-| `impl-b` | coder | antigravity-native | Gemini 3.5 Flash | competing coder, own branch |
+| `impl-b` | coder | antigravity-native | Gemini 3.8 Flash, high | competing coder, own branch |
 | `sec` | security-reviewer | claude-native | Claude Sonnet 5 | security audit (`:ro`) |
-| `bugs` | bug-reviewer | antigravity-native | Gemini 3.5 Flash | correctness audit (`:ro`) |
+| `bugs` | bug-reviewer | antigravity-native | Gemini 3.8 Flash, high | correctness audit (`:ro`) |
 | `judge` | judge | claude-native | Claude Opus 4.8 | picks the winning branch |
 | `refactor` | refactoring | claude-native | Claude Sonnet 5, high | cleans up the winner (behavior-preserving) |
 
@@ -89,7 +89,7 @@ Add `--keep` to leave the microVMs + worktrees up for inspection afterwards.
 
 ## What you should see
 
-`plan` (Gemini 3.5) posts a design + questions and waits for your `APPROVED`, then
+`plan` (Gemini 3.8) posts a design + questions and waits for your `APPROVED`, then
 emits a consolidated final plan. `tests` (Sonnet 5) writes a failing suite on its
 own branch. `impl-a` (Claude) and `impl-b` (agy) each cut a branch **from the
 tests branch** and implement to make the suite pass. `review-a` then `review-b`
