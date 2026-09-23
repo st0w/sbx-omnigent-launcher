@@ -8932,7 +8932,7 @@ class PipelineRunner:
         if not result.ok:
             snap = self._session_snapshot(session)
             note = _session_failure_note(snap)
-            auth = self._auth_failure_note(session)
+            auth = self._auth_failure_note(session, result.error, snap)
             pane_path = self._capture_turn(
                 session,
                 f'the turn failed: {result.error}{note}{auth}',
@@ -8962,42 +8962,58 @@ class PipelineRunner:
             )
         return result.reply
 
-    def _auth_failure_note(self, session: str) -> str:
+    def _auth_failure_note(
+        self, session: str, error: str | None, snap: dict | None
+    ) -> str:
         """
-        What the VM's runner log says, if a credential was rejected.
+        Name the rejected credential behind a failed turn, if any.
 
-        A dead credential fails as a harness that never starts, with no
-        pane to read; on 2026-09-14 the runner log in the VM already
-        held the ``401`` (#26). Reads that log and, when it shows an
-        authentication failure, names it and the remedy for this
-        agent's harness.
+        A dead credential fails as a harness that never starts (#26).
+        Where the reason shows up depends on the harness:
+
+        * Claude: Claude Code fires ``StopFailure`` and Omnigent makes
+          its "Failed to authenticate. API Error: 401 ..." the turn's
+          error, and the session's ``last_task_error``. Checked first,
+          since it costs nothing.
+        * Codex: only the runner log inside the VM held the ``401`` on
+          2026-09-14, so that is read next, with one bounded
+          ``sbx exec``.
 
         Best-effort like the pane capture: it runs while a turn is
         already failing, so any error here yields no note rather than a
         different failure. ``KeyboardInterrupt`` still gets out.
 
         :param session: The session whose turn just failed.
+        :param error: The failed turn's error, if any.
+        :param snap: The session snapshot, or ``None`` if unreadable.
         :returns: A parenthesised note for the failure message, or
             ``''``.
         """
-        sandbox = self._sandbox_for_session(session)
-        if sandbox is None:
-            return ''
-        try:
-            phrase = guest_log.auth_failure(
-                guest_log.read_runner_log(sandbox)
-            )
-        except Exception:
-            return ''
+        reported = (snap or {}).get('last_task_error')
+        phrase = guest_log.auth_failure(error)
+        where = "the turn's error"
+        if phrase is None and isinstance(reported, str):
+            phrase = guest_log.auth_failure(reported)
+            where = "the session's last error"
         if phrase is None:
-            return ''
+            sandbox = self._sandbox_for_session(session)
+            if sandbox is None:
+                return ''
+            try:
+                phrase = guest_log.auth_failure(
+                    guest_log.read_runner_log(sandbox)
+                )
+            except Exception:
+                return ''
+            if phrase is None:
+                return ''
+            where = f'the runner log in {sandbox}'
         agent = self._session_agent.get(session)
         harness = agent.harness if agent is not None else ''
         return (
-            f' (the runner log in {sandbox} shows an authentication '
-            f'failure, "{phrase}": the credential this agent runs on '
-            f'was rejected. To renew it, '
-            f'{guest_log.relogin_hint(harness)})'
+            f' ({where} shows an authentication failure, "{phrase}": '
+            f'the credential this agent runs on was rejected. To renew '
+            f'it, {guest_log.relogin_hint(harness)})'
         )
 
     def _no_pane_note(self, session: str) -> str:

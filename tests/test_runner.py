@@ -12601,5 +12601,58 @@ class TestAnAuthFailureIsNamed(_Base):
         self.assertNotIn('diagnostic broke', str(exc))
 
 
+class TestAClaudeAuthFailureIsNamed(_Base):
+    """A rejected Claude credential never reaches the runner log. Claude
+    Code fires StopFailure, and Omnigent makes its last message ("Failed
+    to authenticate. API Error: 401 ...") the turn's error (#26)."""
+
+    _CLAUDE = (
+        'Failed to authenticate. API Error: 401 OAuth access token is '
+        'invalid.'
+    )
+
+    def _failing(
+        self, outcome: str, status: dict | None = None
+    ) -> tuple[R.PipelineRunError, FakeSC]:
+        sc = FakeSC({'tests': 'wrote tests'})
+        sc.turn_outcomes['build'] = [outcome]
+        sc.default_host_id = 'h1'
+        sc.host_names['h1'] = 'managed-h1'
+        if status is not None:
+            sc.status_for_label['build'] = status
+        with mock.patch.object(R.pane, 'capture_pane', return_value=None):
+            with self.assertRaises(R.PipelineRunError) as caught:
+                self._run(_TDD, {}, sc=sc)
+        return caught.exception, sc
+
+    def test_the_turns_error_names_it(self) -> None:
+        exc, _sc = self._failing(f'error:{self._CLAUDE}')
+        self.assertIn('authentication failure', str(exc))
+        self.assertIn('claude setup-token', str(exc))
+
+    def test_the_sessions_last_error_names_it(self) -> None:
+        # `failed: None` on the turn, the reason on the session.
+        exc, _sc = self._failing(
+            'lost', status={'last_task_error': self._CLAUDE}
+        )
+        self.assertIn('authentication failure', str(exc))
+
+    def test_it_says_where_it_found_it(self) -> None:
+        exc, _sc = self._failing(f'error:{self._CLAUDE}')
+        self.assertIn("the turn's error", str(exc))
+
+    def test_no_vm_read_when_the_error_already_says(self) -> None:
+        self._failing(f'error:{self._CLAUDE}')
+        self.runner_log.assert_not_called()
+
+    def test_it_is_not_retried(self) -> None:
+        _exc, sc = self._failing(
+            'lost', status={'last_task_error': self._CLAUDE}
+        )
+        self.assertEqual(
+            sum(1 for lb in sc._label.values() if lb == 'build'), 1
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
