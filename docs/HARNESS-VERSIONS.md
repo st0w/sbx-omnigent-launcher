@@ -100,9 +100,37 @@ at runtime, inside the VM**:
 So genuinely freezing a harness means BOTH pinning the package in the image
 snapshot AND stopping the in-VM updater — removing the auto-updater host from the
 egress policy, or setting whatever disable switch each CLI offers. That is a
-deliberate trade: a frozen harness cannot pick up a security fix either. It has
-NOT been done here; this file exists so the comparison is possible when a run
-wedges.
+deliberate trade: a frozen harness cannot pick up a security fix either. For
+codex and agy it has NOT been done here; this file exists so the comparison is
+possible when a run wedges.
+
+### Pinning Claude Code: `sbx.claude_version`
+
+Claude Code can be pinned without waiting for a new image. A model can need a
+newer Claude Code than the image carries: on the `v0.13.0` image, every turn of
+an Opus 5.5 agent failed with `API Error: 400 Claude Code 2.1.266 does not
+support this model; version 2.1.280 or newer is required`. That error came back
+as the turn's reply, so the run looked like an agent that did nothing.
+
+```yaml
+sandbox:
+  sbx:
+    claude_version: "2.1.280"
+```
+
+With it set, every Claude VM runs `npm install -g @anthropic-ai/claude-code@<pin>`
+before its host starts (skipped when the image already carries the pin), checks
+that `claude --version` then reports it, and fails the VM loudly if not. It also
+sets `DISABLE_AUTOUPDATER=1` in the VM's Claude settings, so no VM moves off the
+pin mid-run. Codex and agy VMs are untouched.
+
+- The install needs `registry.npmjs.org`, which the default egress allows. A
+  custom `sbx.egress_allow` without it is refused at startup.
+- Every Claude VM pays for the download.
+- Only pipeline and swarm VMs are pinned. A session started from the Omnigent UI
+  takes a different path and keeps the image's version.
+- Bump the pin deliberately, after a run on the new version, and record it in the
+  known-good set above.
 
 ## The operational rule
 

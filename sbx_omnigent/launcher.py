@@ -344,6 +344,10 @@ class SbxLauncher(ExecModelHostLauncher):
         no project. Ignored unless ``agy_enabled``.
     :param agy_gcp_location: GCP location for that settings block
         (default ``"us"``).
+    :param claude_version: Exact Claude Code version every Claude VM is
+        moved to before its host starts, with Claude's auto-updater
+        turned off so it stays there; ``None`` keeps whatever the image
+        carries. See :func:`claude.build_version_pin_script`.
 
     Credentials are NOT handled here. ``sbx``'s host-side proxy injects
     them into the agent's outbound API calls from its own secret store
@@ -428,6 +432,7 @@ class SbxLauncher(ExecModelHostLauncher):
         agy_enterprise: bool = False,
         agy_gcp_project: str | None = None,
         agy_gcp_location: str = 'us',
+        claude_version: str | None = None,
     ) -> None:
         self._image = image
         self._profile = profile
@@ -442,6 +447,10 @@ class SbxLauncher(ExecModelHostLauncher):
         self._agy_enterprise = agy_enterprise
         self._agy_gcp_project = agy_gcp_project
         self._agy_gcp_location = agy_gcp_location
+        self._claude_version = (
+            None if claude_version is None
+            else claude.validate_claude_version(claude_version)
+        )
 
     def prepare(self) -> None:
         """
@@ -626,6 +635,9 @@ class SbxLauncher(ExecModelHostLauncher):
             # `launch_args_for` both fall back to Claude for an
             # unresolved harness, so the two stay in step by
             # construction rather than by a second list to maintain.
+            # The pin comes first, and after egress: it downloads.
+            if self._claude_version is not None:
+                self._pin_claude_version(sandbox_id)
             self._seed_claude_settings(sandbox_id)
         # The server OWNS this file and passes it on every managed
         # launch: it is the verbatim in-sandbox
@@ -1000,7 +1012,9 @@ class SbxLauncher(ExecModelHostLauncher):
         try:
             proc = sbx_cli.run(
                 ['sbx', 'exec', name, 'python3', '-c',
-                 claude.build_settings_seed_script()],
+                 claude.build_settings_seed_script(
+                     disable_autoupdater=self._claude_version is not None,
+                 )],
                 timeout_s=sbx_cli.MANAGE_TIMEOUT_S,
             )
         except OSError as exc:
@@ -1013,6 +1027,47 @@ class SbxLauncher(ExecModelHostLauncher):
                 f'failed to pre-accept the Claude bypass-permissions '
                 f'dialog in {name!r} (exit {proc.returncode}): '
                 f'{detail[-800:]}'
+            )
+
+    def _pin_claude_version(self, name: str) -> None:
+        """
+        Move the VM's Claude Code to the pinned version.
+
+        The host image carries whatever Claude Code was newest when it
+        was built, and a model can need a newer one: Opus 5.5 failed
+        every turn on the v0.13.0 image's 2.1.266 with "version 2.1.280
+        or newer is required". This installs the pin with npm before
+        the host starts, so the first turn already runs it; Claude's
+        auto-updater is turned off in the settings seed, so the VM stays
+        on it.
+
+        Fail-loud: a VM left on the wrong version fails every turn in a
+        way that reads as the agent doing nothing.
+
+        :param name: The sandbox to pin.
+        :raises click.ClickException: If the install cannot run, fails,
+            or leaves ``claude`` on another version.
+        :raises sbx_cli.SbxNotResponding: If it does not finish within
+            :data:`sbx_cli.INSTALL_TIMEOUT_S`.
+        """
+        assert self._claude_version is not None
+        version = self._claude_version
+        try:
+            proc = sbx_cli.run(
+                ['sbx', 'exec', name, '--', 'sh', '-c',
+                 claude.build_version_pin_script(version)],
+                timeout_s=sbx_cli.INSTALL_TIMEOUT_S,
+            )
+        except OSError as exc:
+            raise click.ClickException(
+                f'failed to install Claude Code {version} in {name!r}: '
+                f'{exc}'
+            ) from exc
+        if proc.returncode != 0 or claude.PIN_OK_MARKER not in proc.stdout:
+            detail = ((proc.stdout or '') + (proc.stderr or '')).strip()
+            raise click.ClickException(
+                f'failed to install Claude Code {version} in {name!r} '
+                f'(rc={proc.returncode}): {detail[-800:]}'
             )
 
     def _run_agy_inject(

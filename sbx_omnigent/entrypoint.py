@@ -44,7 +44,7 @@ from omnigent.server.managed_hosts import (
     _parse_host_config,
 )
 
-from sbx_omnigent import pipeline
+from sbx_omnigent import claude, pipeline
 from sbx_omnigent._compat import load_agy_bridge
 from sbx_omnigent.defaults import (
     DEFAULT_EGRESS_ALLOW,
@@ -114,6 +114,62 @@ def _as_stagger(value: object) -> float:
             'non-negative number of seconds'
         )
     return float(value)
+
+
+#: Where npm installs a pinned Claude Code from, package and binary.
+_NPM_REGISTRY_HOST = 'registry.npmjs.org'
+
+
+def _as_claude_version(
+    value: object, egress_allow: tuple[str, ...]
+) -> str | None:
+    """
+    Resolve ``sbx.claude_version``, the Claude Code VMs are moved to.
+
+    A model can need a newer Claude Code than the host image carries
+    (Opus 5.5 needs 2.1.280; the v0.13.0 image has 2.1.266), and the
+    image cannot be swapped without moving the server with it. Pinning
+    installs the version into each Claude VM before its host starts.
+
+    :param value: Raw config value; ``None`` pins nothing.
+    :param egress_allow: The resolved per-VM allowlist.
+    :returns: The exact version, or ``None``.
+    :raises ValueError: If it is not an exact version, or the allowlist
+        would block the install, which would then fail every Claude VM.
+    """
+    if value is None:
+        return None
+    try:
+        version = claude.validate_claude_version(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"server config 'sandbox.sbx.claude_version': {exc}"
+        ) from exc
+    if not any(_allows_host(e, _NPM_REGISTRY_HOST) for e in egress_allow):
+        raise ValueError(
+            f"server config 'sandbox.sbx.claude_version' installs Claude "
+            f'Code from {_NPM_REGISTRY_HOST}, which '
+            f"'sandbox.sbx.egress_allow' does not allow. Add it, or "
+            f'remove claude_version.'
+        )
+    return version
+
+
+def _allows_host(entry: str, host: str) -> bool:
+    """
+    Whether an allowlist *entry* lets a VM reach *host* on port 443.
+
+    :param entry: An ``egress_allow`` entry: ``host``, ``host:port``, or
+        a ``*.domain`` wildcard.
+    :param host: The host needed.
+    :returns: Whether *entry* covers it.
+    """
+    name, _, port = entry.partition(':')
+    if port and port != '443':
+        return False
+    if name.startswith('*.'):
+        return host.endswith(name[1:])
+    return name == host
 
 
 def _as_egress_allow(value: object) -> tuple[str, ...]:
@@ -429,6 +485,9 @@ def _build_sbx_config(raw: dict[str, Any]) -> ManagedSandboxConfig:
     )
     if agy_enterprise:
         install_agy_enterprise_onboarding_patch()
+    claude_version = _as_claude_version(
+        sbx.get('claude_version'), egress_allow
+    )
 
     host_config = _parse_host_config(raw)
     warn_on_inert_providers(host_config)
@@ -448,6 +507,7 @@ def _build_sbx_config(raw: dict[str, Any]) -> ManagedSandboxConfig:
             agy_enterprise=agy_enterprise,
             agy_gcp_project=agy_gcp_project,
             agy_gcp_location=agy_gcp_location,
+            claude_version=claude_version,
         )
 
     return ManagedSandboxConfig(

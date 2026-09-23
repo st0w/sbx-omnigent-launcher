@@ -35,6 +35,9 @@ CREATE_TIMEOUT_S = 300.0
 #: A remote command Omnigent hands the launcher, e.g. a ``git clone``.
 COMMAND_TIMEOUT_S = 900.0
 
+#: A package install inside a VM, e.g. a pinned Claude Code from npm.
+INSTALL_TIMEOUT_S = 300.0
+
 #: Checked against ``sbx daemon --help``, ``pgrep`` and ``ps`` on macOS
 #: and Linux. ``sbx daemon stop`` has been seen hanging on a lingering
 #: shim, and a restart also runs containerd's GC, which reclaims guest
