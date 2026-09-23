@@ -228,8 +228,9 @@ Each `agents:` entry is one participant:
   `codex-native`.
 - **`model:` / `effort:`** — pinned per session at create time (not baked into the
   bundle, which native harnesses ignore). `model` reaches every harness; `effort`
-  is honored by the Claude and codex harnesses — **agy has no effort knob**, so omit
-  it there. A codex effort must be one of `none`, `minimal`, `low`, `medium`,
+  is honored by the Claude and codex harnesses. **For agy, effort is the tier in
+  the model id** (`gemini-3.8-flash-high`), and an agy agent with `effort:` is
+  refused. A codex effort must be one of `none`, `minimal`, `low`, `medium`,
   `high`, `xhigh`; anything else is refused when the pipeline loads, and by
   `omni-sbx-swarm start` for a bundle that pins one.
 - **`skills:`** — a directory copied verbatim into the agent's bundle

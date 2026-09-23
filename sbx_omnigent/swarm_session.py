@@ -1042,8 +1042,9 @@ class SwarmSessionClient:
             agent spec's own model.
         :param reasoning_effort: Optional per-session reasoning-effort
             hint — one of ``low``, ``medium``, ``high``, ``xhigh``, or
-            ``max``. Honored by the Claude harnesses; agy has no effort
-            knob and ignores it (informational). ``None`` = the default.
+            ``max``. Honored by the Claude harnesses; agy ignores it
+            (its effort is the tier in its model id), so callers refuse
+            one for agy. ``None`` = the default.
         :returns: The new session (conversation) id.
         :raises SwarmSessionError: On a create failure.
         """
