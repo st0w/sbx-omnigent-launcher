@@ -640,6 +640,10 @@ All keys live under `sandbox:` in your server config.
 | `sbx.agy_gcp_project` | no | GCP project id seeded into the VM's agy `settings.json` — **required for a Business/enterprise (Vertex) account** or an agy turn fails with `invalid project ID` (model listing works without it; running a cascade does not). Unset seeds no project. Ignored unless `agy_enabled`. |
 | `sbx.agy_gcp_location` | no | GCP location for the seeded project block. Default `us`. Ignored unless `agy_enabled`. |
 
+Two of Omnigent's own `sandbox:` settings are not supported with `sbx`, and the
+server refuses to start rather than ignore them: a `reaper:` block, and a
+`providers:` list (sbx runs only as the sole `provider`).
+
 Credentials are intentionally **not** a launcher config key — see [Credentials](#credentials).
 
 ### Environment variables

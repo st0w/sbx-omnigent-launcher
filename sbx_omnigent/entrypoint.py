@@ -1,12 +1,18 @@
 """Register the ``sbx`` provider, then run Omnigent's CLI.
 
 Omnigent's stock server resolves its managed-sandbox provider through
-:func:`omnigent.server.managed_hosts.parse_sandbox_config`, whose
-``provider`` dispatch is a hardcoded if/elif with no plugin hook.
-Rather than patch that source (which would conflict on every ``git
-pull``), this entrypoint wraps the function at process startup:
-``provider: sbx`` is handled here, and every other provider is
-delegated to the original implementation unchanged.
+:func:`omnigent.server.managed_hosts.parse_sandbox_config`. Omnigent
+does load community providers from a registry, but only from modules
+under ``omnigent.community.sandbox.*``, which a separately installed
+package cannot add to. Rather than patch that source (which would
+conflict on every ``git pull``), this entrypoint wraps the function at
+process startup: ``provider: sbx`` is handled here, and every other
+provider is delegated to the original implementation unchanged.
+
+The wrapper builds the sbx deployment from the sbx block alone, so the
+settings Omnigent parses outside a provider entry, ``sandbox.reaper``
+and a ``providers:`` list, are refused beside ``sbx`` rather than
+silently dropped (#54).
 
 The wrap lands before the server command's function-local ``from
 omnigent.server.managed_hosts import parse_sandbox_config`` executes,
@@ -525,10 +531,56 @@ class _SbxParseSandboxConfig:
 
         :param raw: The raw ``sandbox:`` mapping.
         :returns: The deployment, or what the original parser returns.
+        :raises ValueError: For a setting beside ``sbx`` that this
+            wrapper cannot honour (see :func:`_refuse_unsupported_sbx`).
         """
-        if isinstance(raw, dict) and raw.get('provider') == 'sbx':
-            return ManagedSandboxDeployment.single(_build_sbx_config(raw))
+        if isinstance(raw, dict):
+            _refuse_unsupported_sbx(raw)
+            if raw.get('provider') == 'sbx':
+                return ManagedSandboxDeployment.single(
+                    _build_sbx_config(raw)
+                )
         return self._original(raw)
+
+
+def _refuse_unsupported_sbx(raw: dict[str, object]) -> None:
+    """
+    Refuse the ``sandbox:`` settings the ``sbx`` wrapper cannot honour.
+
+    The wrapper builds an sbx deployment from the sbx block alone, so a
+    setting Omnigent parses outside the provider entry never reaches
+    it. These were dropped without a word, or refused with a message
+    that blamed the wrong thing (#54). Refusing them at startup is the
+    contract Omnigent keeps for a config it cannot honour.
+
+    :param raw: The raw ``sandbox:`` mapping.
+    :raises ValueError: For ``reaper`` or ``providers`` beside
+        ``provider: sbx``, or ``sbx`` inside a ``providers:`` list.
+    """
+    if raw.get('provider') == 'sbx':
+        if 'reaper' in raw:
+            raise ValueError(
+                "server config 'sandbox.reaper' is not supported with "
+                "provider 'sbx': the sbx deployment has no reaper, so "
+                "none of its settings would take effect. Remove it."
+            )
+        if 'providers' in raw:
+            raise ValueError(
+                "server config 'sandbox' must set either 'provider' or "
+                "'providers', not both, and 'providers' cannot include "
+                "'sbx'"
+            )
+        return
+    entries = raw.get('providers')
+    if isinstance(entries, list) and any(
+        isinstance(entry, dict) and entry.get('provider') == 'sbx'
+        for entry in entries
+    ):
+        raise ValueError(
+            "server config 'sandbox.providers' cannot include 'sbx': "
+            "sbx runs only as the sole provider. Use `provider: sbx` "
+            "with an `sbx:` block instead of a list."
+        )
 
 
 def _bundled_agent_dirs() -> list[str]:
