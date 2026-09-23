@@ -20,6 +20,13 @@ _CODEX_EXPIRED = (
 )
 #: agy's wording for a dead login since 1.1 (#70).
 _AGY_SIGN_IN = 'Please sign in to view available models'
+#: Claude Code 2.1.280 on a made-up OAuth token and a made-up API key:
+#: its StopFailure hook's `last_assistant_message`, which Omnigent makes
+#: the failed turn's error.
+_CLAUDE_OAUTH = (
+    'Failed to authenticate. API Error: 401 OAuth access token is invalid.'
+)
+_CLAUDE_KEY = 'Failed to authenticate. API Error: 401 API key is invalid.'
 #: The routing line printed beside that failure. It says "login" and
 #: "logged in" and is NOT an auth failure.
 _ROUTING = (
@@ -107,6 +114,11 @@ class TestFindingAnAuthFailure(unittest.TestCase):
 
     def test_agys_sign_in_wording_matches(self) -> None:
         self.assertIsNotNone(guest_log.auth_failure(_AGY_SIGN_IN))
+
+    def test_claudes_wording_matches(self) -> None:
+        for line in (_CLAUDE_OAUTH, _CLAUDE_KEY):
+            with self.subTest(line=line):
+                self.assertIsNotNone(guest_log.auth_failure(line))
 
     def test_the_routing_line_is_not_an_auth_failure(self) -> None:
         # Seen beside the real failure on 9/14, saying the login was

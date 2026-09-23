@@ -8,6 +8,11 @@ read, while the runner log inside the VM already held the answer: a
 tail of that log once a turn has failed, and names an authentication
 failure if it finds one.
 
+Claude never writes to that log. Claude Code fires its ``StopFailure``
+hook, and Omnigent makes the hook's last message ("Failed to
+authenticate. API Error: 401 ...") the failed turn's error, so the
+runner checks that text with :func:`auth_failure` first.
+
 Like :mod:`sbx_omnigent.pane`, it runs on a path where a turn has
 already failed, so it never raises: every failure to read collapses to
 ``None``.
@@ -34,15 +39,17 @@ DEFAULT_LINES = 400
 DEFAULT_TIMEOUT_S = 30.0
 
 #: Lower-case phrases that mean a harness's credential was rejected.
-#: The first four were seen live (#26); the last two are the standard
-#: OAuth and Anthropic API error codes for the same thing. "login" and
-#: "logged in" alone are deliberately absent: the routing line printed
-#: beside the 9/14 failure used both to say the login was fine.
+#: The first five were seen live (#26): Codex's three, agy's, and Claude
+#: Code's prefix for a rejected token or key. The last two are the
+#: standard OAuth and Anthropic API error codes. "login" and "logged in"
+#: alone are deliberately absent: the routing line printed beside the
+#: 9/14 failure used both to say the login was fine.
 AUTH_SIGNALS: tuple[str, ...] = (
     'could not be refreshed',
     'refresh token has expired',
     '401 unauthorized',
     'please sign in',
+    'failed to authenticate',
     'invalid_grant',
     'authentication_error',
 )
