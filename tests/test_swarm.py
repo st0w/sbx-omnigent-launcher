@@ -21,14 +21,13 @@ from unittest import mock
 
 import click
 
+from sbx_omnigent.launch_args import YOLO_LAUNCH_ARGS, launch_args_for
 from sbx_omnigent.swarm import (
     _PUBLISH_MODE_ENV,
-    _YOLO_LAUNCH_ARGS,
     Reviewer,
     SwarmHandle,
     SwarmOrchestrator,
     SwarmRegistry,
-    _launch_args_for,
     _parse_reviewer_specs,
     _read_message,
     _resolve_open_pr,
@@ -283,7 +282,7 @@ class TestStartSwarm(unittest.TestCase):
         # YOLO applied to BOTH roles.
         for kw in (coder_kw, reviewer_kw):
             self.assertEqual(
-                kw['terminal_launch_args'], list(_YOLO_LAUNCH_ARGS)
+                kw['terminal_launch_args'], list(YOLO_LAUNCH_ARGS)
             )
         self.assertEqual(handle.coder_session, 'conv_coder')
         self.assertEqual(handle.reviewers[0].role, 'reviewer')
@@ -559,7 +558,7 @@ class TestCodexIsAThirdHarness(unittest.TestCase):
         # `--permission-mode` with exit 2, so every Codex agent would
         # have died at launch. Its own help names this flag for an
         # externally sandboxed environment, which the microVM is.
-        args = _launch_args_for('codex-native')
+        args = launch_args_for('codex-native')
         self.assertEqual(args, ('--dangerously-bypass-approvals-and-sandbox',))
         self.assertNotIn('--permission-mode', args)
 
@@ -578,7 +577,7 @@ class TestCodexIsAThirdHarness(unittest.TestCase):
         """
         for harness in ('claude-native', None):
             with self.subTest(harness=harness):
-                args = _launch_args_for(harness)
+                args = launch_args_for(harness)
                 self.assertNotIn('auto', args)
                 self.assertNotIn('dontAsk', args)
                 self.assertEqual(
@@ -587,15 +586,15 @@ class TestCodexIsAThirdHarness(unittest.TestCase):
 
     def test_the_other_two_harnesses_are_untouched(self) -> None:
         self.assertEqual(
-            _launch_args_for('antigravity-native'),
+            launch_args_for('antigravity-native'),
             ('--dangerously-skip-permissions',),
         )
         self.assertEqual(
-            _launch_args_for('claude-native'),
+            launch_args_for('claude-native'),
             ('--permission-mode', 'bypassPermissions'),
         )
         self.assertEqual(
-            _launch_args_for(None),
+            launch_args_for(None),
             ('--permission-mode', 'bypassPermissions'),
         )
 
@@ -607,7 +606,7 @@ class TestCodexIsAThirdHarness(unittest.TestCase):
         # turn runs at codex's default (omnigent#2800/#3536).
         # `-c` is the only channel that reaches it.
         self.assertEqual(
-            _launch_args_for('codex-native', 'xhigh'),
+            launch_args_for('codex-native', 'xhigh'),
             (
                 '--dangerously-bypass-approvals-and-sandbox',
                 '-c',
@@ -622,17 +621,17 @@ class TestCodexIsAThirdHarness(unittest.TestCase):
         for effort in ('max', 'ultra', 'bogus', ''):
             with self.subTest(effort=effort):
                 with self.assertRaises(ValueError) as caught:
-                    _launch_args_for('codex-native', effort)
+                    launch_args_for('codex-native', effort)
                 self.assertIn(repr(effort), str(caught.exception))
 
     def test_the_refusal_names_the_accepted_ladder(self) -> None:
         with self.assertRaises(ValueError) as caught:
-            _launch_args_for('codex-native', 'max')
+            launch_args_for('codex-native', 'max')
         self.assertIn('xhigh', str(caught.exception))
 
     def test_no_effort_leaves_codex_on_its_own_default(self) -> None:
         self.assertEqual(
-            _launch_args_for('codex-native', None),
+            launch_args_for('codex-native', None),
             ('--dangerously-bypass-approvals-and-sandbox',),
         )
 
@@ -640,15 +639,15 @@ class TestCodexIsAThirdHarness(unittest.TestCase):
         # Claude gets --effort from Omnigent's own launch path, and for
         # agy the effort IS the model id — neither takes it from here.
         self.assertEqual(
-            _launch_args_for('claude-native', 'xhigh'),
+            launch_args_for('claude-native', 'xhigh'),
             ('--permission-mode', 'bypassPermissions'),
         )
         self.assertEqual(
-            _launch_args_for('antigravity-native', 'high'),
+            launch_args_for('antigravity-native', 'high'),
             ('--dangerously-skip-permissions',),
         )
         self.assertEqual(
-            _launch_args_for(None, 'xhigh'),
+            launch_args_for(None, 'xhigh'),
             ('--permission-mode', 'bypassPermissions'),
         )
 

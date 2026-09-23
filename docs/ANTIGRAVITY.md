@@ -140,7 +140,7 @@ each is now handled automatically by the launcher/swarm code.
   `--permission-mode auto`. `agy` does **not** know that flag and exits on
   startup: `flags provided but not defined: -permission-mode` (rc=2). agy's
   equivalent auto-approve flag is `--dangerously-skip-permissions`.
-- **Fix:** `swarm._launch_args_for(harness)` — agy harnesses get
+- **Fix:** `launch_args.launch_args_for(harness)` — agy harnesses get
   `('--dangerously-skip-permissions',)`, Claude/codex get `('--permission-mode',
   'auto')`. The orchestrator resolves each bound agent's harness from
   `GET /v1/agents` and picks per-agent args. **Client-side** (the `omni-sbx-swarm`

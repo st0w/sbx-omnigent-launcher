@@ -38,6 +38,11 @@ import yaml
 
 from sbx_omnigent import agy, codex
 from sbx_omnigent._compat import CODEX_EFFORTS
+from sbx_omnigent.launch_args import (
+    YOLO_LAUNCH_ARGS,
+    harness_by_ref,
+    launch_args_for,
+)
 from sbx_omnigent.swarm_session import (
     SwarmSessionClient,
     SwarmSessionError,
@@ -49,93 +54,6 @@ from sbx_omnigent.worktrees import WorktreeManager
 #: Default per-turn budget (seconds) — generous, since a turn may wait
 #: on a fresh microVM to finish provisioning before it even starts.
 _DEFAULT_TURN_TIMEOUT_S = 600.0
-
-#: Default no-prompt launch args for swarm agents. Swarm agents are
-#: headless — they cannot answer a permission prompt, so any prompt
-#: hangs the turn. The mode must auto-approve EVERY tool (Bash too, not
-#: just edits) without prompting.
-#:
-#: This is Omnigent's OWN value for claude-native, not a guess of ours.
-#: ``_derive_terminal_launch_args_from_spec``
-#: (``omnigent/server/routes/_sessions/helpers.py``) maps a spec's
-#: ``permission_mode`` onto ``--permission-mode`` and states outright
-#: that "YOLO uses ``bypassPermissions``"; Omnigent's own web
-#: permission-mode selector sends exactly
-#: ``["--permission-mode", "bypassPermissions"]``. That same function is
-#: where :data:`_AGY_LAUNCH_ARGS` and :data:`_CODEX_LAUNCH_ARGS` already
-#: agree with Omnigent — Claude was the one harness where this table
-#: had drifted. Our sessions are the TOP-LEVEL kind, which keep the
-#: launch args in the create body (a ``sub_agent_name`` spawn would
-#: derive them from the spec and ignore the body instead), so passing
-#: them here is the supported seam rather than a workaround.
-#:
-#: HISTORY — two wrong answers, both found live, both silent:
-#: - ``auto``, until 2026-08-19. A Haiku 4.5 reviewer ran in MANUAL
-#:   mode and blocked on every tool call: auto needs a model-side risk
-#:   classifier Haiku does not implement, so Claude Code discarded the
-#:   requested mode with no warning and no log line (TASKS.md #28).
-#: - ``dontAsk``, until 2026-08-22. It does NOT auto-approve. It
-#:   suppresses the PROMPT and then DENIES anything that would have
-#:   raised one — "Permission to use Edit has been denied because
-#:   Claude Code is running in don't ask mode". Read-only Bash still
-#:   passed, so planners and reviewers looked healthy while every
-#:   writer was refused; a coder burned two turns changing no files
-#:   (TASKS.md #39).
-#:
-#: ``bypassPermissions`` opens a "Yes, I accept" dialog on first launch,
-#: which is fatal headless — cleared by pre-seeding
-#: ``skipDangerousModePermissionPrompt`` into the VM's Claude settings
-#: (see :mod:`sbx_omnigent.claude`), the same way Omnigent already
-#: pre-accepts Claude's onboarding and folder-trust gates. The other
-#: half of the old objection — that managed settings reject the mode —
-#: does not apply here: these microVMs carry no managed-settings file.
-#:
-#: ``acceptEdits`` remains wrong for its own reason: it auto-approves
-#: file EDITS only, so a reviewer's ``git diff`` still prompts.
-#:
-#: What actually contains a bad tool call is the microVM boundary and a
-#: reviewer's ``:ro`` mount — both hold at the kernel regardless of what
-#: the agent is permitted to attempt. Omnigent's policy hook
-#: deliberately returns "no opinion" on ALLOW so the harness's own
-#: permission system still runs (``omnigent/native_policy_hook.py``:
-#: emitting ``allow`` "would auto-approve the tool and suppress the
-#: harness's native permission prompt"), which is precisely why the
-#: harness mode has to carry this.
-_YOLO_LAUNCH_ARGS = ('--permission-mode', 'bypassPermissions')
-
-#: agy (Antigravity) equivalent of the YOLO args. agy does NOT accept
-#: Claude's ``--permission-mode`` — it exits on the unknown flag at
-#: launch (before binding its connect-RPC port), which the executor
-#: reports as "the agy terminal is no longer running (the TUI exited)".
-#: agy's auto-approve flag is ``--dangerously-skip-permissions``
-#: instead. Safe for the same reason (microVM isolation + reviewer :ro).
-_AGY_LAUNCH_ARGS = ('--dangerously-skip-permissions',)
-
-#: codex equivalent. It rejects BOTH Claude's ``--permission-mode`` and
-#: agy's ``--dangerously-skip-permissions``; this is the flag its own
-#: help documents for an externally sandboxed environment. Verified
-#: against codex-cli 0.147.0 in an sbx microVM: the turn header reports
-#: ``approval: never, sandbox: danger-full-access``.
-_CODEX_LAUNCH_ARGS = ('--dangerously-bypass-approvals-and-sandbox',)
-
-#: codex config key for reasoning effort, set via the CLI's ``-c
-#: <key=value>`` override because codex-native DROPS the session's
-#: ``reasoning_effort``. The value is accepted, persisted, and reported
-#: back by the API — ``GET /v1/sessions/<id>`` returned
-#: ``"reasoning_effort": "xhigh"`` for a session whose codex status bar
-#: read ``gpt-5.6-sol default`` — but nothing applies it to the TUI.
-#: Upstream: omnigent-ai/omnigent#2800 (open, ``validated:reproduced``)
-#: and #3536; note #3536 asserts native terminals are unaffected
-#: because codex-native applies effort via
-#: ``thread/settings/update``, which does not hold here.
-#:
-#: ``-c`` is an IN-MEMORY override — it is not written to the session's
-#: ``config.toml``, so Omnigent's ``write_codex_config_model()``
-#: cannot clobber it when it pins a model. Verified against
-#: codex-cli 0.148.0 in an sbx microVM 2026-08-19: the turn header
-#: reports ``model: gpt-5.6-sol xhigh`` with this arg, and
-#: ``gpt-5.6-sol default`` without it.
-_CODEX_EFFORT_CONFIG_KEY = 'model_reasoning_effort'
 
 #: The role name used to address the coder in the role-based API/CLI.
 _CODER_ROLE = 'coder'
@@ -373,11 +291,11 @@ class SwarmOrchestrator:
         an explicit per-role ``reviewers`` map instead.
     :param agent_launch_args: Native-terminal args for an agent whose
         harness is NOT in *agent_harnesses* (the Claude/codex default —
-        see :data:`_YOLO_LAUNCH_ARGS`).
+        see :data:`YOLO_LAUNCH_ARGS`).
     :param agent_harnesses: Optional ``{agent-ref: harness}`` map (ids
         and/or names, from ``GET /v1/agents``). When given, each session
         gets harness-appropriate launch args (agy needs
-        :data:`_AGY_LAUNCH_ARGS`, not Claude's ``--permission-mode``);
+        :data:`AGY_LAUNCH_ARGS`, not Claude's ``--permission-mode``);
         when ``None``, every agent gets *agent_launch_args*.
     :param agent_models: Optional ``{agent-ref: model}`` map. When a
         bound agent has an entry, its session is created with that model
@@ -387,7 +305,7 @@ class SwarmOrchestrator:
         map, applied the same way (``reasoning_effort`` at create).
         Honored by the Claude harnesses. Codex needs it a second way —
         it ignores the persisted value, so the same effort also rides
-        its launch args (see :data:`_CODEX_EFFORT_CONFIG_KEY`). agy's
+        its launch args (see :data:`CODEX_EFFORT_CONFIG_KEY`). agy's
         effort is the tier in its model id, so ``start`` refuses one
         (see :func:`_refuse_agy_efforts`).
     """
@@ -399,7 +317,7 @@ class SwarmOrchestrator:
         worktree_manager: WorktreeManager,
         coder_agent_id: str,
         reviewer_agent_id: str = '',
-        agent_launch_args: tuple[str, ...] = _YOLO_LAUNCH_ARGS,
+        agent_launch_args: tuple[str, ...] = YOLO_LAUNCH_ARGS,
         agent_harnesses: dict[str, str] | None = None,
         agent_models: dict[str, str] | None = None,
         agent_efforts: dict[str, str] | None = None,
@@ -422,7 +340,7 @@ class SwarmOrchestrator:
         every agent. A codex agent also carries its own pinned effort
         here — that is the only channel that reaches codex-native, so it
         is resolved PER AGENT rather than per harness (see
-        :data:`_CODEX_EFFORT_CONFIG_KEY`).
+        :data:`CODEX_EFFORT_CONFIG_KEY`).
 
         :param agent_id: The agent ref (id or name) being launched.
         :returns: The launch args for that agent.
@@ -430,7 +348,7 @@ class SwarmOrchestrator:
         if self._agent_harnesses is None:
             return self._agent_launch_args
         return list(
-            _launch_args_for(
+            launch_args_for(
                 self._agent_harnesses.get(agent_id),
                 self._effort_for_agent(agent_id),
             )
@@ -896,26 +814,6 @@ def _agy_ack_enabled(flag: bool | None) -> bool:
     )
 
 
-def _harness_by_ref(agents: list[dict[str, object]]) -> dict[str, str]:
-    """
-    Map each catalog agent's id AND name to its harness.
-
-    :param agents: catalog dicts, each ``{id, name, harness}``.
-    :returns: ``{ref: harness}`` keyed by both id and name (string
-        harnesses only).
-    """
-    out: dict[str, str] = {}
-    for agent in agents:
-        harness = agent.get('harness')
-        if not isinstance(harness, str):
-            continue
-        for key in ('id', 'name'):
-            ref = agent.get(key)
-            if isinstance(ref, str) and ref:
-                out[ref] = harness
-    return out
-
-
 #: Env override for the bundle root the swarm CLI reads per-agent
 #: ``executor.model`` / ``llm.reasoning_effort`` from. Defaults to the
 #: packaged ``agents/`` (same resolution the launcher uses to register
@@ -1013,68 +911,6 @@ def _model_effort_by_ref(
     return models, efforts
 
 
-def _launch_args_for(
-    harness: str | None, effort: str | None = None
-) -> tuple[str, ...]:
-    """
-    YOLO (no-prompt) native-terminal launch args for a harness.
-
-    Every CLI spells this differently and REJECTS the others\' spelling,
-    so an unknown flag is not ignored — the process exits at launch:
-
-    * agy (``antigravity-native``) rejects ``--permission-mode``
-    * codex rejects it too, with ``error: unexpected argument
-      \'--permission-mode\' found`` and exit 2. This function used to
-      claim codex accepted Claude\'s flag; it does not, and every Codex
-      agent would have died at launch. Its own help says
-      ``--dangerously-bypass-approvals-and-sandbox`` is "intended solely
-      for running in environments that are externally sandboxed", which
-      is exactly what the microVM is.
-    * Claude native (and any unresolved harness) take
-      ``--permission-mode auto``
-
-    Codex additionally carries its reasoning effort here, because that
-    is the only channel that reaches it — see
-    :data:`_CODEX_EFFORT_CONFIG_KEY`. An effort outside codex's own
-    ladder is REFUSED, never passed: the value is interpolated into a
-    ``-c key=value`` config expression, so an unvalidated one would
-    reach the CLI as config syntax. It used to be dropped instead, and
-    the turn then ran at codex's default with nothing said (#53). The
-    pipeline loader and ``start`` refuse such an agent before any VM
-    exists, so reaching the raise here is a bug. Claude and agy ignore
-    *effort* here — Claude gets ``--effort`` from Omnigent\'s own
-    launch path (verified: the session transcript records
-    ``"effort":"xhigh"``). agy's effort is the tier in its model id
-    (``gemini-3.8-flash-high``); its ``--effort`` flag sets the same
-    thing and conflicts with a tiered id, so an agy agent with an effort
-    is refused before launch instead (#6).
-
-    :param harness: The agent\'s harness id, or ``None`` when
-        unresolved.
-    :param effort: The agent\'s pinned reasoning effort, or ``None``.
-        Used only for codex.
-    :returns: The launch args for that harness.
-    :raises ValueError: If a codex agent pins an effort off codex's
-        ladder.
-    """
-    if harness in agy.AGY_HARNESSES:
-        return _AGY_LAUNCH_ARGS
-    if harness in codex.CODEX_HARNESSES:
-        if effort is None:
-            return _CODEX_LAUNCH_ARGS
-        if effort not in CODEX_EFFORTS:
-            raise ValueError(
-                f'effort {effort!r} is not one codex is launched with '
-                f'({", ".join(sorted(CODEX_EFFORTS))})'
-            )
-        return (
-            *_CODEX_LAUNCH_ARGS,
-            '-c',
-            f'{_CODEX_EFFORT_CONFIG_KEY}="{effort}"',
-        )
-    return _YOLO_LAUNCH_ARGS
-
-
 def _detect_agy_bindings(
     agents: list[dict[str, object]], bound_ids: list[str]
 ) -> list[str]:
@@ -1122,14 +958,14 @@ def _bindings_on(
     :returns: Matching refs, in input order, deduplicated. An
         unresolvable ref is ignored.
     """
-    harness_by_ref = _harness_by_ref(agents)
+    harness_of = harness_by_ref(agents)
     seen: set[str] = set()
     bound: list[str] = []
     for ref in bound_ids:
         if ref in seen:
             continue
         seen.add(ref)
-        if harness_by_ref.get(ref) in harnesses:
+        if harness_of.get(ref) in harnesses:
             bound.append(ref)
     return bound
 
@@ -1250,7 +1086,7 @@ def _refuse_dropped_codex_efforts(
     Refuse a bound Codex agent whose effort codex is not launched with.
 
     Codex takes its effort only as a ``-c`` value from a closed ladder
-    (:func:`_launch_args_for`). A bundle pinning ``effort: max`` on a
+    (:func:`launch_args_for`). A bundle pinning ``effort: max`` on a
     Codex agent used to run at codex's default with nothing said (#53);
     the pipeline loader refuses it since #71, and this does the same
     for ``start``, before any VM.
@@ -1472,7 +1308,7 @@ def _start(
         ),
         coder_agent_id=coder_agent,
         reviewer_agent_id=reviewer_agent or '',
-        agent_harnesses=_harness_by_ref(catalog),
+        agent_harnesses=harness_by_ref(catalog),
         agent_models=agent_models,
         agent_efforts=agent_efforts,
     )

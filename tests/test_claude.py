@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 
 from sbx_omnigent import claude
-from sbx_omnigent.swarm import _launch_args_for
+from sbx_omnigent.launch_args import launch_args_for
 
 
 def _seed(home: Path) -> subprocess.CompletedProcess[str]:
@@ -123,7 +123,7 @@ class TestSeedIsWiredToTheClaudeMode(unittest.TestCase):
 
     def test_claude_is_launched_in_the_mode_that_needs_it(self) -> None:
         self.assertEqual(
-            _launch_args_for('claude-native'),
+            launch_args_for('claude-native'),
             ('--permission-mode', 'bypassPermissions'),
         )
 

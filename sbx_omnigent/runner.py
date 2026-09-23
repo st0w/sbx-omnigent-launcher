@@ -63,8 +63,8 @@ from sbx_omnigent import (
     verify,
 )
 from sbx_omnigent.defaults import DEFAULT_EGRESS_ALLOW, DEFAULT_HOST_IMAGE
+from sbx_omnigent.launch_args import launch_args_for
 from sbx_omnigent.swarm import (
-    _launch_args_for,
     credential_kind_for,
     mount_sentinel,
 )
@@ -8678,7 +8678,7 @@ class PipelineRunner:
             return
         mode = None
         if agent.harness not in agy.AGY_HARNESSES | codex.CODEX_HARNESSES:
-            args = list(_launch_args_for(agent.harness, agent.effort))
+            args = list(launch_args_for(agent.harness, agent.effort))
             if '--permission-mode' in args:
                 mode = args[args.index('--permission-mode') + 1]
         for why in readback.launch_mismatches(
@@ -8820,7 +8820,7 @@ class PipelineRunner:
             ),
             title=f'{self._run_id}/{label}',
             terminal_launch_args=list(
-                _launch_args_for(agent.harness, agent.effort)
+                launch_args_for(agent.harness, agent.effort)
             ),
             model_override=agent.model,
             reasoning_effort=agent.effort,
