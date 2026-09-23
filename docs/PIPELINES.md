@@ -69,6 +69,8 @@ generated: ["*.lock"]      # optional — files that don't count as implementati
 guarded: ["deny.toml"]     # optional — files that ARE a check (see Guarded checks)
 disk:                      # optional — per-unit estimates for the startup disk
   per_worktree_gb: 0.2     #   preflight; the defaults suit a COMPILED project
+build_cache: [target]      # optional — build output dirs handed from node to
+                           #   node (see "Warm build cache")
 verify:                    # optional — the mechanical gate run before publish
   coverage_min: 95         #   substituted for {coverage_min} in the command
   setup: |                 #   SHELL (not prose) — prepares the gate's own VM
@@ -576,6 +578,39 @@ the turn's budget**, so a stage that asks one clarifying question can exhaust
 ```yaml
 turn_timeout: 3600      # seconds; --turn-timeout overrides it
 ```
+
+## Warm build cache
+
+Every node starts from a fresh clone, so without a cache every node compiles the
+project from clean. `build_cache:` names the build output directories to carry
+from one node to the next:
+
+```yaml
+build_cache: [target]      # Rust; e.g. [node_modules, dist] or [build]
+```
+
+- **What the entries are.** Bare directory names at the top of the worktree.
+  Paths, `.` and `..` are refused when the pipeline loads.
+- **Where the cache lives.** `<canonical-root>/_buildcache/<repo>`, beside the
+  canonical mirrors, so it outlives any one run and two projects never share
+  one.
+- **When it is used.** Every node clone the runner cuts is seeded from it:
+  writers, readers and the verify gate's clone. It is refreshed after every
+  stage that completes, and after a gate that passes, so the next node starts
+  from the newest build. A stage that failed never refreshes it. Reviewers
+  mount a snapshot that is not seeded, so they still build from clean (#37).
+- **Staleness is the build tool's job.** A cache from another branch or
+  toolchain is revalidated by the build tool (Cargo fingerprints every
+  artifact), so the worst case is a from-clean build, never a wrong artifact.
+- **Best-effort.** A cache that can't be seeded or refreshed leaves the node
+  building from clean, and a `[build-cache]` line says so once per run. It
+  never fails a run.
+- **Disk.** Seeding costs nothing only on a filesystem that clones copy-on-write:
+  APFS on macOS, or btrfs and XFS with reflink on Linux. Anywhere else, each
+  node gets a full copy of the cache.
+
+Measured on a Rust workspace: a seeded rebuild took 16 s where a from-clean one
+took 121 s.
 
 ## Verification — the one check the orchestrator makes itself
 

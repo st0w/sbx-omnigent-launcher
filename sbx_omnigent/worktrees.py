@@ -1210,12 +1210,12 @@ class WorktreeManager:
         """
         Clone the warm build cache into a freshly cut node worktree.
 
-        Every node starts from an empty tree, so every node paid a
-        from-clean compile — measured at roughly two thirds of a build
-        increment's wall-clock time, and identical whether the
-        increment changed seven lines or seven hundred. Seeding the
-        previous node's build directory turns that into an incremental
-        one.
+        Every node starts from an empty tree, so without this every
+        node pays a from-clean compile, identical whether the increment
+        changed seven lines or seven hundred. Seeding the previous
+        node's build directory turns that into an incremental one: on a
+        Rust workspace, 16 s instead of 121 s (see
+        ``_MAX_PARALLEL_NODES`` in :mod:`sbx_omnigent.runner`).
 
         On APFS ``cp -Rc`` is a copy-on-write CLONE: measured at 200 MB
         in under 10 ms with no space consumed until a block diverges,
@@ -1228,8 +1228,8 @@ class WorktreeManager:
         fingerprints every artifact by source hash, feature flags and
         compiler version, so a cache from another branch — or another
         toolchain — is revalidated and rebuilt where it disagrees. The
-        worst case is the from-clean build we do today; there is no
-        case where it silently uses the wrong artifact.
+        worst case is a from-clean build; there is no case where it
+        silently uses the wrong artifact.
 
         Best-effort throughout: a cache that cannot be read or copied
         leaves the worktree exactly as it was. Seeding is an
