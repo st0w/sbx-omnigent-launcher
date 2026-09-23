@@ -51,6 +51,7 @@ import click
 
 from sbx_omnigent import (
     agy,
+    claude,
     codex,
     disk_metrics,
     guest_log,
@@ -8929,9 +8930,17 @@ class PipelineRunner:
             # One turn late still beats stage 6 of 8, and costs no wait.
             self._verify_launch(session)
             self._record_harness_versions(session)
+        api_error = claude.api_error_reply(result.reply) if result.ok else None
+        if api_error is not None:
+            # The reply is Claude Code's refusal, not work. It can come
+            # back before the server's failed status does, so it is
+            # read here rather than trusted to that race.
+            result = replace(result, status='failed', error=api_error)
         if not result.ok:
             snap = self._session_snapshot(session)
-            note = _session_failure_note(snap)
+            note = _session_failure_note(snap) + claude.version_hint(
+                result.error
+            )
             auth = self._auth_failure_note(session, result.error, snap)
             pane_path = self._capture_turn(
                 session,

@@ -223,5 +223,64 @@ class TestTheAutoUpdaterCanBeTurnedOff(unittest.TestCase):
         self.assertEqual(self.settings.stat().st_mtime_ns, before)
 
 
+#: What Claude Code 2.1.266 replied to every turn of an Opus 5.5 agent.
+_TOO_OLD = (
+    "API Error: 400 Claude Code 2.1.266 does not support this model; "
+    "version 2.1.280 or newer is required. Run 'claude update', or "
+    'update the Claude desktop app, then try again.'
+)
+
+
+class TestAnApiErrorReplyIsRecognised(unittest.TestCase):
+    """Claude Code answers a rejected request with one line of text,
+    which Omnigent forwards as the turn's reply."""
+
+    def test_the_version_error(self) -> None:
+        self.assertEqual(claude.api_error_reply(_TOO_OLD), _TOO_OLD)
+
+    def test_a_rejected_credential(self) -> None:
+        for reply in (
+            'Failed to authenticate. API Error: 401 OAuth access token '
+            'is invalid.',
+            'Failed to authenticate. API Error: 401 API key is invalid.',
+        ):
+            with self.subTest(reply=reply):
+                self.assertEqual(claude.api_error_reply(reply), reply)
+
+    def test_surrounding_whitespace_is_ignored(self) -> None:
+        self.assertEqual(claude.api_error_reply(f'\n{_TOO_OLD}\n'), _TOO_OLD)
+
+    def test_a_real_reply_that_mentions_one_is_not(self) -> None:
+        # An agent reporting on an HTTP client is doing its job.
+        for reply in (
+            f'I found the bug. The client logs:\n{_TOO_OLD}',
+            f'Fixed: the handler returned "{_TOO_OLD}"',
+            'API Error: handled in errors.py',
+            '',
+        ):
+            with self.subTest(reply=reply):
+                self.assertIsNone(claude.api_error_reply(reply))
+
+    def test_no_reply_is_not(self) -> None:
+        self.assertIsNone(claude.api_error_reply(None))
+
+
+class TestATooOldClaudeNamesThePin(unittest.TestCase):
+    def test_the_version_error_names_the_setting(self) -> None:
+        hint = claude.version_hint(_TOO_OLD)
+        self.assertIn('sandbox.sbx.claude_version', hint)
+        self.assertIn('2.1.280', hint)
+        self.assertIn('2.1.266', hint)
+
+    def test_any_other_error_has_no_hint(self) -> None:
+        for error in (
+            'Failed to authenticate. API Error: 401 API key is invalid.',
+            'API Error: 529 Overloaded',
+            None,
+        ):
+            with self.subTest(error=error):
+                self.assertEqual(claude.version_hint(error), '')
+
+
 if __name__ == '__main__':
     unittest.main()
