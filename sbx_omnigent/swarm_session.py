@@ -34,6 +34,9 @@ from typing import TYPE_CHECKING, Protocol
 
 import click
 
+from sbx_omnigent import agy
+from sbx_omnigent.launch_args import harness_by_ref, launch_args_for
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -2296,6 +2299,17 @@ def cli(ctx: click.Context, server: str, token: str | None) -> None:
 @click.option('--workspace', default=None, help='Mount sentinel or repo URL.')
 @click.option('--parent', 'parent_session_id', default=None)
 @click.option('--title', default=None)
+@click.option(
+    '--model', 'model_override', default=None,
+    help='Model to pin, e.g. claude-sonnet-5. An agy id carries its '
+    'effort tier: gemini-3.8-flash-high.',
+)
+@click.option(
+    '--effort', 'reasoning_effort', default=None,
+    help='Reasoning effort to pin. Codex receives it as a launch arg, '
+    'from its own ladder; agy takes it from the model id, so it is '
+    'refused for agy.',
+)
 @click.pass_obj
 def _create(
     client: SwarmSessionClient,
@@ -2303,16 +2317,86 @@ def _create(
     workspace: str | None,
     parent_session_id: str | None,
     title: str | None,
+    model_override: str | None,
+    reasoning_effort: str | None,
 ) -> None:
-    """Create a managed session; print its id."""
+    """
+    Create a managed session; print its id.
+
+    Launch args come from the agent's harness in the server's catalog,
+    built as omni-sbx-swarm start builds them: the no-prompt args a
+    headless agent needs, and a codex effort as a -c value.
+    """
+    harness = _catalog_harness(client, agent_id)
+    launch = _create_launch_args(harness, agent_id, reasoning_effort)
     click.echo(
         client.create(
             agent_id=agent_id,
             workspace=workspace,
             parent_session_id=parent_session_id,
             title=title,
+            terminal_launch_args=launch,
+            model_override=model_override,
+            reasoning_effort=reasoning_effort,
         )
     )
+
+
+def _catalog_harness(client: SwarmSessionClient, agent_id: str) -> str | None:
+    """
+    The harness the server's catalog lists for *agent_id*, or ``None``.
+
+    :param client: The session client.
+    :param agent_id: The agent's id or name.
+    :returns: The harness, or ``None`` when the catalog cannot be read
+        or does not list the agent.
+    """
+    try:
+        catalog = client.list_builtin_agents()
+    except SwarmSessionError:
+        return None
+    return harness_by_ref(catalog).get(agent_id)
+
+
+def _create_launch_args(
+    harness: str | None, agent_id: str, effort: str | None
+) -> list[str] | None:
+    """
+    The launch args for a new session, or ``None`` for none.
+
+    :param harness: The agent's harness, or ``None`` if unresolved.
+    :param agent_id: The agent, for messages.
+    :param effort: The ``--effort`` given, or ``None``.
+    :returns: The launch args; ``None`` when the harness is unknown and
+        no effort was asked for, which creates the session as this
+        command always has.
+    :raises click.UsageError: For an effort that cannot be applied: the
+        harness is unknown, the agent is agy, or it is off codex's
+        ladder.
+    """
+    if harness is None:
+        if effort is not None:
+            raise click.UsageError(
+                f"--effort: the server's agent catalog does not list "
+                f'{agent_id!r}, or could not be read, so its harness is '
+                f'unknown and the effort cannot be applied'
+            )
+        click.echo(
+            f"[create] the server's agent catalog does not list "
+            f'{agent_id!r}, or could not be read, so its harness is '
+            f'unknown: creating it with no launch args.',
+            err=True,
+        )
+        return None
+    if effort is not None and harness in agy.AGY_HARNESSES:
+        raise click.UsageError(
+            f"--effort {effort!r}: agy's effort is the tier in its model "
+            f'id (e.g. gemini-3.8-flash-high); pass it in --model instead'
+        )
+    try:
+        return list(launch_args_for(harness, effort))
+    except ValueError as exc:
+        raise click.UsageError(f'--effort: {exc}') from exc
 
 
 @cli.command('send-and-wait')

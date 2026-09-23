@@ -623,7 +623,7 @@ class SbxLauncher(ExecModelHostLauncher):
             # needs before `bypassPermissions` will start at all.
             # `credential is None` is EXACTLY the set of VMs that get
             # the Claude launch args: `credential_kind_for` and
-            # `_launch_args_for` both fall back to Claude for an
+            # `launch_args_for` both fall back to Claude for an
             # unresolved harness, so the two stay in step by
             # construction rather than by a second list to maintain.
             self._seed_claude_settings(sandbox_id)
@@ -980,7 +980,7 @@ class SbxLauncher(ExecModelHostLauncher):
         Pre-accept Claude's bypass-permissions dialog inside a VM.
 
         Claude launches with ``--permission-mode bypassPermissions``
-        (see :data:`sbx_omnigent.swarm._YOLO_LAUNCH_ARGS`), and the
+        (see :data:`sbx_omnigent.launch_args.YOLO_LAUNCH_ARGS`), and the
         first launch in that mode renders a full-screen "Yes, I accept"
         warning. No one is at the terminal in a swarm VM, so without
         this the agent never reaches its prompt and the turn dies at

@@ -16,7 +16,7 @@ from unittest import mock
 import click
 from click.testing import CliRunner
 
-from sbx_omnigent import swarm
+from sbx_omnigent import launch_args, swarm
 
 _AGENTS: list[dict[str, object]] = [
     {
@@ -174,33 +174,33 @@ class TestGuardAgyBindings(unittest.TestCase):
 
 
 class TestLaunchArgsFor(unittest.TestCase):
-    """`_launch_args_for` / `_harness_by_ref` pick per-harness args."""
+    """`launch_args_for` / `harness_by_ref` pick per-harness args."""
 
     def test_agy_harness_gets_skip_permissions(self) -> None:
         self.assertEqual(
-            swarm._launch_args_for('antigravity-native'),
+            launch_args.launch_args_for('antigravity-native'),
             ('--dangerously-skip-permissions',),
         )
 
     def test_agy_alias_matches(self) -> None:
         self.assertEqual(
-            swarm._launch_args_for('native-antigravity'),
-            swarm._AGY_LAUNCH_ARGS,
+            launch_args.launch_args_for('native-antigravity'),
+            launch_args.AGY_LAUNCH_ARGS,
         )
 
     def test_claude_gets_permission_mode(self) -> None:
         self.assertEqual(
-            swarm._launch_args_for('claude-native'),
+            launch_args.launch_args_for('claude-native'),
             ('--permission-mode', 'bypassPermissions'),
         )
 
     def test_unresolved_defaults_to_claude(self) -> None:
         self.assertEqual(
-            swarm._launch_args_for(None), swarm._YOLO_LAUNCH_ARGS
+            launch_args.launch_args_for(None), launch_args.YOLO_LAUNCH_ARGS
         )
 
     def test_harness_by_ref_keys_id_and_name(self) -> None:
-        refs = swarm._harness_by_ref(_AGENTS)
+        refs = launch_args.harness_by_ref(_AGENTS)
         self.assertEqual(refs['ag_coder'], 'antigravity-native')
         self.assertEqual(refs['swarm-agy-coder'], 'antigravity-native')
         self.assertEqual(refs['swarm-coder'], 'claude-native')
@@ -235,7 +235,7 @@ class TestOrchestratorLaunchArgs(unittest.TestCase):
         orch = self._orch(None)
         self.assertEqual(
             orch._launch_args_for_agent('anything'),
-            list(swarm._YOLO_LAUNCH_ARGS),
+            list(launch_args.YOLO_LAUNCH_ARGS),
         )
 
 

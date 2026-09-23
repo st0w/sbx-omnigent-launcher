@@ -300,6 +300,14 @@ coordinator invokes via `sys_os_shell`) is the trusted-plane primitive that runs
 one agent turn and knows when it finished. Commands: `create` / `send-and-wait` /
 `read` / `status` / `dispose`.
 
+`create` takes `--model` and `--effort`, and builds the launch args from the
+agent's harness in the server's catalog, the way `omni-sbx-swarm start` does:
+the no-prompt args a headless agent needs, and a codex effort as a `-c` value.
+An effort it cannot apply is refused before any session exists: off codex's
+ladder, on an agy agent (agy's effort is the tier in its model id), or for an
+agent the catalog does not list. With no effort and an unlisted agent, the
+session is created without launch args, and stderr says so.
+
 Turn completion is **push-based, not polled**. `send-and-wait`:
 1. subscribes to the session SSE stream `GET /v1/sessions/{id}/stream`;
 2. waits for the **ready heartbeat** the server emits the instant the subscriber
