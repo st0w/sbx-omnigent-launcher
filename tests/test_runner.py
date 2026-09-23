@@ -12662,5 +12662,61 @@ class TestAClaudeAuthFailureIsNamed(_Base):
         )
 
 
+class TestAnApiErrorReplyFailsTheTurn(_Base):
+    """Claude Code's "API Error: 400 ... version 2.1.280 or newer is
+    required" came back as the turn's REPLY, before the server's failed
+    status. The runner took it as success, waited out the settle window
+    on an empty tree four times, and failed the stage as an agent that
+    "reported success without writing production code"."""
+
+    _TOO_OLD = (
+        'API Error: 400 Claude Code 2.1.266 does not support this model; '
+        'version 2.1.280 or newer is required.'
+    )
+
+    def _failing(self, reply: str) -> tuple[R.PipelineRunError, FakeSC]:
+        sc = FakeSC({'tests': 'wrote tests', 'build': reply})
+        with mock.patch.object(R.pane, 'capture_pane', return_value=None):
+            with self.assertRaises(R.PipelineRunError) as caught:
+                self._run(_TDD, {}, sc=sc)
+        return caught.exception, sc
+
+    def test_the_turn_fails_with_the_error(self) -> None:
+        exc, _sc = self._failing(self._TOO_OLD)
+        self.assertIn('API Error: 400', str(exc))
+
+    def test_it_is_not_mistaken_for_a_writer_that_did_nothing(self) -> None:
+        exc, sc = self._failing(self._TOO_OLD)
+        self.assertNotIn('produced no implementation', str(exc))
+        sent = [m for s, m in sc.sent if sc.label_of(s) == 'build']
+        self.assertEqual(len(sent), 1)
+
+    def test_it_is_not_retried(self) -> None:
+        # A fresh VM on the same image fails the same way.
+        _exc, sc = self._failing(self._TOO_OLD)
+        self.assertEqual(
+            sum(1 for lb in sc._label.values() if lb == 'build'), 1
+        )
+
+    def test_a_too_old_claude_names_the_pin(self) -> None:
+        exc, _sc = self._failing(self._TOO_OLD)
+        self.assertIn('sandbox.sbx.claude_version', str(exc))
+
+    def test_a_rejected_credential_is_named(self) -> None:
+        exc, _sc = self._failing(
+            'Failed to authenticate. API Error: 401 OAuth access token '
+            'is invalid.'
+        )
+        self.assertIn('authentication failure', str(exc))
+        self.assertIn('claude setup-token', str(exc))
+
+    def test_a_real_reply_that_mentions_one_passes(self) -> None:
+        result, _sc, _wt = self._run(_TDD, {
+            'tests': 'wrote tests',
+            'build': f'Handled the upstream failure:\n{self._TOO_OLD}',
+        })
+        self.assertEqual(result.status, 'completed')
+
+
 if __name__ == '__main__':
     unittest.main()

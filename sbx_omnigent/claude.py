@@ -97,6 +97,58 @@ NPM_PACKAGE = '@anthropic-ai/claude-code'
 
 _VERSION_RE = re.compile(r'[0-9]+\.[0-9]+\.[0-9]+')
 
+#: Claude Code's reply when the API rejected the turn: one line,
+#: optionally prefixed for a rejected credential. Seen live: "API Error:
+#: 400 Claude Code 2.1.266 does not support this model; ..." and
+#: "Failed to authenticate. API Error: 401 OAuth access token is
+#: invalid.".
+_API_ERROR_RE = re.compile(
+    r'(?:Failed to authenticate\. )?API Error: [0-9]{3}\b[^\n]*'
+)
+
+#: The API's refusal of a model the installed Claude Code predates.
+_TOO_OLD_RE = re.compile(
+    r'Claude Code ([0-9]+\.[0-9]+\.[0-9]+) does not support this model; '
+    r'version ([0-9]+\.[0-9]+\.[0-9]+) or newer is required'
+)
+
+
+def api_error_reply(reply: str | None) -> str | None:
+    """
+    The API error a turn's whole reply consists of, or ``None``.
+
+    Claude Code answers a request the API rejected with that one line
+    of text, and Omnigent forwards it as the turn's reply. The server
+    does mark the turn failed, but the runner can see the turn finish
+    first: a pipeline writer's four turns each came back as that line
+    and were taken for success. Only a reply that is exactly the line
+    counts, so an agent quoting one in real work is left alone.
+
+    :param reply: The turn's reply.
+    :returns: The error line, or ``None``.
+    """
+    text = (reply or '').strip()
+    return text if _API_ERROR_RE.fullmatch(text) else None
+
+
+def version_hint(error: str | None) -> str:
+    """
+    Name the fix when the API refused a model the VM's Claude predates.
+
+    :param error: A turn's error text.
+    :returns: A parenthesised note naming ``sandbox.sbx.claude_version``
+        and the version required, or ``''``.
+    """
+    match = _TOO_OLD_RE.search(error or '')
+    if match is None:
+        return ''
+    have, need = match.groups()
+    return (
+        f' (the VM runs Claude Code {have}, too old for this model: set '
+        f'sandbox.sbx.claude_version to {need} or newer in the server '
+        f'config, then restart the server)'
+    )
+
 
 def validate_claude_version(value: object) -> str:
     """
