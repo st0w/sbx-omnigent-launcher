@@ -49,8 +49,9 @@ See `docs/HARNESS-VERSIONS.md`.
 
 **Omnigent now has a real provider plugin hook.** The
 `omnigent.sandbox_providers` entry-point group
-(`omnigent/onboarding/sandboxes/registry.py`) does what
-`entrypoint.py`'s docstring says does not exist. Adopting it would
-retire the `parse_sandbox_config` monkeypatch, at the cost of moving
-the launcher class under the `omnigent.community.sandbox.*` namespace
-the registry requires. Not done; the wrapper still works.
+(`omnigent/onboarding/sandboxes/registry.py`) loads community
+providers. Adopting it would retire the `parse_sandbox_config`
+monkeypatch, and would bring `sandbox.reaper` and a `providers:` list
+to sbx; the wrapper refuses both beside sbx today (#54). The cost is
+moving the launcher class under the `omnigent.community.sandbox.*`
+namespace the registry requires. Not done; the wrapper still works.
