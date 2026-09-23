@@ -1035,11 +1035,12 @@ class SwarmSessionClient:
             ``["--permission-mode", "auto"]`` so a headless agent
             auto-approves every tool instead of blocking on a prompt.
         :param model_override: Optional per-session model to pin, e.g.
-            ``"claude-sonnet-5"`` or an agy ``"gemini-3.5-*"`` label.
-            The server applies it the way Polly applies a per-dispatch
-            model: native harnesses receive it as ``--model`` at launch,
-            SDK harnesses via ``HARNESS_<H>_MODEL``. ``None`` = use the
-            agent spec's own model.
+            ``"claude-sonnet-5"``, or an agy id with its effort tier,
+            ``"gemini-3.8-flash-high"``. The server applies it the way
+            Polly applies a per-dispatch model: native harnesses receive
+            it as ``--model`` at launch, SDK harnesses via
+            ``HARNESS_<H>_MODEL``. ``None`` = use the agent spec's own
+            model.
         :param reasoning_effort: Optional per-session reasoning-effort
             hint — one of ``low``, ``medium``, ``high``, ``xhigh``, or
             ``max``. Honored by the Claude harnesses; agy ignores it

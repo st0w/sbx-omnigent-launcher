@@ -203,7 +203,7 @@ context: |                 # optional — project facts baked into EVERY agent's
   Stack, conventions, etc.  #   system prompt (see "Configuring agents")
 
 agents:                    # WHO is on the pipeline
-  plan:  { template: planner,  harness: antigravity-native, model: gemini-3.5-flash }
+  plan:  { template: planner,  harness: antigravity-native, model: gemini-3.8-flash-high }
   build: { template: coder,    model: claude-sonnet-5, effort: medium }
   sec:   { template: security-reviewer, model: claude-sonnet-5 }
 
