@@ -10778,6 +10778,14 @@ class TestChunkGranularity(unittest.TestCase):
         self.assertIn('fixed per increment', ask)
         self.assertIn('seven lines or seven hundred', ask)
 
+    def test_the_cost_is_stated_without_a_stale_figure(self) -> None:
+        # It said the fixed cost was "about two thirds" of an
+        # increment's time. Writers now start from the warm build
+        # cache, and that figure no longer holds (#39).
+        ask = self._ask()
+        self.assertNotIn('two thirds', ask)
+        self.assertIn('a microVM for every writer, reviewer and judge', ask)
+
     def test_size_and_order_are_no_longer_conflated(self) -> None:
         # It used to say "order them smallest shippable increment
         # first", which reads as an instruction to make them small.
