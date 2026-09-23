@@ -230,7 +230,8 @@ Each `agents:` entry is one participant:
   bundle, which native harnesses ignore). `model` reaches every harness; `effort`
   is honored by the Claude and codex harnesses — **agy has no effort knob**, so omit
   it there. A codex effort must be one of `none`, `minimal`, `low`, `medium`,
-  `high`, `xhigh`; anything else is refused when the pipeline loads.
+  `high`, `xhigh`; anything else is refused when the pipeline loads, and by
+  `omni-sbx-swarm start` for a bundle that pins one.
 - **`skills:`** — a directory copied verbatim into the agent's bundle
   (Polly-style), to layer repo- or role-specific guidance on top of the base
   prompt. See [`examples/tdd-race/skills/tdd/`](./examples/tdd-race/skills/tdd/).

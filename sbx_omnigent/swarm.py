@@ -1035,9 +1035,12 @@ def _launch_args_for(
     Codex additionally carries its reasoning effort here, because that
     is the only channel that reaches it — see
     :data:`_CODEX_EFFORT_CONFIG_KEY`. An effort outside codex's own
-    ladder is DROPPED rather than passed: the value is interpolated
-    into a ``-c key=value`` config expression, so an unvalidated one
-    would reach the CLI as config syntax. Claude and agy ignore
+    ladder is REFUSED, never passed: the value is interpolated into a
+    ``-c key=value`` config expression, so an unvalidated one would
+    reach the CLI as config syntax. It used to be dropped instead, and
+    the turn then ran at codex's default with nothing said (#53). The
+    pipeline loader and ``start`` refuse such an agent before any VM
+    exists, so reaching the raise here is a bug. Claude and agy ignore
     *effort* here — Claude gets ``--effort`` from Omnigent\'s own
     launch path (verified: the session transcript records
     ``"effort":"xhigh"``), and agy has no effort knob at all, since
@@ -1046,19 +1049,26 @@ def _launch_args_for(
     :param harness: The agent\'s harness id, or ``None`` when
         unresolved.
     :param effort: The agent\'s pinned reasoning effort, or ``None``.
-        Used only for codex, and only when codex accepts it.
+        Used only for codex.
     :returns: The launch args for that harness.
+    :raises ValueError: If a codex agent pins an effort off codex's
+        ladder.
     """
     if harness in agy.AGY_HARNESSES:
         return _AGY_LAUNCH_ARGS
     if harness in codex.CODEX_HARNESSES:
-        if effort in CODEX_EFFORTS:
-            return (
-                *_CODEX_LAUNCH_ARGS,
-                '-c',
-                f'{_CODEX_EFFORT_CONFIG_KEY}="{effort}"',
+        if effort is None:
+            return _CODEX_LAUNCH_ARGS
+        if effort not in CODEX_EFFORTS:
+            raise ValueError(
+                f'effort {effort!r} is not one codex is launched with '
+                f'({", ".join(sorted(CODEX_EFFORTS))})'
             )
-        return _CODEX_LAUNCH_ARGS
+        return (
+            *_CODEX_LAUNCH_ARGS,
+            '-c',
+            f'{_CODEX_EFFORT_CONFIG_KEY}="{effort}"',
+        )
     return _YOLO_LAUNCH_ARGS
 
 
@@ -1228,6 +1238,41 @@ def _probe_codex_login(
         ) from exc
 
 
+def _refuse_dropped_codex_efforts(
+    agents: list[dict[str, object]],
+    bound_ids: list[str],
+    efforts: dict[str, str],
+) -> None:
+    """
+    Refuse a bound Codex agent whose effort codex is not launched with.
+
+    Codex takes its effort only as a ``-c`` value from a closed ladder
+    (:func:`_launch_args_for`). A bundle pinning ``effort: max`` on a
+    Codex agent used to run at codex's default with nothing said (#53);
+    the pipeline loader refuses it since #71, and this does the same
+    for ``start``, before any VM.
+
+    :param agents: The built-in agent catalog.
+    :param bound_ids: Agent refs bound to this swarm.
+    :param efforts: ``{agent-ref: effort}`` from the bound agents'
+        bundles (see :func:`_model_effort_by_ref`).
+    :raises click.ClickException: Naming each offending agent, its
+        effort and the accepted ladder.
+    """
+    bad = [
+        f'{ref} ({efforts[ref]!r})'
+        for ref in _detect_codex_bindings(agents, bound_ids)
+        if ref in efforts and efforts[ref] not in CODEX_EFFORTS
+    ]
+    if bad:
+        raise click.ClickException(
+            f'Codex agent(s) {", ".join(bad)} pin an effort codex is '
+            f'not launched with ({", ".join(sorted(CODEX_EFFORTS))}); '
+            "the turn would run at codex's default. Set one of those "
+            "in the agent's bundle config.yaml."
+        )
+
+
 def _read_message(message: str | None, message_file: str | None) -> str:
     """
     Read a turn message from ``--message`` or ``--message-file``.
@@ -1381,6 +1426,7 @@ def _start(
     # config.yaml and ride the session-create body (model_override /
     # reasoning_effort) — the Polly pin that reaches native harnesses.
     agent_models, agent_efforts = _model_effort_by_ref(catalog)
+    _refuse_dropped_codex_efforts(catalog, bound_ids, agent_efforts)
     orch = SwarmOrchestrator(
         session_client=client,
         worktree_manager=WorktreeManager(

@@ -615,17 +615,20 @@ class TestCodexIsAThirdHarness(unittest.TestCase):
             ),
         )
 
-    def test_an_effort_codex_does_not_accept_is_dropped(self) -> None:
-        # `max` is a REAL level for Anthropic but absent from codex's
-        # ladder, so a cadre that pins max everywhere must not send it
-        # here — the value is interpolated into a `-c key=value` config
-        # expression, and codex rejects an unknown effort client-side.
+    def test_an_effort_codex_does_not_accept_is_refused(self) -> None:
+        # It used to be dropped, so the turn ran at codex's default and
+        # nothing said so (#53). It is still never passed: the value is
+        # interpolated into a `-c key=value` config expression.
         for effort in ('max', 'ultra', 'bogus', ''):
             with self.subTest(effort=effort):
-                self.assertEqual(
-                    _launch_args_for('codex-native', effort),
-                    ('--dangerously-bypass-approvals-and-sandbox',),
-                )
+                with self.assertRaises(ValueError) as caught:
+                    _launch_args_for('codex-native', effort)
+                self.assertIn(repr(effort), str(caught.exception))
+
+    def test_the_refusal_names_the_accepted_ladder(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            _launch_args_for('codex-native', 'max')
+        self.assertIn('xhigh', str(caught.exception))
 
     def test_no_effort_leaves_codex_on_its_own_default(self) -> None:
         self.assertEqual(
