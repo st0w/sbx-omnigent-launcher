@@ -34,7 +34,7 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
-from sbx_omnigent import claude, codex
+from sbx_omnigent import agy, claude, codex
 from sbx_omnigent._compat import CODEX_EFFORTS, model_family_mismatch
 
 #: Shipped role prompt templates live here (Path-relative, like the
@@ -291,7 +291,8 @@ class PipelineAgent:
     :param model: Optional model to pin at session create (not baked
         into the bundle). ``None`` = harness default.
     :param effort: Optional reasoning effort to pin at create. ``None``
-        = default. Ignored by harnesses without an effort knob (agy).
+        = default. Refused on an agy agent, whose effort is the tier in
+        its model id (see :func:`_validate_agy_efforts`).
     :param skills_dir: Absolute path to a skills directory to copy into
         the materialized bundle, or ``None``.
     """
@@ -697,6 +698,7 @@ def _validate(config: PipelineConfig) -> None:
     _validate_stage_refs(config, seen_ids)
     _validate_model_families(config)
     _validate_codex_efforts(config)
+    _validate_agy_efforts(config)
     _validate_launch_sizes(config)
 
 
@@ -801,6 +803,33 @@ def _validate_codex_efforts(config: PipelineConfig) -> None:
             f'agent {agent_name!r}: effort {agent.effort!r} is not one '
             f'codex is launched with ({", ".join(sorted(CODEX_EFFORTS))}); '
             "the turn would silently run at codex's default effort"
+        )
+
+
+def _validate_agy_efforts(config: PipelineConfig) -> None:
+    """
+    Refuse an ``effort:`` on an agy agent.
+
+    agy's effort is the tier in its model id: ``agy models`` lists only
+    ``gemini-3.8-flash-low``/``-medium``/``-high`` and the like. Its
+    ``--effort`` flag sets the same thing, and agy refuses the two when
+    they disagree. Nothing passes ``--effort`` to agy, and Omnigent
+    treats the session's effort as informational, so ``effort: low`` on
+    a ``-high`` model silently ran at high, and a value off agy's ladder
+    failed every turn (#6).
+
+    :param config: The assembled config.
+    :raises PipelineError: Naming the agent and its effort, and saying
+        where agy's effort is set instead.
+    """
+    for agent_name, agent in config.agents.items():
+        if agent.effort is None or agent.harness not in agy.AGY_HARNESSES:
+            continue
+        raise PipelineError(
+            f'agent {agent_name!r}: effort {agent.effort!r} is not '
+            f"applied to agy. agy's effort is the tier in its model id "
+            f'(e.g. gemini-3.8-flash-high); remove `effort:` and pick '
+            f'the tier in `model:` (`agy models` lists them)'
         )
 
 

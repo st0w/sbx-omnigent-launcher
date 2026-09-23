@@ -6,7 +6,7 @@
 # fires the run. Set `repo:` and `task:` to your own before running.
 #
 # Each role runs its own model; per-agent effort is enforced for the Claude
-# harnesses (agy has no effort knob — see docs/ANTIGRAVITY.md, docs/PIPELINES.md).
+# harnesses (agy's effort is the tier in its model id — see docs/PIPELINES.md).
 
 version: 1
 name: mixed-models

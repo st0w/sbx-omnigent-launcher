@@ -9,10 +9,12 @@ raises on an agy binding without acknowledgment. No real server. Run:
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 from unittest import mock
 
 import click
+from click.testing import CliRunner
 
 from sbx_omnigent import swarm
 
@@ -72,6 +74,63 @@ class TestDetectAgyBindings(unittest.TestCase):
             {'id': 'x', 'name': 'x', 'harness': None}
         ]
         self.assertEqual(swarm._detect_agy_bindings(agents, ['x']), [])
+
+
+class TestStartRefusesAnAgyEffort(unittest.TestCase):
+    """agy's effort is the tier in its model id (#6). A bundle pinning
+    `reasoning_effort` on an agy agent was ignored, so `start` refuses
+    it before any VM, as the pipeline loader does."""
+
+    def test_an_agy_effort_is_refused(self) -> None:
+        with self.assertRaises(click.ClickException) as caught:
+            swarm._refuse_agy_efforts(
+                _AGENTS, ['ag_coder'], {'ag_coder': 'low'}
+            )
+        message = caught.exception.format_message()
+        self.assertIn('ag_coder', message)
+        self.assertIn("'low'", message)
+        self.assertIn('model id', message)
+
+    def test_it_matches_a_ref_by_name_too(self) -> None:
+        with self.assertRaises(click.ClickException):
+            swarm._refuse_agy_efforts(
+                _AGENTS, ['swarm-agy-coder'], {'swarm-agy-coder': 'high'}
+            )
+
+    def test_an_agy_agent_without_effort_passes(self) -> None:
+        swarm._refuse_agy_efforts(_AGENTS, ['ag_coder'], {})
+
+    def test_a_claude_effort_passes(self) -> None:
+        swarm._refuse_agy_efforts(
+            _AGENTS, ['ag_claude'], {'ag_claude': 'max'}
+        )
+
+    def test_start_refuses_before_any_vm(self) -> None:
+        client = mock.Mock()
+        client.list_builtin_agents.return_value = _AGENTS
+        orch = mock.Mock()
+        with (
+            mock.patch.object(
+                swarm, 'SwarmSessionClient', return_value=client
+            ),
+            mock.patch.object(swarm, 'SwarmOrchestrator', orch),
+            mock.patch.object(swarm, 'WorktreeManager'),
+            mock.patch.object(
+                swarm, '_model_effort_by_ref',
+                return_value=({}, {'swarm-agy-coder': 'high'}),
+            ),
+        ):
+            result = CliRunner().invoke(swarm.cli, [
+                '--registry', tempfile.mkdtemp(),
+                'start', '--swarm-id', 's1',
+                '--repo-url', 'https://example/r.git',
+                '--canonical-root', '/srv/c', '--worktree-root', '/srv/w',
+                '--coder-agent', 'swarm-agy-coder',
+                '--reviewer-agent', 'swarm-coder', '--agy',
+            ])
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn('swarm-agy-coder', result.output)
+        orch.assert_not_called()
 
 
 class TestAgyAckEnabled(unittest.TestCase):

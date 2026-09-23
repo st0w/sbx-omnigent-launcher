@@ -387,8 +387,9 @@ class SwarmOrchestrator:
         map, applied the same way (``reasoning_effort`` at create).
         Honored by the Claude harnesses. Codex needs it a second way —
         it ignores the persisted value, so the same effort also rides
-        its launch args (see :data:`_CODEX_EFFORT_CONFIG_KEY`). agy has
-        no effort knob: for agy the effort IS the model id.
+        its launch args (see :data:`_CODEX_EFFORT_CONFIG_KEY`). agy's
+        effort is the tier in its model id, so ``start`` refuses one
+        (see :func:`_refuse_agy_efforts`).
     """
 
     def __init__(
@@ -1043,8 +1044,10 @@ def _launch_args_for(
     exists, so reaching the raise here is a bug. Claude and agy ignore
     *effort* here — Claude gets ``--effort`` from Omnigent\'s own
     launch path (verified: the session transcript records
-    ``"effort":"xhigh"``), and agy has no effort knob at all, since
-    for agy the effort IS the model id (``gemini-3.7-flash-high``).
+    ``"effort":"xhigh"``). agy's effort is the tier in its model id
+    (``gemini-3.8-flash-high``); its ``--effort`` flag sets the same
+    thing and conflicts with a tiered id, so an agy agent with an effort
+    is refused before launch instead (#6).
 
     :param harness: The agent\'s harness id, or ``None`` when
         unresolved.
@@ -1273,6 +1276,40 @@ def _refuse_dropped_codex_efforts(
         )
 
 
+def _refuse_agy_efforts(
+    agents: list[dict[str, object]],
+    bound_ids: list[str],
+    efforts: dict[str, str],
+) -> None:
+    """
+    Refuse a bound agy agent whose bundle pins a reasoning effort.
+
+    agy's effort is the tier in its model id, and nothing passes the
+    session's effort to agy, so a pinned one was ignored (#6). The
+    pipeline loader refuses it too.
+
+    :param agents: The built-in agent catalog.
+    :param bound_ids: Agent refs bound to this swarm.
+    :param efforts: ``{agent-ref: effort}`` from the bound agents'
+        bundles (see :func:`_model_effort_by_ref`).
+    :raises click.ClickException: Naming each offending agent and its
+        effort.
+    """
+    bad = [
+        f'{ref} ({efforts[ref]!r})'
+        for ref in _detect_agy_bindings(agents, bound_ids)
+        if ref in efforts
+    ]
+    if bad:
+        raise click.ClickException(
+            f'agy agent(s) {", ".join(bad)} pin a reasoning effort, '
+            f"which agy never applies: agy's effort is the tier in its "
+            f'model id (e.g. gemini-3.8-flash-high). Remove '
+            f"reasoning_effort from the agent's bundle config.yaml and "
+            f'pick the tier in its model.'
+        )
+
+
 def _read_message(message: str | None, message_file: str | None) -> str:
     """
     Read a turn message from ``--message`` or ``--message-file``.
@@ -1427,6 +1464,7 @@ def _start(
     # reasoning_effort) — the Polly pin that reaches native harnesses.
     agent_models, agent_efforts = _model_effort_by_ref(catalog)
     _refuse_dropped_codex_efforts(catalog, bound_ids, agent_efforts)
+    _refuse_agy_efforts(catalog, bound_ids, agent_efforts)
     orch = SwarmOrchestrator(
         session_client=client,
         worktree_manager=WorktreeManager(

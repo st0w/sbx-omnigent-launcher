@@ -714,18 +714,42 @@ class TestLoadPipeline(_Base):
                 )
                 self.assertEqual(cfg.agents['a'].effort, effort)
 
-    def test_an_effort_is_only_laddered_for_codex(self) -> None:
-        # Claude and agy take no `-c` config, so the codex ladder says
-        # nothing about them.
-        for harness in ('claude-native', 'antigravity-native'):
-            with self.subTest(harness=harness):
-                cfg = self._load(
-                    'repo: ./p\nagents:\n'
-                    f'  a: {{template: coder, harness: {harness}, '
-                    'effort: max}\n'
-                    'stages:\n  - {id: s, run: a}\n'
-                )
-                self.assertEqual(cfg.agents['a'].effort, 'max')
+    def test_a_claude_effort_is_not_held_to_codex_ladder(self) -> None:
+        # Claude takes no `-c` config, and accepts `max`.
+        cfg = self._load(
+            'repo: ./p\nagents:\n'
+            '  a: {template: coder, harness: claude-native, effort: max}\n'
+            'stages:\n  - {id: s, run: a}\n'
+        )
+        self.assertEqual(cfg.agents['a'].effort, 'max')
+
+    def test_an_agy_effort_is_refused_at_load(self) -> None:
+        # #6: agy's effort is the tier in its model id, so `effort:`
+        # was ignored, and a value off agy's ladder failed every turn.
+        for harness in ('antigravity-native', 'native-antigravity'):
+            for effort in ('low', 'high', 'max'):
+                with self.subTest(harness=harness, effort=effort):
+                    with self.assertRaises(P.PipelineError) as caught:
+                        self._load(
+                            'repo: ./p\nagents:\n'
+                            f'  a: {{template: coder, harness: {harness}, '
+                            f'model: gemini-3.8-flash-high, '
+                            f'effort: {effort}}}\n'
+                            'stages:\n  - {id: s, run: a}\n'
+                        )
+                    msg = str(caught.exception)
+                    self.assertIn("agent 'a'", msg)
+                    self.assertIn(repr(effort), msg)
+                    self.assertIn('model id', msg)
+
+    def test_an_agy_agent_without_effort_loads(self) -> None:
+        cfg = self._load(
+            'repo: ./p\nagents:\n'
+            '  a: {template: coder, harness: antigravity-native, '
+            'model: gemini-3.8-flash-low}\n'
+            'stages:\n  - {id: s, run: a}\n'
+        )
+        self.assertIsNone(cfg.agents['a'].effort)
 
     def test_parallel_competing_writers(self) -> None:
         cfg = self._load(

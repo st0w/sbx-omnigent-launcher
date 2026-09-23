@@ -92,7 +92,7 @@ agents:                    # WHO is on the pipeline
     prompt_file: ./p.md    #   a prompt read from a file (relative to this yaml)
     harness: claude-native # default: claude-native
     model: claude-sonnet-5 # optional; pinned at session create
-    effort: medium         # optional; Claude and codex (agy has no knob)
+    effort: medium         # optional; Claude and codex (agy: set it in the model id)
     skills: ./skills/tdd   # optional; a dir copied into the agent's bundle
 
 stages:                    # the DAG — what runs, in what order, with what edges
@@ -117,8 +117,11 @@ agent or `codex-native` for Codex. Model and effort are **not** baked into the
 bundle — native harnesses ignore a spec-declared model. The runner applies them
 per session at create time (`model_override` / `reasoning_effort`), which reaches
 every harness: `--model` at launch for the native CLIs, spawn env for the SDK.
-Effort is honored by the Claude and codex harnesses; **agy has no effort knob**, so
-it's omitted there rather than declared and silently ignored. Codex takes effort
+Effort is honored by the Claude and codex harnesses. **For agy, effort is the tier
+in the model id** (`gemini-3.8-flash-low`, `-medium`, `-high`; `agy models` lists
+them), so an agy agent with `effort:` is refused when the pipeline loads, and by
+`omni-sbx-swarm start`. agy's own `--effort` flag sets the same thing, and agy
+refuses the two when they disagree. Codex takes effort
 as a `-c` config value, so the launcher only passes one from a fixed ladder
 (`none` through `xhigh`). A `codex-native` agent pinned to anything else, such as
 `max`, is refused when the pipeline loads instead of running at codex's default.
@@ -1188,8 +1191,9 @@ Either refusal names the fix: `codex login --device-auth` on the host.
 
 Agy (`antigravity-native`) agents need the harvest/proxy-swap auth path — the
 one-time `agy /login` on the trusted box and a running token harvester — plus
-`agy_enabled: true` in the server's `sandbox` block. Model is pinnable
-(`--model gemini-3.5-flash`); reasoning effort is not. See
+`agy_enabled: true` in the server's `sandbox` block. The model is pinnable, and
+its id carries the reasoning effort as a tier (`model: gemini-3.8-flash-high`);
+a separate `effort:` is refused. See
 [`ANTIGRAVITY.md`](./ANTIGRAVITY.md).
 
 **The harvester is automatic.** If a pipeline declares any agy agent, the runner

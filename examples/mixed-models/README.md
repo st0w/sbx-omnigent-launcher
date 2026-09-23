@@ -19,8 +19,9 @@ plan ──▶ build ──▶ review (consensus) ──▶ publish
 | `bugs` | antigravity-native | Gemini 3.5 Flash | — (agy default) |
 
 Every role pins its own model; the `build` coder also pins reasoning effort
-(`medium`) — `sec` is Claude too but leaves effort at the default, and agy
-exposes no effort knob at all (see [`../../docs/ANTIGRAVITY.md`](../../docs/ANTIGRAVITY.md)).
+(`medium`) — `sec` is Claude too but leaves effort at the default, and agy's
+effort is the tier in its model id rather than a separate `effort:` (see
+[`../../docs/PIPELINES.md`](../../docs/PIPELINES.md#agents)).
 How the pipeline model works is in [`../../docs/PIPELINES.md`](../../docs/PIPELINES.md).
 
 > **New to the launcher?** Start with [`../quickstart/`](../quickstart/) — a
