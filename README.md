@@ -640,6 +640,7 @@ All keys live under `sandbox:` in your server config.
 | `sbx.agy_enterprise` | no | Default `false`. Sets `enterpriseOnboardingComplete` in the seeded onboarding marker (and patches the in-VM bridge so agy's first-run wizard is skipped) — set `true` for a **Business/enterprise** Google account, else agy re-runs enterprise onboarding a headless VM can't answer. Ignored unless `agy_enabled`. |
 | `sbx.agy_gcp_project` | no | GCP project id seeded into the VM's agy `settings.json` — **required for a Business/enterprise (Vertex) account** or an agy turn fails with `invalid project ID` (model listing works without it; running a cascade does not). Unset seeds no project. Ignored unless `agy_enabled`. |
 | `sbx.agy_gcp_location` | no | GCP location for the seeded project block. Default `us`. Ignored unless `agy_enabled`. |
+| `sbx.claude_version` | no | Exact Claude Code version, e.g. `"2.1.280"`, installed into every **Claude** VM before its host starts, with Claude's auto-updater turned off so it stays there. For a model the image's Claude Code is too old for. Needs `registry.npmjs.org` in the egress allowlist (the default has it). Pipeline and swarm VMs only. See [`docs/HARNESS-VERSIONS.md`](./docs/HARNESS-VERSIONS.md#pinning-claude-code-sbxclaude_version). |
 
 Two of Omnigent's own `sandbox:` settings are not supported with `sbx`, and the
 server refuses to start rather than ignore them: a `reaper:` block, and a

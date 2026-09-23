@@ -45,6 +45,8 @@ a script literal instead of on stdin.
 
 from __future__ import annotations
 
+import re
+
 #: Sentinel the in-VM seed prints on success, so a silent no-op cannot
 #: pass for a successful seed.
 #: The claude-native harness ids, as Omnigent spells them
@@ -77,8 +79,82 @@ SETTINGS_KEY = 'skipDangerousModePermissionPrompt'
 #: Path of the settings file inside the guest, relative to ``$HOME``.
 SETTINGS_REL_PATH = '.claude/settings.json'
 
+#: Claude Code's switch for its background auto-updater, set through the
+#: ``env`` block of ``settings.json`` (documented: code.claude.com
+#: "Disable auto-updates"). It stops only the background check, which is
+#: what moves a VM to a new version partway through a run.
+AUTOUPDATER_ENV = 'DISABLE_AUTOUPDATER'
 
-def build_settings_seed_script() -> str:
+#: Printed by :func:`build_version_pin_script` once ``claude --version``
+#: reports the pinned version.
+PIN_OK_MARKER = '__omni_claude_pin_ok__'
+
+#: The npm package the host image installs Claude Code from. Replacing
+#: it in place keeps the ``claude`` Omnigent launches: the image puts it
+#: at ``/usr/local/bin/claude``, while a native ``claude install`` lands
+#: in ``~/.local/bin``, which is not on the VM's ``PATH``.
+NPM_PACKAGE = '@anthropic-ai/claude-code'
+
+_VERSION_RE = re.compile(r'[0-9]+\.[0-9]+\.[0-9]+')
+
+
+def validate_claude_version(value: object) -> str:
+    """
+    Return *value* if it is an exact Claude Code version, else raise.
+
+    The version is interpolated into a shell command in the VM, so only
+    ``MAJOR.MINOR.PATCH`` digits are accepted: no channel names, no
+    ranges, no whitespace.
+
+    :param value: The configured version, e.g. ``"2.1.280"``.
+    :returns: *value*, unchanged.
+    :raises ValueError: If it is not a string of that exact form.
+    """
+    if not isinstance(value, str) or not _VERSION_RE.fullmatch(value):
+        raise ValueError(
+            f'a Claude Code version must be exact, like 2.1.280; '
+            f'got {value!r}'
+        )
+    return value
+
+
+def build_version_pin_script(version: str) -> str:
+    """
+    The in-VM shell program that makes ``claude`` report *version*.
+
+    Installs the exact version with npm when ``claude --version``
+    reports anything else, including a newer one, then checks again.
+    Written for a minimal POSIX ``sh`` (the VM's is dash).
+
+    :param version: The exact version to pin, e.g. ``"2.1.280"``.
+    :returns: A ``sh -c`` program printing :data:`PIN_OK_MARKER` and
+        the version on success. On failure it exits non-zero and prints
+        why: npm's last lines, or the version still reported.
+    :raises ValueError: If *version* is not exact.
+    """
+    want = validate_claude_version(version)
+    return (
+        f"want='{want}'\n"
+        "have=$(claude --version 2>/dev/null | cut -d' ' -f1)\n"
+        'if [ "$have" != "$want" ]; then\n'
+        '  log=$(mktemp)\n'
+        f'  if ! npm install -g --no-audit --no-fund "{NPM_PACKAGE}@$want" '
+        '>"$log" 2>&1; then\n'
+        '    echo "npm install of Claude Code $want failed:"\n'
+        '    tail -n 20 "$log"\n'
+        '    exit 3\n'
+        '  fi\n'
+        'fi\n'
+        "now=$(claude --version 2>/dev/null | cut -d' ' -f1)\n"
+        'if [ "$now" != "$want" ]; then\n'
+        '  echo "claude --version reports ${now:-nothing}, not $want"\n'
+        '  exit 4\n'
+        'fi\n'
+        f'echo "{PIN_OK_MARKER} $now"\n'
+    )
+
+
+def build_settings_seed_script(*, disable_autoupdater: bool = False) -> str:
     """
     The in-VM program that pre-accepts the bypass-permissions dialog.
 
@@ -93,6 +169,10 @@ def build_settings_seed_script() -> str:
     Omnigent's own refusal to overwrite an unexpected user config
     rather than silently replacing it.
 
+    :param disable_autoupdater: Also set :data:`AUTOUPDATER_ENV` in the
+        file's ``env`` block, so a VM pinned to a Claude Code version
+        stays on it for the whole run. Existing ``env`` entries are
+        kept; an ``env`` that is not a mapping fails loud.
     :returns: A ``python3 -c`` program printing :data:`SEED_OK_MARKER`.
     """
     return (
@@ -105,8 +185,18 @@ def build_settings_seed_script() -> str:
         '    data = json.loads(raw) if raw else {}\n'
         '    if not isinstance(data, dict):\n'
         "        sys.exit('claude settings is not a JSON object: %s' % p)\n"
+        'changed = False\n'
         f'if data.get({SETTINGS_KEY!r}) is not True:\n'
         f'    data[{SETTINGS_KEY!r}] = True\n'
+        '    changed = True\n'
+        f'if {disable_autoupdater!r}:\n'
+        "    env = data.setdefault('env', {})\n"
+        '    if not isinstance(env, dict):\n'
+        "        sys.exit('claude settings env is not a mapping: %s' % p)\n"
+        f"    if env.get({AUTOUPDATER_ENV!r}) != '1':\n"
+        f"        env[{AUTOUPDATER_ENV!r}] = '1'\n"
+        '        changed = True\n'
+        'if changed:\n'
         '    p.parent.mkdir(parents=True, exist_ok=True)\n'
         "    p.write_text(json.dumps(data, indent=2), encoding='utf-8')\n"
         '    os.chmod(p, 0o600)\n'
