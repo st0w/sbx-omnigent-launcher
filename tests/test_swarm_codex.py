@@ -257,5 +257,69 @@ class TestStartChecksTheLoginAgainstTheServer(unittest.TestCase):
         probe.assert_not_called()
 
 
+class TestStartRefusesACodexEffortItWouldDrop(unittest.TestCase):
+    """A bundle pinning `effort: max` on a Codex agent ran at codex's
+    default, with nothing said (#53). `start` now refuses it before any
+    VM, as the pipeline loader already does (#71)."""
+
+    def test_an_off_ladder_effort_is_refused(self) -> None:
+        with self.assertRaises(click.ClickException) as caught:
+            swarm._refuse_dropped_codex_efforts(
+                _AGENTS, ['ag_codex'], {'ag_codex': 'max'}
+            )
+        message = caught.exception.format_message()
+        self.assertIn('ag_codex', message)
+        self.assertIn("'max'", message)
+        self.assertIn('xhigh', message)
+
+    def test_a_ladder_effort_passes(self) -> None:
+        swarm._refuse_dropped_codex_efforts(
+            _AGENTS, ['ag_codex'], {'ag_codex': 'xhigh'}
+        )
+
+    def test_no_effort_passes(self) -> None:
+        swarm._refuse_dropped_codex_efforts(_AGENTS, ['ag_codex'], {})
+
+    def test_a_claude_agent_is_not_held_to_codex_ladder(self) -> None:
+        # Claude takes `max`; its effort reaches it another way.
+        swarm._refuse_dropped_codex_efforts(
+            _AGENTS, ['ag_claude'], {'ag_claude': 'max'}
+        )
+
+    def test_it_matches_a_ref_by_name_too(self) -> None:
+        with self.assertRaises(click.ClickException):
+            swarm._refuse_dropped_codex_efforts(
+                _AGENTS, ['swarm-codex-coder'], {'swarm-codex-coder': 'ultra'}
+            )
+
+    def test_start_refuses_before_any_vm(self) -> None:
+        client = mock.Mock()
+        client.list_builtin_agents.return_value = _AGENTS
+        orch = mock.Mock()
+        with (
+            mock.patch.object(
+                swarm, 'SwarmSessionClient', return_value=client
+            ),
+            mock.patch.object(swarm, 'SwarmOrchestrator', orch),
+            mock.patch.object(swarm, 'WorktreeManager'),
+            mock.patch.object(swarm.codex, 'preflight', return_value=None),
+            mock.patch.object(swarm.codex, 'probe_login', return_value=None),
+            mock.patch.object(
+                swarm, '_model_effort_by_ref',
+                return_value=({}, {'swarm-codex-coder': 'max'}),
+            ),
+        ):
+            registry = tempfile.mkdtemp()
+            result = CliRunner().invoke(
+                swarm.cli,
+                ['--registry', registry,
+                 *TestStartRunsTheCodexPreflight._ARGS],
+            )
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn('swarm-codex-coder', result.output)
+        self.assertIn("'max'", result.output)
+        orch.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()
