@@ -8731,8 +8731,16 @@ class PipelineRunner:
 
         * the version this session recorded at its first turn, when it
           has one: the CLI updated itself mid-session;
-        * otherwise an earlier session in this run driving the same CLI;
+        * otherwise an earlier session in this run driving the same CLI,
+          including an earlier session of this same node: a retry's
+          dead VM, or the previous attempt a resume restored;
         * the known-good set, once per CLI per process.
+
+        Readings are kept per node, so a node's new session replaces its
+        earlier one's. Each carries the session it came from, in memory
+        only: a resume restores readings that belong to no live session,
+        and comparing a new VM with one of those as "its first turn"
+        called a pinned VM a mid-session self-update.
 
         WARNS, never raises, and the first reading for a session is the
         one kept.
@@ -8746,7 +8754,13 @@ class PipelineRunner:
         label = self._session_label.get(session, session)
         cli = harness_versions.cli_for_harness(agent.harness)
         with self._lock:
-            first = self._harness_versions.get(label)
+            recorded = self._harness_versions.get(label)
+            first = (
+                recorded
+                if recorded is not None
+                and recorded.get('session') == session
+                else None
+            )
             warnings = self._version_warnings(
                 label, cli, versions.get(cli), first
             )
@@ -8754,6 +8768,7 @@ class PipelineRunner:
                 self._harness_versions[label] = {
                     'runs': cli,
                     'versions': dict(versions),
+                    'session': session,
                 }
         for warning in warnings:
             click.echo(f'[versions] {warning}')
@@ -8793,8 +8808,12 @@ class PipelineRunner:
         for other, entry in self._harness_versions.items():
             before = _recorded_version(entry, cli)
             if entry.get('runs') == cli and before not in (None, now):
+                ran = (
+                    f'an earlier session of {label}' if other == label
+                    else other
+                )
                 warnings.append(
-                    f'{label}: {cli} {now}, but {other} ran {before} '
+                    f'{label}: {cli} {now}, but {ran} ran {before} '
                     f'earlier in this run.'
                 )
                 break

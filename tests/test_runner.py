@@ -9121,6 +9121,80 @@ class TestHarnessVersionsAreRecorded(_Base):
         result, _wt, _said = self._run_on_vm(boom)
         self.assertEqual(result.status, 'completed')
 
+    def test_a_retry_is_not_called_a_mid_session_update(self) -> None:
+        # A lost writer turn is retried on a fresh VM (#87). Its reading
+        # is a new session's, not the old one updating itself.
+        calls: list[str] = []
+
+        def versions(sandbox):
+            calls.append(sandbox)
+            claude = '2.1.266' if len(calls) <= 2 else '2.1.280'
+            return {**_KNOWN_GOOD, 'claude': claude}
+
+        sc = FakeSC(dict(_LINEAR_REPLIES))
+        sc.turn_outcomes['build'] = ['lost']
+        _r, _wt, said = self._run_on_vm(versions, sc=sc)
+        joined = '\n'.join(said)
+        self.assertNotIn('mid-session', joined)
+        self.assertIn('an earlier session of build ran 2.1.266', joined)
+
+
+class TestAResumeIsNotAMidSessionUpdate(_Base):
+    """A resume restores the previous attempt's readings, keyed by the
+    node. A new VM for that node was compared against them as if it
+    were the same session: "claude 2.1.280 is installed now, but it ran
+    2.1.266 at its first turn. It updated itself mid-session." It was a
+    different VM, pinned to 2.1.280 before it started."""
+
+    def _note(self, versions: dict[str, str]) -> tuple[R.PipelineRunner, str]:
+        cfg = self._cfg(_LINEAR)
+        # Real clients, never called: only the version bookkeeping runs.
+        runner = R.PipelineRunner(
+            cfg,
+            session_client=SwarmSessionClient('http://unused'),
+            worktree_manager=WorktreeManager(
+                canonical_root=str(self.root / 'c'),
+                worktree_root=str(self.root / 'w'),
+            ),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        runner._harness_versions = R._restore_harness_versions({
+            'build': {
+                'runs': 'claude',
+                'versions': {**_KNOWN_GOOD, 'claude': '2.1.266'},
+            },
+        })
+        runner._session_agent['sess-new'] = cfg.agents['build']
+        runner._session_label['sess-new'] = 'build'
+        with mock.patch.object(R.click, 'echo') as echo:
+            runner._note_harness_versions('sess-new', versions)
+        said = '\n'.join(str(c.args[0]) for c in echo.call_args_list)
+        return runner, said
+
+    def test_it_is_reported_as_an_earlier_session(self) -> None:
+        _runner, said = self._note({**_KNOWN_GOOD, 'claude': '2.1.280'})
+        self.assertNotIn('mid-session', said)
+        self.assertIn('an earlier session of build ran 2.1.266', said)
+
+    def test_the_new_session_replaces_the_record(self) -> None:
+        runner, _said = self._note({**_KNOWN_GOOD, 'claude': '2.1.280'})
+        self.assertEqual(
+            R._recorded_version(runner._harness_versions['build'], 'claude'),
+            '2.1.280',
+        )
+
+    def test_the_same_version_says_nothing(self) -> None:
+        _runner, said = self._note({**_KNOWN_GOOD, 'claude': '2.1.266'})
+        self.assertNotIn('earlier session', said)
+        self.assertNotIn('mid-session', said)
+
+    def test_the_session_is_not_written_to_the_state_file(self) -> None:
+        # Sessions never survive a resume; the state format stays put.
+        runner, _said = self._note({**_KNOWN_GOOD, 'claude': '2.1.280'})
+        saved = runner._state_payload()['harness_versions']['build']
+        self.assertEqual(set(saved), {'runs', 'versions'})
+
 
 class TestDiskMetricsAreOptIn(_Base):
     """Recording what a run costs on disk (TASKS.md #36).
