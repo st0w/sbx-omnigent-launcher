@@ -28,6 +28,7 @@ from sbx_omnigent.runner import main as runner_main
 from sbx_omnigent.swarm_session import (
     _DEFAULT_TERMINAL_SETTLE_S,
     _PLAN_APPROVAL_PHRASES,
+    SwarmRunnerUnavailable,
     SwarmSessionClient,
     SwarmSessionError,
     SwarmTurnTimeout,
@@ -1435,6 +1436,68 @@ class TestATurnTimeoutIsItsOwnError(unittest.TestCase):
         with self.assertRaises(SwarmTurnTimeout) as caught:
             client.send_and_wait('conv_1', 'go', timeout=5)
         self.assertIn('5s', caught.exception.format_message())
+
+
+#: The server's answer to a turn whose managed VM never started.
+_UNAVAILABLE: dict[str, object] = {'error': {
+    'code': 'runner_unavailable',
+    'message': "The session's managed sandbox failed to launch: "
+               'managed runner did not connect after launch',
+}}
+
+
+class TestARunnerThatNeverStartedIsItsOwnError(unittest.TestCase):
+    """A managed VM whose runner missed the server's connect window
+    fails its first turn with a 503 `runner_unavailable`. No turn ran,
+    so the runner retries it apart from its turn budget."""
+
+    _POST = 'POST /v1/sessions/conv_1/events'
+
+    def _post(self, status: int, body: dict[str, object]) -> None:
+        t = FakeTransport({self._POST: (status, body)})
+        client = SwarmSessionClient('http://x:6767', transport=t)
+        client._json('POST', '/v1/sessions/conv_1/events', {'x': 1})
+
+    def test_a_runner_unavailable_503_is_its_own_error(self) -> None:
+        with self.assertRaises(SwarmRunnerUnavailable) as caught:
+            self._post(503, _UNAVAILABLE)
+        self.assertIn('did not connect after launch', str(caught.exception))
+
+    def test_it_is_still_a_session_error(self) -> None:
+        self.assertTrue(
+            issubclass(SwarmRunnerUnavailable, SwarmSessionError)
+        )
+
+    def test_another_503_is_not(self) -> None:
+        body: dict[str, object] = {
+            'error': {'code': 'overloaded', 'message': 'busy'},
+        }
+        with self.assertRaises(SwarmSessionError) as caught:
+            self._post(503, body)
+        self.assertNotIsInstance(caught.exception, SwarmRunnerUnavailable)
+
+    def test_the_code_on_another_status_is_not(self) -> None:
+        with self.assertRaises(SwarmSessionError) as caught:
+            self._post(500, _UNAVAILABLE)
+        self.assertNotIsInstance(caught.exception, SwarmRunnerUnavailable)
+
+    def test_a_503_that_is_not_json_is_not(self) -> None:
+        class _Raw(FakeTransport):
+            def request(self, method, url, *, headers, body, timeout):
+                return 503, b'<html>Service Unavailable</html>'
+
+        client = SwarmSessionClient('http://x:6767', transport=_Raw({}))
+        with self.assertRaises(SwarmSessionError) as caught:
+            client._json('POST', '/v1/sessions/conv_1/events', {'x': 1})
+        self.assertNotIsInstance(caught.exception, SwarmRunnerUnavailable)
+
+    def test_it_reaches_the_caller_of_a_turn(self) -> None:
+        t = FakeTransport(
+            {self._POST: (503, _UNAVAILABLE)}, stream_lines=_HEARTBEAT
+        )
+        client = SwarmSessionClient('http://x:6767', transport=t)
+        with self.assertRaises(SwarmRunnerUnavailable):
+            client.send_and_wait('conv_1', 'go', timeout=5)
 
 
 _TERMINALS = 'GET /v1/sessions/conv_1/resources/terminals'
