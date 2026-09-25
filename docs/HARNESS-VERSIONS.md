@@ -18,14 +18,16 @@ not theoretical — it has cost this project four separate days:
 Recorded on **2026-09-23**: image `ghcr.io/omnigent-ai/omnigent-host:v0.13.0`
 with `sbx.claude_version: "2.1.280"`. The image itself carries Claude Code
 2.1.266; the pin moves every Claude VM to 2.1.280 before its host starts. codex
-and agy come from the unchanged image: read from a fresh VM on 2026-09-14 and
-again by a pipeline run on 2026-09-22.
+comes from the unchanged image: read from a fresh VM on 2026-09-14 and again by
+pipeline runs since. agy does not: the image carries 1.1.16, and agy updates
+itself inside the VM (see below). A pipeline's agy judge read **1.2.9** on
+2026-09-23, and its turn completed and made its selection.
 
 | CLI | Version |
 | --- | --- |
 | `@anthropic-ai/claude-code` | 2.1.280 |
 | `@openai/codex` | 0.153.4 |
-| `agy` (Antigravity CLI) | 1.1.16 |
+| `agy` (Antigravity CLI) | 1.2.9 |
 
 Models confirmed on that image — one real turn each:
 
@@ -80,6 +82,7 @@ rows is what a run that wedges right after an upgrade gets compared against.
 
 | Recorded | Image | claude | codex | agy |
 | --- | --- | --- | --- | --- |
+| 2026-09-23 | `omnigent-host:v0.13.0` + `claude_version: 2.1.280`; agy updated itself in the VM | 2.1.280 | 0.153.4 | 1.2.9 |
 | 2026-09-23 | `omnigent-host:v0.13.0` + `claude_version: 2.1.280` | 2.1.280 | 0.153.4 | 1.1.16 |
 | 2026-09-14 | `omnigent-host:v0.13.0` | 2.1.266 | 0.153.4 | 1.1.16 |
 | 2026-08-19 | `omnigent-host:dev-adcf83cc` (local build) | 2.1.235 | 0.148.0 | 1.1.15 |

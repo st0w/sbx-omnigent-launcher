@@ -34,7 +34,7 @@ CLIS: tuple[str, ...] = ('claude', 'codex', 'agy')
 KNOWN_GOOD: Mapping[str, str] = {
     'claude': '2.1.280',
     'codex': '0.153.4',
-    'agy': '1.1.16',
+    'agy': '1.2.9',
 }
 
 #: The date :data:`KNOWN_GOOD` was recorded.
