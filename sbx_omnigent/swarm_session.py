@@ -599,6 +599,33 @@ class SwarmTurnTimeout(SwarmSessionError):
     """
 
 
+class SwarmRunnerUnavailable(SwarmSessionError):
+    """
+    The session has no runner: its managed VM never started one.
+
+    The server answers a turn with a 503 ``runner_unavailable`` when the
+    runner it launched in the VM missed its connect window, which a
+    loaded host makes likely. No turn ran, so a fresh VM may well
+    succeed, and the runner retries it apart from its turn budget.
+    """
+
+
+def _error_code(data: bytes) -> str | None:
+    """
+    The ``error.code`` of an Omnigent error body, or ``None``.
+
+    :param data: A response body.
+    :returns: The code, or ``None`` when the body is not that shape.
+    """
+    try:
+        doc = json.loads(data)
+    except ValueError:
+        return None
+    error = doc.get('error') if isinstance(doc, dict) else None
+    code = error.get('code') if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
+
+
 def _is_timeout(exc: BaseException) -> bool:
     """
     Whether *exc* was caused by a socket timeout.
@@ -996,9 +1023,12 @@ class SwarmSessionClient:
         )
         if status not in ok:
             detail = data.decode('utf-8', errors='replace')[:500]
-            raise SwarmSessionError(
-                f'{method} {path} returned {status}: {detail}'
+            error = (
+                SwarmRunnerUnavailable
+                if status == 503 and _error_code(data) == 'runner_unavailable'
+                else SwarmSessionError
             )
+            raise error(f'{method} {path} returned {status}: {detail}')
         if not data:
             return {}
         decoded = json.loads(data)

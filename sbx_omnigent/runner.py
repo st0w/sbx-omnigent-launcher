@@ -70,6 +70,7 @@ from sbx_omnigent.swarm import (
     mount_sentinel,
 )
 from sbx_omnigent.swarm_session import (
+    SwarmRunnerUnavailable,
     SwarmSessionClient,
     SwarmSessionError,
     SwarmTurnTimeout,
@@ -649,6 +650,15 @@ _WRITER_TURN_ATTEMPTS = 2
 #: same reasoning as :data:`_REVIEW_RETRY_BACKOFF_S`: long enough to
 #: outlast a provider blip, and paid after the dead guest is freed.
 _WRITER_RETRY_BACKOFF_S = 90.0
+
+#: Launches of one reviewer or writer whose VM never started a runner
+#: (:class:`SwarmRunnerUnavailable`), counted apart from its turn
+#: attempts. The server gives a launched runner 30 s to connect, and on
+#: a loaded host three reviewer VMs missed that in one run: no turn ran,
+#: but each failure spent the reviewer's one retry, and a candidate
+#: lost its review to the host's load. Each retry waits the role's
+#: backoff first, which is also time for the load to drain.
+_LAUNCH_ATTEMPTS = 3
 
 #: Asked of a reviewer that finished its turn without stating a verdict.
 #: Since reviewers were told to EXECUTE what they review, they install
@@ -7176,7 +7186,8 @@ class PipelineRunner:
         :raises SwarmSessionError: Likewise, for a turn that never came
             back.
         """
-        for attempt in range(1, _WRITER_TURN_ATTEMPTS + 1):
+        attempt = launches = 0
+        while True:
             assert node.session is not None
             try:
                 node.output = self._drive(
@@ -7188,20 +7199,33 @@ class PipelineRunner:
                 # salvaging only PipelineRunError lost exactly the work
                 # the salvage exists for.
                 self._commit_partial(stage.id)
-                if (
-                    attempt == _WRITER_TURN_ATTEMPTS
-                    or not _lost_not_failed(exc)
-                    or not self._free_session(
-                        node.session,
-                        f'{stage.id}: freeing the VM that lost its turn.',
+                # A VM that never started a runner ran no turn, so it
+                # spends a launch, not the lost-turn retry.
+                never_started = isinstance(exc, SwarmRunnerUnavailable)
+                if never_started:
+                    launches += 1
+                    exhausted = launches == _LAUNCH_ATTEMPTS
+                else:
+                    attempt += 1
+                    exhausted = (
+                        attempt == _WRITER_TURN_ATTEMPTS
+                        or not _lost_not_failed(exc)
                     )
+                if exhausted or not self._free_session(
+                    node.session,
+                    f'{stage.id}: freeing the VM that lost its turn.',
                 ):
                     raise
+                what = (
+                    f'its VM never started a runner (launch {launches} '
+                    f'of {_LAUNCH_ATTEMPTS})' if never_started
+                    else f'attempt {attempt} was lost'
+                )
                 click.echo(
-                    f'[retry] {stage.id}: attempt {attempt} was lost '
-                    f'({exc}); its work is committed to the node branch, '
-                    f'so waiting {_WRITER_RETRY_BACKOFF_S:.0f}s, then '
-                    f'booting a fresh VM on the same worktree.'
+                    f'[retry] {stage.id}: {what} ({exc}); its work is '
+                    f'committed to the node branch, so waiting '
+                    f'{_WRITER_RETRY_BACKOFF_S:.0f}s, then booting a '
+                    f'fresh VM on the same worktree.'
                 )
                 # AFTER the guest is freed, so an outage is not waited
                 # out while a dead VM holds its slot.
@@ -7763,6 +7787,10 @@ class PipelineRunner:
         guessing wrong is one turn, against a whole campaign for not
         retrying. See :data:`_REVIEW_TURN_ATTEMPTS`.
 
+        A guest that never started a runner ran no turn at all, so it
+        is retried against its own allowance, :data:`_LAUNCH_ATTEMPTS`,
+        and leaves the turn retry for a turn that actually ran.
+
         :param stage: The review stage.
         :param reviewer: The reviewing agent's name.
         :param target_wt: The reviewed branch's worktree (mounted ro).
@@ -7771,8 +7799,10 @@ class PipelineRunner:
             frees the abandoned one too.
         :returns: ``(session, reply)`` for the attempt that succeeded.
         :raises PipelineRunError: If the last attempt also fails.
+        :raises SwarmRunnerUnavailable: If every launch failed.
         """
-        for attempt in range(1, _REVIEW_TURN_ATTEMPTS + 1):
+        attempt = launches = 0
+        while True:
             session = self._create_session(reviewer, target_wt, 'ro', label)
             # Recorded the moment it exists, not once the turn succeeds,
             # so a reviewer that dies mid-review still hands its
@@ -7783,6 +7813,17 @@ class PipelineRunner:
                 return session, self._drive(
                     session, self._review_instruction(stage)
                 )
+            except SwarmRunnerUnavailable as exc:
+                # No turn ran, so this spends a launch, not an attempt.
+                launches += 1
+                if launches == _LAUNCH_ATTEMPTS:
+                    raise
+                click.echo(
+                    f'[review] {label}: its VM never started a runner '
+                    f'(launch {launches} of {_LAUNCH_ATTEMPTS}: {exc}) — '
+                    f'waiting {_REVIEW_RETRY_BACKOFF_S:.0f}s, then '
+                    f'booting a fresh guest.'
+                )
             except (PipelineRunError, SwarmSessionError) as exc:
                 # SwarmSessionError as well as PipelineRunError: a turn
                 # that never CAME BACK is as safe to retry as one that
@@ -7791,6 +7832,7 @@ class PipelineRunner:
                 # written, no verdict recorded. It was escaping because
                 # the two live in disjoint hierarchies, so the stage
                 # died on the first dropped stream or server hiccup.
+                attempt += 1
                 if attempt == _REVIEW_TURN_ATTEMPTS:
                     raise
                 click.echo(
@@ -7800,13 +7842,12 @@ class PipelineRunner:
                     f'{_REVIEW_RETRY_BACKOFF_S:.0f}s, then booting a '
                     f'fresh guest and reviewing again.'
                 )
-                self._free_session(
-                    session, f'{label}: freeing the guest that died.'
-                )
-                # AFTER the guest is freed, so an outage is not waited
-                # out while a dead VM holds its slot.
-                time.sleep(_REVIEW_RETRY_BACKOFF_S)
-        raise AssertionError('unreachable')
+            self._free_session(
+                session, f'{label}: freeing the guest that died.'
+            )
+            # AFTER the guest is freed, so an outage is not waited out
+            # while a dead VM holds its slot.
+            time.sleep(_REVIEW_RETRY_BACKOFF_S)
 
     def _review_guest(
         self,

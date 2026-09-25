@@ -516,6 +516,12 @@ retried: a second attempt would spend a second full turn budget on something
 likely to fail the same way. Nor is a turn under `--keep`, or one whose VM
 could not be freed, since two agents would then be writing into one tree.
 
+**A VM that never started is launched again, apart from that retry.** On a busy
+host, a VM's runner can miss the server's 30-second connect window, and the turn
+fails with `runner_unavailable` before anything runs. A reviewer or writer gets
+up to three launches for that, each after the same 90-second wait, without
+spending the retry kept for a turn that actually ran.
+
 **A rejected credential is named, not retried.** When any turn fails, the runner
 looks for an authentication failure in the turn's own error and, failing that,
 in the tail of the runner log inside that VM. Claude reports one in the turn's

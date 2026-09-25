@@ -29,6 +29,7 @@ from click.testing import CliRunner, Result
 from sbx_omnigent import pipeline
 from sbx_omnigent import runner as R
 from sbx_omnigent.swarm_session import (
+    SwarmRunnerUnavailable,
     SwarmSessionClient,
     SwarmSessionError,
     SwarmTurnResult,
@@ -541,18 +542,7 @@ class FakeSC:
             return SwarmTurnResult('failed', None, '')
         scripted = self.turn_outcomes.get(self._label.get(session, ''))
         if scripted:
-            outcome = scripted.pop(0)
-            if outcome == 'drop':
-                raise SwarmSessionError(f'stream for {session} closed')
-            if outcome == 'timeout':
-                raise SwarmTurnTimeout(
-                    f'turn on {session} did not complete within 3600s'
-                )
-            if outcome.startswith('error:'):
-                return SwarmTurnResult(
-                    'failed', outcome.removeprefix('error:'), ''
-                )
-            return SwarmTurnResult('failed', None, '')
+            return self._scripted_outcome(session, scripted.pop(0))
         self.sent_calls.append({'session': session, 'label':
                                 self._label.get(session, ''), **kw})
         label = self._label.get(session, '')
@@ -571,6 +561,26 @@ class FakeSC:
         self._last_reply[session] = reply
         self._assistant.setdefault(session, []).append(reply)
         return SwarmTurnResult('idle', None, reply)
+
+    @staticmethod
+    def _scripted_outcome(session, outcome):
+        """Raise or return what one scripted turn outcome stands for."""
+        if outcome == 'drop':
+            raise SwarmSessionError(f'stream for {session} closed')
+        if outcome == 'unavailable':
+            raise SwarmRunnerUnavailable(
+                f'POST /v1/sessions/{session}/events returned 503: '
+                'managed runner did not connect after launch'
+            )
+        if outcome == 'timeout':
+            raise SwarmTurnTimeout(
+                f'turn on {session} did not complete within 3600s'
+            )
+        if outcome.startswith('error:'):
+            return SwarmTurnResult(
+                'failed', outcome.removeprefix('error:'), ''
+            )
+        return SwarmTurnResult('failed', None, '')
 
     def get_status(self, session) -> dict:
         # Per-label overrides let a test say "this session's runner went
@@ -12790,6 +12800,69 @@ class TestAnApiErrorReplyFailsTheTurn(_Base):
             'build': f'Handled the upstream failure:\n{self._TOO_OLD}',
         })
         self.assertEqual(result.status, 'completed')
+
+
+class TestAVmThatNeverStartedIsRetriedApart(_Base):
+    """On a loaded host, three reviewer VMs' runners missed the server's
+    30 s connect window and their first turns failed with a 503
+    `runner_unavailable`. No turn ran, but each failure used up the
+    reviewer's one retry, so a candidate lost its review to the host's
+    load, not to anything a reviewer said."""
+
+    def _sc(self, label: str, *outcomes: str) -> FakeSC:
+        sc = FakeSC(dict(_LINEAR_REPLIES))
+        sc.turn_outcomes[label] = list(outcomes)
+        return sc
+
+    @staticmethod
+    def _boots(sc: FakeSC, label: str) -> int:
+        return sum(1 for lb in sc._label.values() if lb == label)
+
+    def test_a_reviewer_survives_two_launch_failures(self) -> None:
+        sc = self._sc('review-sec', 'unavailable', 'unavailable')
+        result, _sc, _wt = self._run(_LINEAR, {}, sc=sc)
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(self._boots(sc, 'review-sec'), 3)
+
+    def test_launch_failures_leave_the_reviewers_turn_retry(self) -> None:
+        sc = self._sc('review-sec', 'unavailable', 'unavailable', 'lost')
+        result, _sc, _wt = self._run(_LINEAR, {}, sc=sc)
+        self.assertEqual(result.status, 'completed')
+
+    def test_a_reviewer_gives_up_after_three_launches(self) -> None:
+        sc = self._sc('review-sec', *(['unavailable'] * 3))
+        with self.assertRaises((R.PipelineRunError, SwarmSessionError)):
+            self._run(_LINEAR, {}, sc=sc)
+        self.assertEqual(
+            self._boots(sc, 'review-sec'), R._LAUNCH_ATTEMPTS
+        )
+
+    def test_a_writer_survives_a_launch_failure(self) -> None:
+        sc = FakeSC({'tests': 'wrote tests', 'build': 'impl'})
+        sc.turn_outcomes['build'] = ['unavailable', 'unavailable']
+        result, _sc, _wt = self._run(_TDD, {}, sc=sc)
+        self.assertEqual(result.status, 'completed')
+
+    def test_launch_failures_leave_the_writers_lost_turn_retry(self) -> None:
+        sc = FakeSC({'tests': 'wrote tests', 'build': 'impl'})
+        sc.turn_outcomes['build'] = ['unavailable', 'lost']
+        result, _sc, _wt = self._run(_TDD, {}, sc=sc)
+        self.assertEqual(result.status, 'completed')
+
+    def test_a_writer_gives_up_after_three_launches(self) -> None:
+        sc = FakeSC({'tests': 'wrote tests', 'build': 'impl'})
+        sc.turn_outcomes['build'] = ['unavailable'] * 3
+        with self.assertRaises((R.PipelineRunError, SwarmSessionError)):
+            self._run(_TDD, {}, sc=sc)
+        self.assertEqual(self._boots(sc, 'build'), R._LAUNCH_ATTEMPTS)
+
+    def test_the_retry_says_the_vm_never_started(self) -> None:
+        sc = self._sc('review-sec', 'unavailable')
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            self._run(_LINEAR, {}, sc=sc)
+        said = ' '.join(str(c.args[0]) for c in echo.call_args_list)
+        self.assertIn('never started', said)
+        self.assertIn(f'launch 1 of {R._LAUNCH_ATTEMPTS}', said)
 
 
 if __name__ == '__main__':
