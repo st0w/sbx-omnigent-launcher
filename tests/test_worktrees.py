@@ -22,6 +22,7 @@ from sbx_omnigent import worktrees
 from sbx_omnigent.worktrees import (
     WorktreeManager,
     _pr_create_command,
+    _repo_key,
     _repo_name,
     _validate_name,
     clone_copy_command,
@@ -178,6 +179,99 @@ class TestWorktreeLifecycle(unittest.TestCase):
         wt = self.mgr.create_swarm_worktree('swarm-b', self.up)
         self.mgr.dispose_swarm('swarm-b')
         self.assertFalse(os.path.exists(wt))
+
+
+class TestTheRepositoryKey(unittest.TestCase):
+    """The mirror and the build cache were keyed by the repository's
+    name alone, so ``org-a/app`` and ``org-b/app`` shared both: a run
+    for one was cut from the other's mirror, and published that
+    history to the repository it was meant for."""
+
+    def test_same_named_repositories_get_different_keys(self) -> None:
+        self.assertNotEqual(
+            _repo_key('https://github.com/org-a/app.git'),
+            _repo_key('https://github.com/org-b/app.git'),
+        )
+        self.assertNotEqual(_repo_key('/a/app'), _repo_key('/b/app'))
+
+    def test_spellings_of_one_repository_share_a_key(self) -> None:
+        for url in (
+            'https://github.com/org/app',
+            'https://github.com/org/app/',
+            'https://github.com/org/app.git',
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(
+                    _repo_key(url), _repo_key('https://github.com/org/app.git')
+                )
+
+    def test_a_relative_path_keys_as_its_absolute_one(self) -> None:
+        self.assertEqual(
+            _repo_key('./proj'), _repo_key(os.path.abspath('proj'))
+        )
+
+    def test_it_is_readable_and_a_safe_name(self) -> None:
+        key = _repo_key('git@github.com:org/app.git')
+        self.assertRegex(key, r'^app-[0-9a-f]{12}$')
+        self.assertEqual(_validate_name(key, 'repo key'), key)
+
+
+class TestTheMirrorIsTheRightRepository(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix='wt-key-')
+        # Two different repositories, both named "upstream".
+        self.a = _make_upstream(os.path.join(self.tmp, 'a'))
+        self.b = _make_upstream(os.path.join(self.tmp, 'b'))
+        with open(os.path.join(self.b, 'only-in-b'), 'w') as fh:
+            fh.write('b\n')
+        _git(self.b, 'add', '-A')
+        _git(self.b, 'commit', '-qm', 'b')
+        self.mgr = WorktreeManager(
+            canonical_root=os.path.join(self.tmp, 'repos'),
+            worktree_root=os.path.join(self.tmp, 'worktrees'),
+            default_branch='main',
+        )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_same_named_repositories_get_their_own_mirrors(self) -> None:
+        mirror_a = self.mgr.ensure_canonical(self.a)
+        mirror_b = self.mgr.ensure_canonical(self.b)
+        self.assertNotEqual(mirror_a, mirror_b)
+        self.assertEqual(
+            _git(mirror_b, 'rev-parse', 'main'),
+            _git(self.b, 'rev-parse', 'main'),
+        )
+
+    def test_a_mirror_of_another_repository_is_refused(self) -> None:
+        mirror_a = self.mgr.ensure_canonical(self.a)
+        # As if a's mirror sat where b's belongs.
+        shutil.copytree(mirror_a, self.mgr.canonical_path(self.b))
+        with self.assertRaises(click.ClickException) as caught:
+            self.mgr.ensure_canonical(self.b)
+        self.assertIn('not', caught.exception.format_message())
+        self.assertIn(self.b, caught.exception.format_message())
+
+    def test_the_refusal_never_prints_a_token(self) -> None:
+        mirror_a = self.mgr.ensure_canonical(self.a)
+        planted = self.mgr.canonical_path(self.b)
+        shutil.copytree(mirror_a, planted)
+        _git(
+            planted, 'config', 'remote.origin.url',
+            'https://s3cr3t@github.com/org/upstream.git',
+        )
+        with self.assertRaises(click.ClickException) as caught:
+            self.mgr.ensure_canonical(self.b)
+        message = caught.exception.format_message()
+        self.assertNotIn('s3cr3t', message)
+        self.assertIn('***@github.com', message)
+
+    def test_another_spelling_reuses_the_mirror(self) -> None:
+        mirror = self.mgr.ensure_canonical(self.a)
+        self.assertEqual(
+            self.mgr.ensure_canonical(self.a + os.sep), mirror
+        )
 
 
 class TestPublishRecorded(unittest.TestCase):

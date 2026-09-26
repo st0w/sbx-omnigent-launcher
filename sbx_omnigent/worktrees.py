@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 from typing import TYPE_CHECKING
 
 import click
@@ -140,6 +141,60 @@ def _repo_name(repo_url: str) -> str:
         last = last.rsplit(':', 1)[-1]
     name = last[:-4] if last.endswith('.git') else last
     return _validate_name(name, 'repo name')
+
+
+#: Git's own rule: ``host:path`` with no ``/`` before the colon is an
+#: scp-style remote, not a local path.
+_SCP_LIKE_RE = re.compile(r'[^/]+:')
+
+
+def _repo_identity(repo_url: str) -> str:
+    """
+    What makes two spellings of ``repo:`` the same repository.
+
+    :param repo_url: A remote URL or a local path.
+    :returns: A remote without its trailing ``/`` or ``.git``, or a
+        local path resolved with :func:`os.path.realpath`.
+    """
+    if '://' in repo_url or _SCP_LIKE_RE.match(repo_url):
+        remote = repo_url.rstrip('/')
+        return remote[:-4] if remote.endswith('.git') else remote
+    return os.path.realpath(repo_url)
+
+
+def _display_url(url: str) -> str:
+    """
+    *url* safe to print: any userinfo (a token, say) masked.
+
+    :param url: A remote URL or a local path.
+    :returns: *url* with ``user[:pass]@`` replaced by ``***@``.
+    """
+    if '://' not in url:
+        return url
+    parts = urllib.parse.urlsplit(url)
+    if '@' not in parts.netloc:
+        return url
+    host = parts.netloc.rsplit('@', 1)[1]
+    return urllib.parse.urlunsplit(parts._replace(netloc=f'***@{host}'))
+
+
+def _repo_key(repo_url: str) -> str:
+    """
+    Name a repository's mirror and build cache under the canonical root.
+
+    The name alone is not enough: ``org-a/app`` and ``org-b/app`` both
+    give ``app``, and keyed by it a run for one was cut from the
+    other's mirror and published that history to the repository it
+    was meant for. So a short hash of the whole repository follows the
+    readable name.
+
+    :param repo_url: A remote URL or a local path.
+    :returns: ``<name>-<12 hex>``, e.g. ``"app-3f2a9c1b0d4e"``.
+    :raises click.ClickException: If no safe name can be derived.
+    """
+    identity = _repo_identity(repo_url)
+    digest = hashlib.sha256(identity.encode('utf-8')).hexdigest()[:12]
+    return f'{_repo_name(identity)}-{digest}'
 
 
 def _redact(text: str, secret: str | None) -> str:
@@ -312,8 +367,9 @@ class WorktreeManager:
         ``('target',)`` for cargo. Empty (the default) disables it.
         See :meth:`seed_build_cache`.
     :param build_cache_key: Names the cache directory under
-        ``<canonical_root>/_buildcache/``, so two repositories never
-        share one. ``None`` also disables the cache.
+        ``<canonical_root>/_buildcache/``; pass :func:`_repo_key`, so
+        two repositories never share one. ``None`` also disables the
+        cache.
     """
 
     def __init__(
@@ -512,7 +568,7 @@ class WorktreeManager:
     def canonical_path(self, repo_url: str) -> str:
         """:returns: The bare mirror path for *repo_url*."""
         return os.path.join(
-            self._canonical_root, f'{_repo_name(repo_url)}.git'
+            self._canonical_root, f'{_repo_key(repo_url)}.git'
         )
 
     def worktree_path(self, swarm_id: str) -> str:
@@ -535,11 +591,45 @@ class WorktreeManager:
         """
         path = self.canonical_path(repo_url)
         if os.path.isdir(path):
+            self._check_mirror_origin(path, repo_url)
             self._run(['git', '-C', path, 'fetch', '--prune', 'origin'])
         else:
             os.makedirs(self._canonical_root, exist_ok=True)
             self._run(['git', 'clone', '--mirror', repo_url, path])
         return path
+
+    def _check_mirror_origin(self, path: str, repo_url: str) -> None:
+        """
+        Refuse a mirror that is not a mirror of *repo_url*.
+
+        The key makes a collision unlikely; this makes one loud. A run
+        cut from the wrong mirror works on another repository's code
+        and publishes its history to *repo_url*.
+
+        :param path: The existing mirror.
+        :param repo_url: The repository the run is for.
+        :raises click.ClickException: If the mirror's origin is
+            unreadable or names another repository.
+        """
+        try:
+            origin = self._run(
+                ['git', '-C', path, 'config', '--get', 'remote.origin.url']
+            ).strip()
+        except click.ClickException as exc:
+            raise click.ClickException(
+                f'cannot read the origin of the mirror at {path}: '
+                f'{exc.message}'
+            ) from exc
+        if _repo_identity(origin) != _repo_identity(repo_url):
+            raise click.ClickException(
+                f'the mirror at {path} is a mirror of '
+                f'{_display_url(origin)!r}, not '
+                f'{_display_url(repo_url)!r}. Refusing to fetch it: a '
+                f'run cut from it would work on the wrong repository '
+                f'and could publish '
+                f'that history to yours. Move it aside and the next '
+                f'run clones a fresh mirror.'
+            )
 
     def create_swarm_worktree(
         self,

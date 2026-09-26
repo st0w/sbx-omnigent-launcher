@@ -35,7 +35,7 @@ from sbx_omnigent.swarm_session import (
     SwarmTurnResult,
     SwarmTurnTimeout,
 )
-from sbx_omnigent.worktrees import WorktreeManager
+from sbx_omnigent.worktrees import WorktreeManager, _repo_key
 
 
 def _assert_plan_committed(case, wt, worktree, path, marker):
@@ -13003,6 +13003,33 @@ class TestAReviewerBuildsFromTheWarmCache(_Base):
         msg = self._refactor_review(source, '/s')
         self.assertIn('You are reviewing a REFACTOR', msg)
         self.assertIn('CARGO_TARGET_DIR=/s/target', msg)
+
+
+class TestTheCacheIsKeyedByTheRepository(_Base):
+    """Keyed by name alone, two same-named repositories shared one."""
+
+    def _cache_dir(self, repo: str) -> str | None:
+        cfg = self._cfg(_with_cache(_LINEAR).replace(
+            'repo: ./proj\n', f'repo: {repo}\n', 1
+        ))
+        mgr = R._worktree_manager(
+            cfg, canonical_root='/can', worktree_root='/wt',
+            publish_token=None,
+        )
+        return mgr._build_cache_dir()
+
+    def test_same_named_repositories_do_not_share_one(self) -> None:
+        a = self._cache_dir('https://github.com/org-a/app.git')
+        b = self._cache_dir('https://github.com/org-b/app.git')
+        self.assertIsNotNone(a)
+        self.assertNotEqual(a, b)
+
+    def test_it_is_the_repositorys_key(self) -> None:
+        url = 'https://github.com/org-a/app.git'
+        self.assertEqual(
+            self._cache_dir(url),
+            str(Path('/can') / '_buildcache' / _repo_key(url)),
+        )
 
 
 class TestASeededReviewerIsCountedOnDisk(_Base):

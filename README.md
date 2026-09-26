@@ -463,8 +463,8 @@ build_cache: [target, node_modules, dist]  # e.g. Rust plus a web frontend
 ```
 
 Leave it out, or set `build_cache: []`, and every VM builds from clean. To keep
-it on but start over once, delete `<canonical-root>/_buildcache/<repo>` between
-runs. The verify gate always builds from clean either way. Details in
+it on but start over once, delete its entry under `<canonical-root>/_buildcache/`
+(named `<repo>-<hash>`) between runs. The verify gate always builds from clean either way. Details in
 [`docs/PIPELINES.md`](./docs/PIPELINES.md#warm-build-cache).
 
 ### Antigravity (agy) egress
