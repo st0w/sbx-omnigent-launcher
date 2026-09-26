@@ -46,6 +46,9 @@ _TASK_BRANCH_PREFIX = 'task/'
 #: filesystem directory AND a branch component, so keep it conservative.
 _SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9._-]+$')
 
+#: A reviewer's seed token (see ``seed_review_scratch``).
+_SEED_TOKEN_RE = re.compile(r'[0-9a-f]{12}')
+
 
 def _run_default(
     cmd: list[str],
@@ -1195,6 +1198,78 @@ class WorktreeManager:
         if seed_cache:
             self.seed_build_cache(path)
         return path
+
+    def seed_review_scratch(
+        self, run_id: str, mounted_path: str, token: str
+    ) -> str:
+        """
+        Cut one reviewer's scratch beside the tree it reviews, seeded.
+
+        A reviewer mounts the tree under review read-only and builds in
+        its read-write primary, which used to be an empty directory, so
+        every reviewer compiled from clean (#37). This is that primary:
+        ``<mounted path>.seed-<token>``, cloned from the warm build
+        cache like a writer's clone. The launcher finds it from the
+        same two parts (see :func:`swarm.mount_sentinel`).
+
+        Always cut fresh, so a retried reviewer never inherits what an
+        earlier reviewer VM wrote into its scratch. Never read back
+        into the cache: only completed writer stages and the verify
+        gate refresh it.
+
+        :param run_id: Pipeline run id.
+        :param mounted_path: The tree the reviewer mounts read-only; it
+            must be a directory directly in this run's nodes dir.
+        :param token: 12 lowercase hex characters.
+        :returns: The scratch path.
+        :raises click.ClickException: On a malformed token, or a path
+            outside this run's nodes dir.
+        """
+        if not isinstance(token, str) or not _SEED_TOKEN_RE.fullmatch(token):
+            raise click.ClickException(f'invalid review seed token: {token!r}')
+        nodes = os.path.realpath(self._nodes_dir(run_id))
+        real = os.path.realpath(mounted_path)
+        if os.path.dirname(real) != nodes or not os.path.isdir(real):
+            raise click.ClickException(
+                f'cannot seed a scratch beside {mounted_path!r}: it is not '
+                f'a directory in {nodes!r}'
+            )
+        label = _validate_name(os.path.basename(real), 'snapshot label')
+        path = os.path.join(nodes, f'{label}.seed-{token}')
+        if os.path.islink(path):
+            os.unlink(path)
+        elif os.path.exists(path):
+            self._remove_under_root(path)
+        os.makedirs(path)
+        self.seed_build_cache(path)
+        return path
+
+    def dispose_review_seeds(self, run_id: str, snapshot_label: str) -> int:
+        """
+        Remove every reviewer scratch cut beside one round's snapshot.
+
+        :param run_id: Pipeline run id.
+        :param snapshot_label: The round's snapshot directory name.
+        :returns: How many scratches were removed; missing ones and ones
+            that will not delete are skipped.
+        """
+        label = _validate_name(snapshot_label, 'snapshot label')
+        nodes = self._nodes_dir(run_id)
+        pattern = re.compile(re.escape(label) + r'\.seed-[0-9a-f]{12}')
+        try:
+            names = sorted(os.listdir(nodes))
+        except OSError:
+            return 0
+        removed = 0
+        for name in names:
+            if not pattern.fullmatch(name):
+                continue
+            try:
+                self._remove_under_root(os.path.join(nodes, name))
+            except click.ClickException:
+                continue
+            removed += 1
+        return removed
 
     def _build_cache_dir(self) -> str | None:
         """
