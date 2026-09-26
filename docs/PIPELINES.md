@@ -632,8 +632,12 @@ build_cache: []
 Then every writer and reader builds in a fresh clone, every reviewer builds on
 its VM's own disk, and the verify gate builds from clean as it always does. The
 cache on disk is neither read nor written. It stays where it is, and is used
-again if you turn the cache back on. There is no command-line switch: the
-pipeline file decides.
+again if you turn the cache back on.
+
+To turn it off for one run without editing the file, pass `--no-build-cache`
+to the runner. The run behaves exactly as if `build_cache:` were unset, and
+says so at the start. Resuming later without the flag turns the cache back on
+for the stages still to run.
 
 ### Starting over from clean, with the cache still on
 
@@ -1242,6 +1246,7 @@ Override any of them with an inline `prompt`/`prompt_file`, and augment with
 | `--no-interactive-plan` | Don't block the plan stage on human approval — use the planner's single-turn output as-is. |
 | `--no-auto-harvest` | Don't start an agy token harvester for this run; refuse instead when the swap secret is stale (use when one runs elsewhere). |
 | `--skip-disk-check` | Skip the preflight that refuses to start when free disk can't cover the run's microVMs. |
+| `--no-build-cache` | Ignore the pipeline's `build_cache:` for this run: every VM builds from clean, and the cache on disk is neither read nor written (see [Warm build cache](#warm-build-cache)). |
 | `--skip-codex-check` | Skip the check that the server accepts the host Codex login, for a network that blocks WebSockets but reaches Codex over HTTPS (see [Codex notes](#codex-notes)). An expired access token is still refused. |
 | `--resume` | Continue the run with this `--run-id` instead of starting clean (see [Resuming a run](#resuming-a-run)). |
 | `--turn-timeout` | Seconds one agent turn may take, overriding the pipeline's `turn_timeout`. |

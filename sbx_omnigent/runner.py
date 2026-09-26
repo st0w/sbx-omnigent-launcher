@@ -11006,6 +11006,13 @@ def preflight_agy(
     'instead when the swap secret is stale (use when a harvester '
     'already runs elsewhere).',
 )
+@click.option(
+    '--no-build-cache',
+    is_flag=True,
+    help="Ignore the pipeline's build_cache for this run: every VM "
+    'builds from clean, and the cache on disk is neither read nor '
+    'written.',
+)
 @click.option('--keep', is_flag=True, help='Leave VMs + worktrees.')
 @click.option(
     '--no-interactive-plan',
@@ -11048,6 +11055,7 @@ def main(
     turn_timeout: float | None,
     skip_disk_check: bool,
     no_auto_harvest: bool,
+    no_build_cache: bool,
     keep: bool,
     no_interactive_plan: bool,
     no_auto_approve: bool,
@@ -11056,6 +11064,14 @@ def main(
 ) -> None:
     """Fire a pipeline.yaml; provision-only when it has no task."""
     config = pipeline.load_pipeline(config_path)
+    if no_build_cache and config.build_cache:
+        # Here, before anything reads it, so the disk preflight, the
+        # reviewers and the worktree manager all see it off.
+        config = replace(config, build_cache=())
+        click.echo(
+            '[build-cache] off for this run (--no-build-cache): every '
+            'VM builds from clean.'
+        )
 
     def publish_token_provider() -> str | None:
         return resolve_publish_token(

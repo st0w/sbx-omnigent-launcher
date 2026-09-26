@@ -13054,5 +13054,60 @@ class TestASeededReviewerIsCountedOnDisk(_Base):
         )
 
 
+
+class TestNoBuildCacheFlag(_Base):
+    """--no-build-cache turns the pipeline's build cache off for one
+    run, so every VM builds from clean without editing the file."""
+
+    def _main(self, text: str, *flags: str):
+        cfg_path = self.root / 'pipeline.yaml'
+        cfg_path.write_text(text, encoding='utf-8')
+        with mock.patch.object(R, 'preflight_sbx'), \
+                mock.patch.object(R, 'preflight_disk') as disk, \
+                mock.patch.object(R, 'preflight_codex_auth'), \
+                mock.patch.object(R, 'preflight_codex_login'), \
+                mock.patch.object(R, '_drive') as drive:
+            res = CliRunner().invoke(
+                R.main,
+                [
+                    '-c', str(cfg_path),
+                    '--canonical-root', str(self.root / 'c'),
+                    '--worktree-root', str(self.root / 'w'),
+                    '--skip-agy-check',
+                    *flags,
+                ],
+            )
+        self.assertEqual(res.exit_code, 0, res.output)
+        return res, disk.call_args.args[0], drive.call_args.args[0]
+
+    def test_the_flag_turns_the_cache_off(self) -> None:
+        _res, _disk, driven = self._main(
+            _with_cache(_LINEAR), '--no-build-cache'
+        )
+        self.assertEqual(driven.build_cache, ())
+
+    def test_the_disk_preflight_sees_it_off_too(self) -> None:
+        _res, checked, _driven = self._main(
+            _with_cache(_LINEAR), '--no-build-cache'
+        )
+        self.assertEqual(checked.build_cache, ())
+
+    def test_it_says_so(self) -> None:
+        res, _disk, _driven = self._main(
+            _with_cache(_LINEAR), '--no-build-cache'
+        )
+        self.assertIn('--no-build-cache', res.output)
+        self.assertIn('builds from clean', res.output)
+
+    def test_without_it_the_pipelines_cache_stands(self) -> None:
+        _res, _disk, driven = self._main(_with_cache(_LINEAR))
+        self.assertEqual(driven.build_cache, ('target',))
+
+    def test_with_no_cache_to_turn_off_it_is_silent(self) -> None:
+        res, _disk, driven = self._main(_LINEAR, '--no-build-cache')
+        self.assertEqual(driven.build_cache, ())
+        self.assertNotIn('--no-build-cache', res.output)
+
+
 if __name__ == '__main__':
     unittest.main()

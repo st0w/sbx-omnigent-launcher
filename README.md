@@ -323,9 +323,9 @@ Editing an agent's prompt/harness/skills needs a **server restart** (agents
 register at startup); model/effort/task/DAG edits are picked up by the runner with
 no restart. Key runner flags: `--keep` (leave VMs up), `--run-id`,
 `--publish-repo`, `--publish-token-file` / `--publish-token-command`,
-`--no-interactive-plan`, `--no-auto-harvest`, `--resume`, `--turn-timeout`,
-`--server`. Full flag table and the provision-only mode (omit `task:`) are in
-[`docs/PIPELINES.md`](./docs/PIPELINES.md).
+`--no-interactive-plan`, `--no-auto-harvest`, `--no-build-cache`, `--resume`,
+`--turn-timeout`, `--server`. Full flag table and the provision-only mode (omit
+`task:`) are in [`docs/PIPELINES.md`](./docs/PIPELINES.md).
 
 Before anything touches sbx, the runner checks that the sbx daemon answers (a
 bounded `sbx ls`). A stuck daemon refuses the run with the steps to recover it,
@@ -462,10 +462,11 @@ node to node:
 build_cache: [target, node_modules, dist]  # e.g. Rust plus a web frontend
 ```
 
-Leave it out, or set `build_cache: []`, and every VM builds from clean. To keep
-it on but start over once, delete its entry under `<canonical-root>/_buildcache/`
-(named `<repo>-<hash>`) between runs. The verify gate always builds from clean either way. Details in
-[`docs/PIPELINES.md`](./docs/PIPELINES.md#warm-build-cache).
+Leave it out, or set `build_cache: []`, and every VM builds from clean; pass
+`--no-build-cache` to the runner to do the same for one run. To keep it on but
+start over once, delete its entry under `<canonical-root>/_buildcache/` (named
+`<repo>-<hash>`) between runs. The verify gate always builds from clean either
+way. Details in [`docs/PIPELINES.md`](./docs/PIPELINES.md#warm-build-cache).
 
 ### Antigravity (agy) egress
 
