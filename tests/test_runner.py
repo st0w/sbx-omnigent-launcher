@@ -12971,6 +12971,14 @@ class TestAReviewerBuildsFromTheWarmCache(_Base):
         self.assertTrue(workspace.endswith('#ro'), workspace)
         self.assertIn('/tmp/review-target', msg)
 
+    def test_an_empty_cache_list_keeps_todays_reviewer(self) -> None:
+        _r, _sc, wt, workspace, msg = self._reviewer(
+            _with_cache(_LINEAR, '[]')
+        )
+        self.assertTrue(workspace.endswith('#ro'), workspace)
+        self.assertIn('/tmp/review-target', msg)
+        self.assertEqual(wt.seeds, [])
+
     def test_no_cache_keeps_todays_reviewer(self) -> None:
         _r, _sc, wt, workspace, msg = self._reviewer(_LINEAR)
         self.assertTrue(workspace.endswith('#ro'), workspace)

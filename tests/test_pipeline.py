@@ -949,9 +949,20 @@ class TestBuildCacheConfig(_Base):
     def test_absent_means_off(self) -> None:
         self.assertEqual(self._load(_FULL).build_cache, ())
 
+    def test_an_empty_list_means_off(self) -> None:
+        # Documented as the explicit way to turn the cache off.
+        cfg = self._load(_FULL + 'build_cache: []\n')
+        self.assertEqual(cfg.build_cache, ())
+
     def test_names_are_parsed(self) -> None:
         cfg = self._load(_FULL + 'build_cache: [target]\n')
         self.assertEqual(cfg.build_cache, ('target',))
+
+    def test_several_names_keep_their_order(self) -> None:
+        cfg = self._load(
+            _FULL + 'build_cache: [target, node_modules, dist]\n'
+        )
+        self.assertEqual(cfg.build_cache, ('target', 'node_modules', 'dist'))
 
     def test_a_traversal_is_rejected(self) -> None:
         # These names are joined onto a worktree path AND onto the
