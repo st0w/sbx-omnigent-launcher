@@ -3992,13 +3992,21 @@ class PipelineRunner:
         committed state that actually ships, and inherits none of the
         multi-gigabyte build output the writer left behind.
 
+        It is not seeded from the warm build cache either. The cache is
+        filled from writers' build directories, and a writer controls
+        its own: output planted there with timestamps newer than the
+        sources is reused by the build tool rather than rebuilt. The
+        gate is the one check that must not take an agent's word, so
+        it builds from clean. Its build still refreshes the cache.
+
         :param winner: The node whose branch to verify.
         :param spec: The configured gate.
         :returns: The :class:`~sbx_omnigent.verify.VerifyOutcome`.
         """
         node_id = f'{winner}-verify'
         workspace = self._wt.create_node_worktree(
-            self._run_id, node_id, from_node=winner, replace=True
+            self._run_id, node_id, from_node=winner, replace=True,
+            seed_cache=False,
         )
         click.echo(
             f'[verify] {winner}: running the gate in a disposable '

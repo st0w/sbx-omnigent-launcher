@@ -603,14 +603,21 @@ build_cache: [target]      # Rust; e.g. [node_modules, dist] or [build]
 - **Where the cache lives.** `<canonical-root>/_buildcache/<repo>`, beside the
   canonical mirrors, so it outlives any one run and two projects never share
   one.
-- **When it is used.** Every node clone the runner cuts is seeded from it:
-  writers, readers and the verify gate's clone. It is refreshed after every
-  stage that completes, and after a gate that passes, so the next node starts
-  from the newest build. A stage that failed never refreshes it. Reviewers
-  mount a snapshot that is not seeded, so they still build from clean (#37).
+- **When it is used.** Writer and reader clones are seeded from it. It is
+  refreshed after every stage that completes, and after a gate that passes,
+  so the next node starts from the newest build. A stage that failed never
+  refreshes it. Reviewers mount a snapshot that is not seeded, so they still
+  build from clean (#37).
+- **The verify gate is never seeded.** The cache is filled from writers' build
+  directories, and a writer controls its own: build output planted there with
+  timestamps newer than the sources would be reused by the build tool instead
+  of rebuilt. The gate is the one check that doesn't take an agent's word, so
+  its clone starts with no build output and it builds from clean. Its build
+  still refreshes the cache.
 - **Staleness is the build tool's job.** A cache from another branch or
   toolchain is revalidated by the build tool (Cargo fingerprints every
-  artifact), so the worst case is a from-clean build, never a wrong artifact.
+  artifact), so for honestly built output the worst case is a from-clean
+  build, never a wrong artifact.
 - **Best-effort.** A cache that can't be seeded or refreshed leaves the node
   building from clean, and a `[build-cache]` line says so once per run. It
   never fails a run.

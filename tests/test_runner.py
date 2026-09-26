@@ -127,6 +127,8 @@ class FakeWT:
         self.state_to_load: dict | None = None
         #: node_id -> whether its worktree cut was a replacement.
         self.replaced: dict[str, bool] = {}
+        #: node -> whether its clone was seeded from the build cache.
+        self.seeded: dict[str, bool] = {}
         #: Whether create_run was asked to reuse an existing hub.
         self.reused = False
         #: Make commit_node raise (salvage must not mask the failure).
@@ -176,10 +178,11 @@ class FakeWT:
 
     def create_node_worktree(
         self, run_id, node_id, *, from_node=None, base_branch=None,
-        replace=False,
+        replace=False, seed_cache=True,
     ) -> str:
         self.node_from[node_id] = from_node
         self.replaced[node_id] = replace
+        self.seeded[node_id] = seed_cache
         return f'/wt/{run_id}/nodes/{node_id}'
 
     def reseed_node_worktree(self, run_id, node_id, from_node) -> str:
@@ -10958,6 +10961,24 @@ class TestVerifyGate(_Base):
         return mock.patch.object(
             R.verify, 'run_verification', side_effect=fake
         ), calls
+
+    def test_the_gates_clone_is_not_seeded(self) -> None:
+        # The cache comes from writers' build directories. A writer
+        # could plant output there that the gate would then trust.
+        patch, _calls = self._gate([_outcome(True)])
+        runner, _sc, wt = self._build()
+        with patch:
+            runner.run()
+        gates = [n for n in wt.seeded if n.endswith('-verify')]
+        self.assertTrue(gates)
+        self.assertFalse(any(wt.seeded[n] for n in gates))
+
+    def test_the_writers_clones_still_are(self) -> None:
+        patch, _calls = self._gate([_outcome(True)])
+        runner, _sc, wt = self._build()
+        with patch:
+            runner.run()
+        self.assertTrue(wt.seeded['build'])
 
     # ── whose setup reaches the shell ─────────────────────────────
 
