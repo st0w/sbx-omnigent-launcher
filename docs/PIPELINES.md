@@ -606,8 +606,16 @@ build_cache: [target]      # Rust; e.g. [node_modules, dist] or [build]
 - **When it is used.** Writer and reader clones are seeded from it. It is
   refreshed after every stage that completes, and after a gate that passes,
   so the next node starts from the newest build. A stage that failed never
-  refreshes it. Reviewers mount a snapshot that is not seeded, so they still
-  build from clean (#37).
+  refreshes it.
+- **Reviewers build in a seeded scratch.** A reviewer's tree is mounted
+  read-only, so it can't build in place. Each reviewer gets its own directory
+  beside the round's snapshot, cloned from the cache, as its read-write mount,
+  and its instruction names it (for Cargo, `CARGO_TARGET_DIR=<scratch>/target`).
+  The scratch is cut fresh on every launch, so a retried reviewer never
+  inherits what the last guest wrote. Nothing a reviewer builds is read back
+  into the cache, and the scratches are removed with the round's snapshot. If
+  a scratch can't be seeded, that reviewer builds from clean on its VM's own
+  disk, as it did before there was a cache.
 - **The verify gate is never seeded.** The cache is filled from writers' build
   directories, and a writer controls its own: build output planted there with
   timestamps newer than the sources would be reused by the build tool instead
@@ -623,10 +631,13 @@ build_cache: [target]      # Rust; e.g. [node_modules, dist] or [build]
   never fails a run.
 - **Disk.** Seeding costs nothing only on a filesystem that clones copy-on-write:
   APFS on macOS, or btrfs and XFS with reflink on Linux. Anywhere else, each
-  node gets a full copy of the cache.
+  node and each reviewer's scratch gets a full copy of the cache, and the disk
+  preflight counts the reviewers of the largest review stage as host worktrees.
 
 Measured on a Rust workspace: a seeded rebuild took 16 s where a from-clean one
-took 121 s.
+took 121 s. Building on the reviewer's mount rather than the VM's own disk costs
+little: on a small crate, a from-clean build took 14.5 s on the mount against
+12.4 s on the VM's disk, and a seeded one took 0.3 s.
 
 ## Verification — the one check the orchestrator makes itself
 

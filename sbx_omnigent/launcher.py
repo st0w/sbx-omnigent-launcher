@@ -593,7 +593,7 @@ class SbxLauncher(ExecModelHostLauncher):
                 ),
             )
 
-        path, mode, credential = self._parse_mount_sentinel(
+        path, mode, credential, seed = self._parse_mount(
             repo_url, repo_branch
         )
         worktree = self._resolve_worktree_path(path)
@@ -601,11 +601,11 @@ class SbxLauncher(ExecModelHostLauncher):
             # Coder: the worktree IS the primary, read-write.
             workspaces = [worktree]
         else:
-            # Reviewer: primary must be rw, so give it a throwaway
-            # scratch and mount the worktree read-only alongside it (at
-            # the same absolute path the host sees).
+            # Reviewer: primary must be rw, so give it a scratch and
+            # mount the worktree read-only alongside it (at the same
+            # absolute path the host sees).
             workspaces = [
-                self._make_scratch(sandbox_id),
+                self._review_primary(sandbox_id, worktree, seed),
                 f'{worktree}:ro',
             ]
         _logger.info(
@@ -660,6 +660,41 @@ class SbxLauncher(ExecModelHostLauncher):
             server_url=server_url,
         )
         return worktree
+
+    @classmethod
+    def _parse_mount(
+        cls, repo_url: str, repo_branch: str | None
+    ) -> tuple[str, str, str | None, str | None]:
+        """
+        Split a mount sentinel into path, mode, credential and seed.
+
+        The seed is a reviewer's build-cache token, carried as
+        ``ro.<token>`` before any credential suffix (see
+        :func:`swarm.mount_sentinel`).
+
+        :param repo_url: A sentinel URL.
+        :param repo_branch: The ``#<mode>`` fragment, or ``None``.
+        :returns: ``(path, mode, credential, seed)``; *seed* is ``None``
+            unless the fragment carries one.
+        :raises click.ClickException: As :meth:`_parse_mount_sentinel`,
+            and on a malformed token or a token on a writer.
+        """
+        mode_part = (repo_branch or 'rw').lower()
+        for kind in swarm_mod.MOUNT_CREDENTIAL_KINDS:
+            if mode_part.endswith(f'-{kind}'):
+                mode_part = mode_part[: -len(f'-{kind}')]
+                break
+        base, dot, seed = mode_part.partition('.')
+        if not dot:
+            return (*cls._parse_mount_sentinel(repo_url, repo_branch), None)
+        if base != 'ro' or not swarm_mod.MOUNT_SEED_RE.fullmatch(seed):
+            raise click.ClickException(
+                f'mount sentinel fragment {repo_branch!r} is invalid — a '
+                f'build seed is 12 lowercase hex characters, and only a '
+                f'reviewer (ro) takes one'
+            )
+        unseeded = (repo_branch or '').lower().replace(f'.{seed}', '', 1)
+        return (*cls._parse_mount_sentinel(repo_url, unseeded), seed)
 
     @staticmethod
     def _parse_mount_sentinel(
@@ -739,6 +774,36 @@ class SbxLauncher(ExecModelHostLauncher):
             raise click.ClickException(
                 f'worktree path {path!r} resolves to {real!r}, which '
                 f'is not under the allowed root {root!r}'
+            )
+        return real
+
+    def _review_primary(
+        self, sandbox_id: str, worktree: str, seed: str | None
+    ) -> str:
+        """
+        A reviewer's read-write primary: its seeded scratch, or empty.
+
+        With a seed token, the runner has cut the scratch
+        ``<worktree>.seed-<token>`` beside the tree under review, cloned
+        from the warm build cache (#37). It must be a real directory,
+        not a symlink, and resolve under ``worktree_root`` like every
+        mount.
+
+        :param sandbox_id: The sandbox, for the empty scratch's name.
+        :param worktree: The resolved tree under review.
+        :param seed: The seed token from the sentinel, or ``None``.
+        :returns: The primary directory to mount read-write.
+        :raises click.ClickException: If the seeded scratch is missing,
+            is a symlink, or resolves outside the root.
+        """
+        if seed is None:
+            return self._make_scratch(sandbox_id)
+        expected = f'{worktree}.seed-{seed}'
+        real = self._resolve_worktree_path(expected)
+        if real != expected:
+            raise click.ClickException(
+                f'review seed {expected!r} resolves to {real!r}; it must '
+                f'be a directory beside the tree under review'
             )
         return real
 

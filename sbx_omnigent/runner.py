@@ -36,6 +36,7 @@ import concurrent.futures
 import contextlib
 import fnmatch
 import functools
+import hashlib
 import re
 import shlex
 import shutil
@@ -891,6 +892,57 @@ _REVIEW_MOUNT = (
     'that reached for `rm -rf` to clear space stalled its whole turn on '
     'a permission prompt.'
 )
+
+
+def _seed_token(label: str) -> str:
+    """
+    The build-seed token for one reviewer (#37).
+
+    Derived from the reviewer's label rather than taken from it: the
+    token rides in the mount sentinel's fragment, which the server
+    lowercases and restricts, so it must be plain hex. Stable per
+    label, so a retried reviewer reseeds the same scratch.
+
+    :param label: The reviewer's node label (``<stage>-<reviewer>``).
+    :returns: Twelve lowercase hex characters.
+    """
+    return hashlib.sha256(label.encode('utf-8')).hexdigest()[:12]
+
+
+def _review_mount(scratch: str | None, build_cache: Sequence[str]) -> str:
+    """
+    The mount note for a reviewer, naming its seeded scratch if any.
+
+    :param scratch: The reviewer's seeded read-write scratch, or
+        ``None`` for one building from clean on the VM's own disk.
+    :param build_cache: The pipeline's ``build_cache`` names.
+    :returns: :data:`_REVIEW_MOUNT` unseeded; otherwise a note that
+        points every cached build directory at the scratch.
+    """
+    if scratch is None:
+        return _REVIEW_MOUNT
+    listed = ', '.join(f'`{scratch}/{name}`' for name in build_cache)
+    cargo = (
+        f' For Cargo, `export CARGO_TARGET_DIR={scratch}/target` before '
+        'any cargo command.'
+        if 'target' in build_cache
+        else ''
+    )
+    return (
+        '\n\nYour mount is READ-ONLY: you can read and build the tree '
+        'but not write into it. Your writable directory is '
+        f'`{scratch}`, and it already holds the build output of the '
+        f'last build of this project: {listed}. Build there, so only '
+        'what changed recompiles.'
+        + cargo
+        + ' Other toolchains have an equivalent. DO NOT COPY the tree '
+        'anywhere first, and do not try to make the mount writable: '
+        'cargo builds a read-only source directory fine with the '
+        'target directory elsewhere, the copy is gigabytes for '
+        'nothing, and one reviewer that reached for `rm -rf` to clear '
+        'space stalled its whole turn on a permission prompt.'
+    )
+
 
 #: Run it, do not read it. Shared by every review instruction.
 _REVIEW_VERIFY = (
@@ -7811,7 +7863,12 @@ class PipelineRunner:
         """
         attempt = launches = 0
         while True:
-            session = self._create_session(reviewer, target_wt, 'ro', label)
+            # Per LAUNCH, not once: a retry must never inherit what the
+            # guest that died wrote into its scratch.
+            seed, scratch = self._seed_reviewer(target_wt, label)
+            session = self._create_session(
+                reviewer, target_wt, 'ro', label, seed=seed
+            )
             # Recorded the moment it exists, not once the turn succeeds,
             # so a reviewer that dies mid-review still hands its
             # guest to the stage backstop instead of leaking it.
@@ -7819,7 +7876,7 @@ class PipelineRunner:
                 created.append(session)
             try:
                 return session, self._drive(
-                    session, self._review_instruction(stage)
+                    session, self._review_instruction(stage, scratch)
                 )
             except SwarmRunnerUnavailable as exc:
                 # No turn ran, so this spends a launch, not an attempt.
@@ -7856,6 +7913,42 @@ class PipelineRunner:
             # AFTER the guest is freed, so an outage is not waited out
             # while a dead VM holds its slot.
             time.sleep(_REVIEW_RETRY_BACKOFF_S)
+
+    def _seed_reviewer(
+        self, target_wt: str, label: str
+    ) -> tuple[str | None, str | None]:
+        """
+        Cut a reviewer's scratch from the warm build cache (#37).
+
+        Each reviewer gets its own directory beside the round's
+        snapshot, cloned fresh from the cache, as its read-write
+        primary. Nothing a reviewer writes there is read back into
+        the cache: the cache is refreshed only from writers and the
+        gate.
+
+        Best-effort: a reviewer that cannot be seeded reviews exactly
+        as it did before there was a cache, building from clean on
+        its VM's own disk. Slower, never wrong.
+
+        :param target_wt: The round's snapshot (mounted ro).
+        :param label: The reviewer's node label.
+        :returns: ``(token, scratch)``, or ``(None, None)`` when there
+            is no ``build_cache`` or seeding failed.
+        """
+        if not self._config.build_cache:
+            return None, None
+        token = _seed_token(label)
+        try:
+            scratch = self._wt.seed_review_scratch(
+                self._run_id, target_wt, token
+            )
+        except (click.ClickException, OSError) as exc:
+            click.echo(
+                f'[review] {label}: could not seed its build scratch '
+                f'from the cache ({exc}) — it builds from clean instead.'
+            )
+            return None, None
+        return token, scratch
 
     def _review_guest(
         self,
@@ -8223,6 +8316,11 @@ class PipelineRunner:
         :param round_no: The recorded review round.
         """
         label = self._snapshot_label(stage_id, round_no)
+        # The reviewers' seeded scratches first, and separately: each
+        # is a full build tree where the filesystem cannot clone
+        # copy-on-write, so one must not be kept by the other failing.
+        with contextlib.suppress(click.ClickException, OSError):
+            self._wt.dispose_review_seeds(self._run_id, label)
         with contextlib.suppress(click.ClickException):
             self._wt.dispose_node_worktrees(self._run_id, [label])
 
@@ -8877,7 +8975,13 @@ class PipelineRunner:
         return warnings
 
     def _create_session(
-        self, agent_name: str, worktree: str, mode: str, label: str
+        self,
+        agent_name: str,
+        worktree: str,
+        mode: str,
+        label: str,
+        *,
+        seed: str | None = None,
     ) -> str:
         agent = self._config.agents[agent_name]
         is_agy = agent.harness in agy.AGY_HARNESSES
@@ -8886,6 +8990,7 @@ class PipelineRunner:
             workspace=mount_sentinel(
                 worktree, mode,
                 credential=credential_kind_for(agent.harness),
+                seed=seed,
             ),
             title=f'{self._run_id}/{label}',
             terminal_launch_args=list(
@@ -9563,12 +9668,14 @@ class PipelineRunner:
         agent = self._config.agents.get(seed_stage.run[0])
         return bool(agent and agent.template == 'tdd-writer')
 
-    def _review_instruction(self, stage: pipeline.PipelineStage) -> str:
+    def _review_instruction(
+        self, stage: pipeline.PipelineStage, scratch: str | None = None
+    ) -> str:
         # A refactor review asks a DIFFERENT question from an
         # implementation review, and asking the implementation one
         # cost a whole campaign. See _refactor_review_instruction.
         if self._reviews_a_refactor(stage):
-            return self._refactor_review_instruction(stage)
+            return self._refactor_review_instruction(stage, scratch)
         # Only inside a campaign: on a flat run there is no increment
         # list, so this would point at a "plan above" that is not there
         # — a dangling reference is worse than saying nothing.
@@ -9579,7 +9686,7 @@ class PipelineRunner:
         )
         return (
             self._task_block()
-            + _REVIEW_MOUNT
+            + _review_mount(scratch, self._config.build_cache)
             + '\n\nReview the working tree in your mount against this '
             'contract.'
             + _REVIEW_VERIFY
@@ -9611,7 +9718,7 @@ class PipelineRunner:
         return target_stage is not None and self._is_refactor(target_stage)
 
     def _refactor_review_instruction(
-        self, stage: pipeline.PipelineStage
+        self, stage: pipeline.PipelineStage, scratch: str | None = None
     ) -> str:
         """
         Ask a refactor's reviewers the question a refactor answers.
@@ -9646,6 +9753,7 @@ class PipelineRunner:
         scope is a fact rather than an act of good faith.
 
         :param stage: The review stage about to run.
+        :param scratch: The reviewer's seeded build scratch, if any.
         :returns: The full instruction for a refactor reviewer.
         """
         target = self._review_target(stage)
@@ -9663,7 +9771,7 @@ class PipelineRunner:
             'by consensus before it reached this stage; a separate '
             'writer has since cleaned it up without being permitted to '
             'change what it does.'
-            + _REVIEW_MOUNT
+            + _review_mount(scratch, self._config.build_cache)
             + listed
             + '\n\nYOUR SUBJECT IS THE CHANGE, NOT THE TREE. Compare '
             'the refactored code against what it replaced, side by '
@@ -10198,6 +10306,32 @@ def writer_worktrees(config: pipeline.PipelineConfig) -> int:
     return total
 
 
+def review_seed_worktrees(config: pipeline.PipelineConfig) -> int:
+    """
+    How many seeded reviewer scratches are on the host at once (#37).
+
+    With a ``build_cache``, each reviewer builds in a scratch cloned
+    from the cache. Where the filesystem cannot clone copy-on-write
+    that is a full copy of a build tree, so each counts as a build
+    worktree. They go when their round ends, and review stages are
+    never up together, so only the LARGEST review stage counts, once,
+    whatever the pass count.
+
+    :param config: The parsed pipeline.
+    :returns: The seeded-scratch count; 0 without a ``build_cache``.
+    """
+    if not config.build_cache:
+        return 0
+    return max(
+        (
+            len(stage.run)
+            for stage in pipeline._iter_stages(config.stages)
+            if PipelineRunner._stage_kind(stage) == 'review'
+        ),
+        default=0,
+    )
+
+
 def _resume_worktree_count(worktree_root: str, run_id: str) -> int:
     """
     How many node worktrees a resume already has on disk.
@@ -10396,7 +10530,9 @@ def preflight_disk(
     # run; without it each module's are reclaimed as it publishes.
     passes = len(config.subtasks) if keep and config.subtasks else 1
     vms = max_concurrent_vms(config, reclaim=not keep) * passes
-    trees = max(0, writer_worktrees(config) * passes - worktrees_on_disk)
+    trees = max(
+        0, writer_worktrees(config) * passes - worktrees_on_disk
+    ) + review_seed_worktrees(config)
     needed = floor + vms * per_vm + trees * per_tree
     free = usage(path or Path.home()).free
     if free >= needed:

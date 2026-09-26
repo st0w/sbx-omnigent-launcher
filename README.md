@@ -942,7 +942,7 @@ A run occupies the host **twice over**, and the estimate counts both terms:
 | Term | How many | Default each |
 | --- | --- | --- |
 | microVMs | one per node that is still re-drivable, plus one for the verification gate, plus the *largest single* review stage's reviewers. A reviewer is freed once its round votes; a reader, a judge, and any writer no gate can loop back to are freed when their stage completes. Under `--keep` nothing is freed and they all sum | 3.5 GB |
-| host worktrees | one per **writer** — the only nodes that build into their clone. A reader's or judge's tree is ~100 KB (a node clone is local, so its objects are hardlinked); a reviewer cuts none, it mounts the writer's | 4.0 GB |
+| host worktrees | one per **writer** — the only nodes that build into their clone. A reader's or judge's tree is ~100 KB (a node clone is local, so its objects are hardlinked), and so is a review round's source-only snapshot. With `build_cache:` set, each reviewer of the largest review stage also counts: it builds in a scratch seeded from the cache, a full copy wherever the filesystem can't clone copy-on-write | 4.0 GB |
 | headroom | for the host itself | 5 GB |
 
 Counting only the VMs is what let a run start on ~23 GB and exhaust the disk two
