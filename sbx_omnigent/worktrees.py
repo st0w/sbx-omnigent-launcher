@@ -1098,6 +1098,7 @@ class WorktreeManager:
         from_node: str | None = None,
         base_branch: str | None = None,
         replace: bool = False,
+        seed_cache: bool = True,
     ) -> str:
         """
         Create an isolated, self-contained clone + branch for one node.
@@ -1122,6 +1123,10 @@ class WorktreeManager:
             earlier attempt and re-cut it (resume). When that attempt
             left a branch behind, the new clone starts from THAT branch,
             so partial work is inherited rather than thrown away.
+        :param seed_cache: Seed the clone from the warm build cache (see
+            :meth:`seed_build_cache`). ``False`` for the verify gate:
+            the cache is filled from writers' build directories, which
+            a writer controls, and the gate must not trust them.
         :returns: The node's clone path.
         :raises click.ClickException: On a missing run or git error.
         """
@@ -1187,7 +1192,8 @@ class WorktreeManager:
         # branch registration downstream nodes inherit from. The cache
         # entries are git-ignored build output by definition, so this
         # cannot change what the node commits.
-        self.seed_build_cache(path)
+        if seed_cache:
+            self.seed_build_cache(path)
         return path
 
     def _build_cache_dir(self) -> str | None:

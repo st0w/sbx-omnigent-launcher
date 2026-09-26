@@ -734,6 +734,47 @@ class TestAnAgentsRewriteNeverRewritesTheHub(unittest.TestCase):
         self.assertEqual(self.mgr.hub_branch_tip('run1', 'build'), tip)
 
 
+class TestTheGatesCloneIsNotSeeded(unittest.TestCase):
+    """The build cache is filled from writers' build directories, which
+    a writer controls. The verify gate is the one check that must not
+    take an agent's word, so its clone starts with no build output."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix='wt-gate-'))
+        src = self.tmp / 'src'
+        _init_repo(src)
+        self.mgr = WorktreeManager(
+            canonical_root=str(self.tmp / 'canon'),
+            worktree_root=str(self.tmp / 'wt'),
+            default_branch='main',
+            build_cache=('target',),
+            build_cache_key='proj',
+        )
+        self.mgr.create_run('run1', str(src))
+        cached = self.tmp / 'canon' / '_buildcache' / 'proj' / 'target'
+        cached.mkdir(parents=True)
+        (cached / 'artifact').write_text('planted', encoding='utf-8')
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_node_is_seeded_by_default(self) -> None:
+        wt = Path(self.mgr.create_node_worktree('run1', 'build'))
+        self.assertTrue((wt / 'target' / 'artifact').exists())
+
+    def test_an_unseeded_clone_has_no_build_output(self) -> None:
+        wt = Path(self.mgr.create_node_worktree(
+            'run1', 'build-verify', seed_cache=False
+        ))
+        self.assertFalse((wt / 'target').exists())
+
+    def test_it_is_still_a_real_clone_of_the_branch(self) -> None:
+        wt = Path(self.mgr.create_node_worktree(
+            'run1', 'build-verify', seed_cache=False
+        ))
+        self.assertIn('README.md', _files(wt))
+
+
 class TestRetainingLosingBranches(unittest.TestCase):
     """Real-git checks for the archive of a non-selected implementation.
 
