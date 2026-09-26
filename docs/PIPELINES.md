@@ -592,17 +592,68 @@ turn_timeout: 3600      # seconds; --turn-timeout overrides it
 
 Every node starts from a fresh clone, so without a cache every node compiles the
 project from clean. `build_cache:` names the build output directories to carry
-from one node to the next:
+from one node to the next. **It is off unless you set it**, and it is yours to
+choose per pipeline: on for a project whose builds are slow, off for one whose
+builds are fast or that you want built from clean everywhere.
+
+### Turning it on
+
+One key, at the top level of `pipeline.yaml`:
 
 ```yaml
-build_cache: [target]      # Rust; e.g. [node_modules, dist] or [build]
+build_cache: [target]                      # a Rust workspace
 ```
 
-- **What the entries are.** Bare directory names at the top of the worktree.
-  Paths, `.` and `..` are refused when the pipeline loads.
+List as many directories as the project builds into:
+
+```yaml
+build_cache: [target, node_modules, dist]  # Rust plus a web frontend
+```
+
+- **It covers the whole pipeline.** Every writer and reader clone is seeded,
+  and every reviewer builds in a seeded scratch. There is no per-stage
+  setting. The verify gate is never seeded (see below).
+- **Entries are top-level directory names.** Paths, `.` and `..` are refused
+  when the pipeline loads, so a nested directory such as `web/node_modules`
+  can't be cached. An entry the project never produces is skipped, and a
+  checked-in directory of the same name is never overwritten.
+- **Leave out anything tied to its own path.** A Python `.venv`, for example:
+  its scripts name the interpreter by absolute path, and each node's clone is
+  at a different one. uv rebuilds a virtualenv quickly anyway.
+
+### Turning it off: every VM builds from clean
+
+Leave `build_cache:` out, or set it to an empty list:
+
+```yaml
+build_cache: []
+```
+
+Then every writer and reader builds in a fresh clone, every reviewer builds on
+its VM's own disk, and the verify gate builds from clean as it always does. The
+cache on disk is neither read nor written. It stays where it is, and is used
+again if you turn the cache back on. There is no command-line switch: the
+pipeline file decides.
+
+### Starting over from clean, with the cache still on
+
+Delete the cache between runs:
+
+```sh
+rm -rf <canonical-root>/_buildcache/<repo>
+```
+
+`<canonical-root>` is the runner's `--canonical-root` (or
+`OMNI_SBX_CANONICAL_ROOT`), and `<repo>` is the last segment of `repo:` without
+`.git`. The next run's first nodes build from clean, and the first stage to
+complete fills the cache again. During a run this buys little: the next stage
+to complete refills it straight away.
+
+### How it works
+
 - **Where the cache lives.** `<canonical-root>/_buildcache/<repo>`, beside the
-  canonical mirrors, so it outlives any one run and two projects never share
-  one.
+  canonical mirrors, so it outlives any one run. It is keyed by the
+  repository's name alone, so two repositories with the same name share one.
 - **When it is used.** Writer and reader clones are seeded from it. It is
   refreshed after every stage that completes, and after a gate that passes,
   so the next node starts from the newest build. A stage that failed never

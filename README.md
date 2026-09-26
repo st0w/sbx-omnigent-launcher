@@ -452,6 +452,21 @@ provision a fresh sandbox with a generated name each time, so a `--sandbox`
 For a **remote** server (not `host.docker.internal`), allow that hostname and
 port instead, e.g. `sbx policy allow network omnigent.example.com:443`.
 
+### Build cache: on, off, or from clean
+
+By default every VM builds the project from clean. For a project with slow
+builds (Rust, say), `build_cache:` in `pipeline.yaml` hands build output from
+node to node:
+
+```yaml
+build_cache: [target, node_modules, dist]  # e.g. Rust plus a web frontend
+```
+
+Leave it out, or set `build_cache: []`, and every VM builds from clean. To keep
+it on but start over once, delete `<canonical-root>/_buildcache/<repo>` between
+runs. The verify gate always builds from clean either way. Details in
+[`docs/PIPELINES.md`](./docs/PIPELINES.md#warm-build-cache).
+
 ### Antigravity (agy) egress
 
 Only if you run **Antigravity** agents (`harness: antigravity-native`, which
