@@ -640,20 +640,26 @@ pipeline file decides.
 Delete the cache between runs:
 
 ```sh
-rm -rf <canonical-root>/_buildcache/<repo>
+ls <canonical-root>/_buildcache/             # find your repository's entry
+rm -rf <canonical-root>/_buildcache/<repo>-<hash>
 ```
 
 `<canonical-root>` is the runner's `--canonical-root` (or
-`OMNI_SBX_CANONICAL_ROOT`), and `<repo>` is the last segment of `repo:` without
-`.git`. The next run's first nodes build from clean, and the first stage to
+`OMNI_SBX_CANONICAL_ROOT`). Each entry is named for the repository: the last
+segment of `repo:` without `.git`, then a hash of the whole of `repo:` (see
+below). The next run's first nodes build from clean, and the first stage to
 complete fills the cache again. During a run this buys little: the next stage
 to complete refills it straight away.
 
 ### How it works
 
-- **Where the cache lives.** `<canonical-root>/_buildcache/<repo>`, beside the
-  canonical mirrors, so it outlives any one run. It is keyed by the
-  repository's name alone, so two repositories with the same name share one.
+- **Where the cache lives.** `<canonical-root>/_buildcache/<repo>-<hash>`,
+  beside the repository's mirror (`<canonical-root>/<repo>-<hash>.git`), so it
+  outlives any one run. The hash covers the whole of `repo:`, so `org-a/app`
+  and `org-b/app` get separate caches and separate mirrors, while spellings of
+  one repository (with or without `.git`, a relative or an absolute path)
+  share them. A mirror whose origin is some other repository is refused, never
+  fetched.
 - **When it is used.** Writer and reader clones are seeded from it. It is
   refreshed after every stage that completes, and after a gate that passes,
   so the next node starts from the newest build. A stage that failed never

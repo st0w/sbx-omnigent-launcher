@@ -78,7 +78,7 @@ from sbx_omnigent.swarm_session import (
 )
 from sbx_omnigent.worktrees import (
     WorktreeManager,
-    _repo_name,
+    _repo_key,
     github_slug,
     pr_number,
 )
@@ -11121,6 +11121,32 @@ def main(
         stop_harvester(harvester)
 
 
+def _worktree_manager(
+    config: pipeline.PipelineConfig,
+    *,
+    canonical_root: str,
+    worktree_root: str,
+    publish_token: str | Callable[[], str | None] | None,
+) -> WorktreeManager:
+    """
+    The host-side git manager for one run.
+
+    :param config: The parsed pipeline.
+    :param canonical_root: Host dir holding the mirrors and the cache.
+    :param worktree_root: Host dir holding the run's worktrees.
+    :param publish_token: The publish identity's token, or a reader.
+    :returns: The manager, its build cache keyed by the repository.
+    """
+    return WorktreeManager(
+        canonical_root=canonical_root,
+        worktree_root=worktree_root,
+        default_branch=config.base_branch or 'main',
+        publish_token=publish_token,
+        build_cache=config.build_cache,
+        build_cache_key=_repo_key(config.repo),
+    )
+
+
 def _drive(
     config: pipeline.PipelineConfig,
     *,
@@ -11142,13 +11168,11 @@ def _drive(
     runner = PipelineRunner(
         config,
         session_client=client,
-        worktree_manager=WorktreeManager(
+        worktree_manager=_worktree_manager(
+            config,
             canonical_root=canonical_root,
             worktree_root=worktree_root,
-            default_branch=config.base_branch or 'main',
             publish_token=publish_token,
-            build_cache=config.build_cache,
-            build_cache_key=_repo_name(config.repo),
         ),
         run_id=run_id or config.name,
         agent_ids=ids,
