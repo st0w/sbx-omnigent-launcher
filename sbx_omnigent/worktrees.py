@@ -1766,6 +1766,35 @@ class WorktreeManager:
         hub = self.hub_branch_tip(run_id, node_id)
         return bool(local) and bool(hub) and local != hub
 
+    def node_matches_hub(self, run_id: str, node_id: str) -> bool:
+        """
+        Whether the hub holds everything a node's clone does.
+
+        The bar for deleting a clone (#29), so every doubt answers
+        ``False``: no clone, no hub branch, an unreadable HEAD, work
+        not committed (untracked files included; ignored build output
+        is not work), or a commit the hub never saw.
+
+        :param run_id: Pipeline run id.
+        :param node_id: The node whose clone to check.
+        :returns: ``True`` only if the clone is clean and its HEAD is
+            its branch's tip on the hub.
+        """
+        path = self.node_worktree_path(run_id, node_id)
+        if not os.path.isdir(path):
+            return False
+        try:
+            if self._porcelain(path):
+                return False
+            local = self._run(
+                ['git', '-C', path, 'rev-parse', '--verify', '--quiet',
+                 'HEAD']
+            ).strip()
+        except click.ClickException:
+            return False
+        hub = self.hub_branch_tip(run_id, node_id)
+        return bool(local) and local == hub
+
     def node_is_dirty(self, run_id: str, node_id: str) -> bool:
         """
         Whether a node's worktree holds work that is not on its branch.

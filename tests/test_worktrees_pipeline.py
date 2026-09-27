@@ -357,6 +357,51 @@ class TestPipelineWorktrees(unittest.TestCase):
         self.mgr.commit_node('run1', 'impl-a', message='reconciled')
         self.assertFalse(self.mgr.node_ahead_of_hub('run1', 'impl-a'))
 
+    def test_a_committed_clone_matches_the_hub(self) -> None:
+        # A resume reclaims a finished writer's clone only on this: the
+        # hub must hold everything the clone does (#29).
+        self.mgr.create_run('run1', self.repo)
+        impl = self.mgr.create_node_worktree('run1', 'impl-a')
+        (Path(impl) / 'impl.py').write_text('x\n', encoding='utf-8')
+        self.mgr.commit_node('run1', 'impl-a', message='impl')
+        self.assertTrue(self.mgr.node_matches_hub('run1', 'impl-a'))
+
+    def test_ignored_build_output_does_not_count_as_work(self) -> None:
+        self.mgr.create_run('run1', self.repo)
+        impl = self.mgr.create_node_worktree('run1', 'impl-a')
+        (Path(impl) / '.gitignore').write_text('target/\n', encoding='utf-8')
+        self.mgr.commit_node('run1', 'impl-a', message='impl')
+        (Path(impl) / 'target').mkdir()
+        (Path(impl) / 'target' / 'bin').write_text('b\n', encoding='utf-8')
+        self.assertTrue(self.mgr.node_matches_hub('run1', 'impl-a'))
+
+    def test_uncommitted_work_does_not_match(self) -> None:
+        self.mgr.create_run('run1', self.repo)
+        impl = self.mgr.create_node_worktree('run1', 'impl-a')
+        (Path(impl) / 'impl.py').write_text('x\n', encoding='utf-8')
+        self.mgr.commit_node('run1', 'impl-a', message='impl')
+        (Path(impl) / 'late.py').write_text('late\n', encoding='utf-8')
+        self.assertFalse(self.mgr.node_matches_hub('run1', 'impl-a'))
+
+    def test_a_commit_the_hub_never_saw_does_not_match(self) -> None:
+        self.mgr.create_run('run1', self.repo)
+        impl = self.mgr.create_node_worktree('run1', 'impl-a')
+        (Path(impl) / 'impl.py').write_text('x\n', encoding='utf-8')
+        self.mgr.commit_node('run1', 'impl-a', message='impl')
+        (Path(impl) / 'own.py').write_text('mine\n', encoding='utf-8')
+        _git(Path(impl), 'add', '-A')
+        _git(Path(impl), '-c', 'user.email=a@a', '-c', 'user.name=a',
+             'commit', '-m', 'the agent committed this itself')
+        self.assertFalse(self.mgr.node_matches_hub('run1', 'impl-a'))
+
+    def test_no_hub_branch_or_no_clone_does_not_match(self) -> None:
+        self.mgr.create_run('run1', self.repo)
+        self.mgr.create_node_worktree('run1', 'impl-a')
+        _git(Path(self.mgr._run_repo('run1')), 'branch', '-D',
+             'pl/run1/impl-a')
+        self.assertFalse(self.mgr.node_matches_hub('run1', 'impl-a'))
+        self.assertFalse(self.mgr.node_matches_hub('run1', 'never-cut'))
+
     def test_the_settle_fingerprint_notices_a_second_edit(self) -> None:
         # `git status --porcelain` prints ' M f.py' for one edit and
         # for ten, so a writer still rewriting files it already touched
