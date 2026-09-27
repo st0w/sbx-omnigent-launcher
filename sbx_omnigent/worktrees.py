@@ -359,9 +359,8 @@ class WorktreeManager:
         **Prefer the callable**: publish happens at the END of a run
         that may have taken hours, and a token captured at startup can
         be rotated or expired by then — which cost a finished module
-        its pull request (TASKS.md #43). A callable is read lazily and
-        re-read once if the credential is rejected. See
-        :meth:`_run_publish`.
+        its pull request. A callable is read lazily and re-read once if
+        the credential is rejected. See :meth:`_run_publish`.
     :param build_cache: Directory names, relative to a node worktree
         root, carried between nodes as a warm build cache — e.g.
         ``('target',)`` for cargo. Empty (the default) disables it.
@@ -410,7 +409,7 @@ class WorktreeManager:
         run can take hours; a token read at startup and held in memory
         is a token that may have been rotated or expired by the time it
         is used. That is not hypothetical — it cost a finished module
-        its pull request, after every stage had passed (TASKS.md #43).
+        its pull request, after every stage had passed.
 
         :param refresh: Re-read even when a value is already cached.
             Used once, after a credential is rejected.
@@ -1597,7 +1596,7 @@ class WorktreeManager:
         on it — so the runner must read what is already on the
         branch and add to it, never regenerate it. A writer that
         rebuilt the document each run would clobber the very
-        annotations it exists to hold (TASKS.md #10).
+        annotations it exists to hold.
 
         Same path guards as the write side: an absolute path, or one
         escaping the worktree via ``..``, is refused rather than
@@ -2293,8 +2292,8 @@ class WorktreeManager:
         Under ``canonical_root`` for the same reason as the retained
         bundles: a COMPLETED run deletes its own run directory, so a
         record kept there would survive only the runs that failed —
-        exactly the bias that made the planning-session record useless
-        (TASKS.md #30). Nothing under ``canonical_root`` is removed.
+        exactly the bias that made the planning-session record useless.
+        Nothing under ``canonical_root`` is removed.
         """
         return os.path.join(
             self._canonical_root,
@@ -2339,7 +2338,7 @@ class WorktreeManager:
         publishes, so without this the loser — complete, reviewed, and
         test-passing — is deleted with the run hub. That is the most
         valuable comparison data the pipeline produces and the run dir
-        holds the only copy (TASKS.md #32).
+        holds the only copy.
 
         A DELTA bundle against *against*, not a full-history one: it is
         roughly twenty times smaller and restores just as well, because

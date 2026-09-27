@@ -1,5 +1,5 @@
 """
-The Claude launch-gate pre-acceptance seed (TASKS.md #39).
+The Claude launch-gate pre-acceptance seed.
 
 These run the seed program for real rather than grepping its source.
 The whole point of the module is a side effect inside a guest, and a

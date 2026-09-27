@@ -5,7 +5,7 @@ ABNORMALLY; a VM disposed cleanly does not leak. Nothing in `sbx ls`,
 `sbx rm` or any session record shows the leftover — it is a file in
 containerd's snapshotter store and only a daemon GC reclaims it. One
 was measured holding **11 GB for twelve days** while `sbx ls` reported
-two sandboxes and no managed VMs (TASKS.md #7).
+two sandboxes and no managed VMs.
 
 That matters here because it is invisible to every reclaim the launcher
 can do: the sessions are gone, the worktrees are gone, and the disk is
@@ -17,8 +17,9 @@ So this module only DETECTS and NAMES. It never deletes: hand-removing a
 snapshot directory leaves a dangling row in the snapshotter's
 ``metadata.db``, which is corruption rather than cleanup. The supported
 reclaim is a daemon restart (`sbx daemon` is a hidden subcommand), which
-runs containerd's GC — and doing that automatically belongs with the
-wedged-daemon work in TASKS.md #24, not in a disk preflight.
+runs containerd's GC. Doing that automatically was decided against in
+#28: a restart stops every VM on the host, including ones that have
+nothing to do with the run.
 """
 
 from __future__ import annotations

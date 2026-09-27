@@ -43,7 +43,7 @@ def _assert_plan_committed(case, wt, worktree, path, marker):
 
     Content equality was incidental to these tests: the fake now returns
     plan-SHAPED replies, because the runner refuses a reply that is not
-    a design plan (TASKS.md #29).
+    a design plan.
     """
     for tree, rel, content in wt.tracked_files:
         if tree == worktree and rel == path and marker in content:
@@ -572,9 +572,9 @@ class FakeSC:
             reply = val
         # A PLANNER's reply is wrapped in plan shape, keeping the
         # fixture's marker inside it. The runner refuses a reply that is
-        # not a design plan (TASKS.md #29), and a real planner never
-        # answers 'P' — so a fixture that did would only be testing the
-        # refusal. Tests of the guard itself pass real text directly.
+        # not a design plan, and a real planner never answers 'P' — so a
+        # fixture that did would only be testing the refusal. Tests of
+        # the guard itself pass real text directly.
         if _is_planner_label(label) and not self.raw_plan_replies:
             reply = _plan_text(2200, reply)
         self._last_reply[session] = reply
@@ -1918,8 +1918,8 @@ class TestAReviewerIsFreedTheMomentItVotes(_Base):
     holding three guests in 17 GB.
 
     This used to be guaranteed by running reviewers ONE AT A TIME.
-    They now run together (TASKS.md #46), so the guarantee is per
-    reviewer rather than a global order."""
+    They now run together, so the guarantee is per reviewer rather than
+    a global order."""
 
     _TWO = _LINEAR.replace(
         '  sec:\n', '  bugs:\n    template: bug-reviewer\n'
@@ -2278,9 +2278,9 @@ class TestTurnCapture(_Base):
         self.assertIn('the turn failed', wt.artifacts['turns/build.md'])
 
     def test_a_failed_turn_also_captures_the_tui_pane(self) -> None:
-        # The whole point of #26: a harness blocked on a keystroke never
-        # produces a message, so the transcript is empty and the SCREEN
-        # is the only evidence there is.
+        # The whole point of the pane capture: a harness blocked on a
+        # keystroke never produces a message, so the transcript is empty
+        # and the SCREEN is the only evidence there is.
         runner, sc, wt = self._runner({'plan': 'P'})
         sc.fail_labels.add('build')
         sc.default_host_id = 'h1'
@@ -2296,7 +2296,7 @@ class TestTurnCapture(_Base):
         # It must say WHICH VM, and it must not have typed anything.
         self.assertIn('managed-h1', wt.artifacts['turns/build.pane.txt'])
         # Not `called_once`: the launch read-back reads the same
-        # pane at session create (#28/#34/#35). Neither one types.
+        # pane at session create. Neither one types.
         self.assertEqual(
             {c.args[0] for c in capture.call_args_list}, {'managed-h1'}
         )
@@ -3903,8 +3903,7 @@ class TestTheFindingsLedgerIsAppendOnly(unittest.TestCase):
     The ledger is a HUMAN-EDITED artifact: a person annotates status and
     reasoning on it, across modules and across runs. So the runner reads
     what is on the branch and adds to it. A renderer that rebuilt the
-    document each run would clobber exactly what it exists to hold
-    (TASKS.md #10).
+    document each run would clobber exactly what it exists to hold.
     """
 
     def _render(self, records, existing=None):
@@ -4399,11 +4398,11 @@ class TestLaterIncrementIsRoutedNotFiled(_Base):
 
 class TestFindingsAreFiledAsIssues(_Base):
     """
-    The flat ledger was the wrong shape and #58 was the proof: a chunk's
-    branch is cut from the previous chunk's implementation tip, so it
-    never carried the previous chunk's docs, so the ledger restarted
-    every chunk — and two chunks adding the same path collide on merge.
-    A tracker is cross-branch and cross-campaign by construction.
+    The flat ledger was the wrong shape: a chunk's branch is cut from
+    the previous chunk's implementation tip, so it never carried the
+    previous chunk's docs, so the ledger restarted every chunk — and two
+    chunks adding the same path collide on merge. A tracker is
+    cross-branch and cross-campaign by construction.
     """
 
     def _run_gh(self, wt=None, replies=None):
@@ -4531,7 +4530,7 @@ class TestTheLedgerIsTheNoTrackerFallback(_Base):
     """
     With no GitHub to file into — `publish: local`, or `mode: none` —
     the committed ledger is still the right home for a finding, so it
-    survives as the fallback (TASKS.md #58).
+    survives as the fallback.
     """
 
     def _ledger(self, wt):
@@ -4851,7 +4850,7 @@ class TestAReviewerThatLostItsRunner(_Base):
 
     def test_a_missing_pane_says_so_rather_than_going_quiet(self) -> None:
         # Dropping the suffix silently reproduces exactly the bare
-        # "failed: None" that #26 exists to prevent.
+        # "failed: None" that the pane capture exists to prevent.
         sc = FakeSC(dict(_LINEAR_REPLIES))
         sc.fail_labels = {'build'}
         with self.assertRaises(R.PipelineRunError) as caught:
@@ -5957,8 +5956,7 @@ class TestAJudgeThatDidNotDecide(_Base):
     A judge replied "I have launched the cargo test execution in the
     background ... I will process the results as soon as they are
     available" and ended its turn. There is no later turn, so its
-    opinion was discarded and the first candidate won by default
-    (TASKS.md #41).
+    opinion was discarded and the first candidate won by default.
     """
 
     def test_it_is_asked_once_more_and_the_answer_counts(self) -> None:
@@ -6053,8 +6051,7 @@ class TestAJudgeThatDecidedButMisspelledIt(_Base):
     documentation, test coverage, trait placement — and ended with
     ``SELECT core-contracts-impl-a``. No colon, so the strict pattern
     found nothing, the vote was discarded, and the first candidate won
-    by default. The outcome happened to match; the mechanism did not
-    (TASKS.md #44).
+    by default. The outcome happened to match; the mechanism did not.
     """
 
     def _pick(self, reply: str) -> str:
@@ -6184,7 +6181,7 @@ class TestAParallelBlockRunsInParallel(_Base):
     """
     ``parallel:`` used to be a grouping, not a promise: the runner
     walked a block's children with a plain loop, so two competing
-    writers that never needed ordering ran end to end (TASKS.md #46).
+    writers that never needed ordering ran end to end.
     """
 
     def test_both_writers_are_in_flight_at_once(self) -> None:
@@ -7504,8 +7501,7 @@ class TestPerChunkRecordPaths(_Base):
     aliased to the winner BEFORE the docs are committed — so two chunks
     sharing a path each CREATE it, and every merge after the first is an
     add/add conflict. Observed on gcp-custom-roles-1: PR #19 conflicted
-    with main on discover-reviews.md, -selection.md and -session.md
-    (TASKS.md #45).
+    with main on discover-reviews.md, -selection.md and -session.md.
 
     PER-MODULE mode is guarded by ``TestPerModule``, which already
     asserts ``docs/plans/mods-m0-reviews.md``: its plan_path is
@@ -8615,7 +8611,7 @@ class TestASummaryOfAPlanIsNotAPlan(unittest.TestCase):
 
 
 class TestPlanShapeCheck(unittest.TestCase):
-    """A plan is recognised by SHAPE, never by length (TASKS.md #29)."""
+    """A plan is recognised by SHAPE, never by length."""
 
     def test_a_real_plan_passes(self) -> None:
         self.assertEqual(R.plan_shape_failures(_plan_text(4000)), [])
@@ -8786,9 +8782,9 @@ class TestPlanOfRecordSelection(unittest.TestCase):
         )
 
     def test_no_plan_anywhere_halts_the_run(self) -> None:
-        # #29's point: a plan that does not exist used to be
-        # indistinguishable from one that does, and the run continued
-        # into eight agents' worth of work either way.
+        # A plan that does not exist used to be indistinguishable from
+        # one that does, and the run continued into eight agents' worth
+        # of work either way.
         with self.assertRaises(R.PipelineRunError) as caught:
             R.select_plan_of_record('the plan is approved', ['hi', 'ok'])
         self.assertIn('no design plan', str(caught.exception))
@@ -8818,8 +8814,7 @@ class TestLosingImplementationsAreKept(_Base):
     Two writers build the same frozen contract and only the winner
     publishes; the loser's branch lives on the run hub, which teardown
     deletes. It is complete, reviewed and test-passing, and it is the
-    comparison data every later argument about model choice would want
-    (TASKS.md #32).
+    comparison data every later argument about model choice would want.
     """
 
     def _race(self, **kw):
@@ -8884,7 +8879,7 @@ class TestBlockedOnAModalPrompt(_Base):
     """A picker on screen must produce the ACTION, not a screenshot.
 
     The failure a human sees otherwise describes the paste mechanism and
-    buries the thing to do (TASKS.md #12).
+    buries the thing to do.
     """
 
     _PICKER = (
@@ -8928,7 +8923,7 @@ class TestBlockedOnAModalPrompt(_Base):
 
 
 class TestLaunchIsVerified(_Base):
-    """The launcher must check it got what it asked for (#28)."""
+    """The launcher must check it got what it asked for."""
 
     def _run_with_pane(self, pane_text):
         sc = FakeSC(dict(_LINEAR_REPLIES))
@@ -9226,7 +9221,7 @@ class TestAResumeIsNotAMidSessionUpdate(_Base):
 
 
 class TestDiskMetricsAreOptIn(_Base):
-    """Recording what a run costs on disk (TASKS.md #36).
+    """Recording what a run costs on disk.
 
     Every disk figure this project has is a hand measurement taken
     during an incident, or an inference from one. One instrumented run
@@ -9290,7 +9285,7 @@ class TestDiskMetricsAreOptIn(_Base):
 
     def test_the_record_lives_outside_the_run_dir(self) -> None:
         # A COMPLETED run deletes its own run directory, so a record
-        # kept there would survive only failures (TASKS.md #30).
+        # kept there would survive only failures.
         with self._recording() as (_sample, append):
             self._run(_LINEAR, dict(_LINEAR_REPLIES))
         path = str(append.call_args_list[0].args[0])
@@ -9310,7 +9305,7 @@ class TestJudgeSelectionIsRecorded(_Base):
     It is the most expensive thing the pipeline does — it doubles the
     implementation AND review stages — and whether that is repaid
     depends on whether both candidates ever win. Before this,
-    ``SELECT:`` appeared in no published artifact at all (TASKS.md #31).
+    ``SELECT:`` appeared in no published artifact at all.
     """
 
     def _race(self, pick='SELECT: impl-b'):
@@ -9386,8 +9381,8 @@ class TestJudgeCannotSeeTheAuthor(_Base):
     Each judge candidate is a standalone clone with a real ``.git``
     directory, so ``git log`` works inside the judge's VM. Attributing a
     commit to ``impl_claude`` therefore hands the judge the model family
-    it is supposed to be blind to (TASKS.md #33). Reviewers see the same
-    through their read-only node mount.
+    it is supposed to be blind to. Reviewers see the same through their
+    read-only node mount.
     """
 
     def test_writer_commits_name_the_node_not_the_agent(self) -> None:
@@ -9436,7 +9431,7 @@ class TestResumeReclaimsBeforeMeasuring(_Base):
     Observed live: a machine crashed mid-module leaving six orphaned
     microVMs holding ~26 GB; the host measured 15.6 GB free against a
     46.5 GB demand and refused — while the reclaim that would have
-    returned the 26 GB sat downstream of the refusal (TASKS.md #7).
+    returned the 26 GB sat downstream of the refusal.
     """
 
     class _WT:
@@ -10027,11 +10022,11 @@ class TestResume(_Base):
     def test_a_resumed_run_still_commits_the_planning_session(
         self,
     ) -> None:
-        # THE bug behind #30. A resumed run restores its nodes WITHOUT a
-        # session (see test_state_never_records_a_session), and the
-        # session guard used to run BEFORE the buffer — so the one copy
-        # that survives was never consulted and no planning session
-        # record ever reached the repo.
+        # A resumed run restores its nodes WITHOUT a session (see
+        # test_state_never_records_a_session), and the session guard
+        # used to run BEFORE the buffer — so the one copy that survives
+        # was never consulted and no planning session record ever
+        # reached the repo.
         state = self._finished_state(['plan'])
         state['reader_turns'] = {
             'plan': [
@@ -10586,7 +10581,7 @@ class TestReviewerIsToldWhereToBuild(_Base):
     where a build may go. Three reviewers improvised three different
     answers: `CARGO_TARGET_DIR=/tmp/cc-target`, a `cp -a` of the whole
     tree into a scratchpad, and an `rm -rf /work` that tripped Claude's
-    destructive-command interlock and cost the turn (TASKS #47).
+    destructive-command interlock and cost the turn.
 
     Saying it once removes the motive AND the copy — a multi-gigabyte
     tree duplicated on every review turn, for nothing.
@@ -10654,7 +10649,7 @@ class TestAgentsAreToldTheyAreUnattended(_Base):
         """
         The four paths that build. Three of them bypass the task
         block, which is how a clause added in one place misses the
-        agents that most need it (TASKS.md #40).
+        agents that most need it.
         """
         _r, sc, _wt = self._run(_LINEAR, dict(_LINEAR_REPLIES))
         self.assertIn('DISPOSABLE', sc.message_for_label('build'))
@@ -10906,8 +10901,7 @@ class TestChunkGranularity(unittest.TestCase):
 
 class TestWarmBuildCacheIsWired(_Base):
     """
-    A finished node hands its build directory to the next one
-    (TASKS.md #46, lever 2).
+    A finished node hands its build directory to the next one.
     """
 
     def test_every_completed_stage_refreshes_the_cache(self) -> None:
@@ -11539,9 +11533,9 @@ class TestPartialWorkSalvage(_Base):
         self.assertEqual([c[0] for c in partials], ['build', 'build'])
 
     def test_partial_commit_is_attributed_to_the_node(self) -> None:
-        # The NODE, never the agent — a judge reads this out of git log
-        # (TASKS.md #33). This fixture's node and agent share a name, so
-        # the discriminating case lives in TestJudgeCannotSeeTheAuthor.
+        # The NODE, never the agent — a judge reads this out of git log.
+        # This fixture's node and agent share a name, so the
+        # discriminating case lives in TestJudgeCannotSeeTheAuthor.
         wt = self._failing_writer()
         partial = next(c for c in wt.commits if 'partial work' in c[1])
         self.assertIn('build@pipeline.local', partial[2])
@@ -12257,7 +12251,7 @@ class TestPublishTokenIsValidatedEarlyAndReadLate(unittest.TestCase):
     A broken token command must still cost two seconds rather than a
     finished module — but the VALUE must not be captured at startup and
     carried for hours, because that is how a completed campaign lost
-    its pull request to a token rotated mid-run (TASKS.md #43).
+    its pull request to a token rotated mid-run.
     """
 
     def setUp(self) -> None:

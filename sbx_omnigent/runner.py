@@ -299,7 +299,7 @@ _PLAN_MIN_CHARS = 1500
 #: both implementers built the module from it. A status update will
 #: always beat a character count, so the floor is now a FAST REJECT and
 #: the decision is structural — does the reply contain the things
-#: ``templates/planner.md`` demands? (TASKS.md #29)
+#: ``templates/planner.md`` demands?
 #:
 #: Calibrated against the six real plans this pipeline has published:
 #: the recap names 2 distinct files and uses 3 acknowledgement phrases;
@@ -779,9 +779,9 @@ _FIX_NO_WEAKENING = (
 #: critical system directory. This requires explicit approval and
 #: CANNOT be auto-allowed by permission rules." No permission mode, no
 #: allowlist, no settings key suppresses it — so prevention is the only
-#: lever there is. Observed live on gcp-custom-roles-1 (TASKS.md #40): a
-#: coder built a swapfile to survive a large Rust build, removed it
-#: afterwards, and lost the turn to a modal nobody could answer.
+#: lever there is. Observed live on gcp-custom-roles-1: a coder built a
+#: swapfile to survive a large Rust build, removed it afterwards, and
+#: lost the turn to a modal nobody could answer.
 _DISPOSABLE_VM = (
     'This VM is DISPOSABLE — it is destroyed when the run ends, and '
     'nothing outside your worktree survives or is inspected. So do not '
@@ -1312,8 +1312,8 @@ def parse_select(
     ``core-contracts-pick``: gemini produced 2,062 characters of real
     comparison and ended with ``SELECT core-contracts-impl-a`` — no
     colon — so tier 1 found nothing, the vote was discarded and the
-    first candidate won by default (TASKS.md #44). ``SELECT: `impl-a` ``
-    and ``SELECT: **impl-a**`` failed the same way.
+    first candidate won by default. ``SELECT: `impl-a` `` and
+    ``SELECT: **impl-a**`` failed the same way.
 
     It cannot false-positive: tier 2 needs BOTH the marker and a
     literal id the runner already knows, so prose like "I will SELECT
@@ -1572,8 +1572,7 @@ def parse_decisions_doc(text: str | None) -> list[tuple[str, str]]:
     The inverse of :meth:`PipelineRunner._decisions_doc`, and the reason
     the ledger can survive a run at all: ``_decisions`` is otherwise
     populated only from run state, so a campaign that builds ONE module
-    per run starts empty every time and carries nothing forward
-    (TASKS.md #75).
+    per run starts empty every time and carries nothing forward.
 
     Stops at the second top-level heading. Everything after it is the
     referrals section, which the writer marks as not binding — see
@@ -1973,8 +1972,8 @@ def parse_findings(text: str | None) -> tuple[str, ...]:
     finding is acted on inside the round; one raised alongside an
     APPROVED verdict is archived to the run directory and never read
     again, so a real defect noticed by a careful reviewer simply
-    evaporates (TASKS.md #10). Lifting them out under a marker is how
-    they reach the ledger.
+    evaporates. Lifting them out under a marker is how they reach the
+    ledger.
 
     Same protocol as :func:`parse_decisions`, deliberately: the LAST
     header wins, blank lines inside the list are tolerated, and
@@ -2024,7 +2023,7 @@ class JudgePick:
     produced: ``SELECT:`` appeared in no published artifact, and the
     only way to establish that the second writer had ever won was to
     notice its name among the commit authors in merged ``main`` — an
-    accident of a metadata leak (TASKS.md #33), not instrumentation.
+    accident of a metadata leak, not instrumentation.
 
     It also makes the JUDGE auditable. A judge that systematically
     favours one family is what would make the whole race theatre, and
@@ -2456,7 +2455,7 @@ def finding_id(rec: ReviewRecord, index: int) -> str:
     keying on text would silently merge those — but a re-raise after a
     round of work is a DIFFERENT event, and dropping it is worse than
     carrying the duplicate. Duplicates here are provenance; a human
-    merges them, the runner never does (TASKS.md #10).
+    merges them, the runner never does.
 
     :param rec: The vote the finding came from.
     :param index: 1-based position within that reviewer's list.
@@ -2654,12 +2653,12 @@ def render_findings_ledger(
     entries are added after it. A renderer that rebuilt the document
     each run would clobber exactly the reasoning it exists to hold.
 
-    Entries are sections rather than table rows, which is a deliberate
-    departure from the sketch in TASKS.md #10. A table only stays valid
-    if every future append lands immediately after the last row, so the
-    first person to write a paragraph under it breaks every later
-    append. Sections append correctly after anything, which is what
-    "human-editable" has to mean if the constraint above is real.
+    Entries are sections rather than table rows, which is deliberate. A
+    table only stays valid if every future append lands immediately
+    after the last row, so the first person to write a paragraph under
+    it breaks every later append. Sections append correctly after
+    anything, which is what "human-editable" has to mean if the
+    constraint above is real.
 
     :param records: Every vote for this chunk, in order cast.
     :param title: Heading, used only when creating the document.
@@ -3907,8 +3906,7 @@ class PipelineRunner:
             # Held in memory it was lost on --resume, and the judge was
             # then told nothing — so it started a verification build it
             # could never finish inside one turn, stated no SELECT, and
-            # the first candidate won by default. That is TASKS.md #41
-            # arriving through the resume path (#53).
+            # the first candidate won by default.
             'reviewed_ok': sorted(self._reviewed_ok),
             'reviews': [r.as_dict() for r in self._reviews],
             # The planner's conversation is buffered in memory the
@@ -4119,8 +4117,7 @@ class PipelineRunner:
         the run first and the finding names the path. A writer told to
         "close the gap" without being shown the gap is being asked to
         guess, and this run produced that: 6000 characters of Postgres
-        checkpoint logs and not one line naming a failing test
-        (TASKS.md #42).
+        checkpoint logs and not one line naming a failing test.
 
         :param spec: The verify spec that ran.
         :param outcome: What the gate reported.
@@ -4877,8 +4874,8 @@ class PipelineRunner:
         # If the screen is a modal picker, SAY so. The failure a human
         # otherwise sees describes the paste mechanism and buries the
         # thing to do, with the picker dumped raw at the end of a
-        # RuntimeError (TASKS.md #12). They are watching this console;
-        # they may never open the failed message bubble.
+        # RuntimeError. They are watching this console; they may never
+        # open the failed message bubble.
         label = self._session_label.get(session, session)
         prompt = pane.modal_prompt(text)
         if prompt is not None:
@@ -5116,7 +5113,7 @@ class PipelineRunner:
                 message='docs: add the judge selection',
                 # A role, like the planner and reviewer records — never
                 # the judge AGENT's name, which would put the deciding
-                # model back into git log (TASKS.md #33).
+                # model back into git log.
                 author='judge <judge@pipeline.local>',
             )
         except click.ClickException:
@@ -5138,7 +5135,7 @@ class PipelineRunner:
         test-passing implementation of the same frozen contract — by a
         different model — is deleted with the run hub. It is the only
         copy, and it is the evidence any future argument about model
-        choice would actually want (TASKS.md #32).
+        choice would actually want.
 
         Best-effort: a run that produced a shippable winner must not
         fail because an archive could not be written. A failure is
@@ -5197,7 +5194,7 @@ class PipelineRunner:
         the same run also answers whether ``per_vm_gb`` is right.
 
         Never raises, never fails a run: instrumentation that can cost a
-        module is worse than no instrumentation (TASKS.md #6, #36).
+        module is worse than no instrumentation.
 
         :param event: What boundary this is, e.g. ``"chunk-peak"``.
         """
@@ -5316,7 +5313,7 @@ class PipelineRunner:
         winner BEFORE ``_publish_chunk`` commits them — so two chunks
         writing one path do not modify a shared file, they each CREATE
         it. Git sees the same path added on both sides and every merge
-        after the first conflicts (TASKS.md #45).
+        after the first conflicts.
 
         Per-module mode never hit this because its *plan_path* is
         already per-module (``discover-m1.md``), which these records
@@ -5515,9 +5512,9 @@ class PipelineRunner:
         `_decisions` is otherwise filled only from run state, which is
         per-run — so a project that builds one module per run started
         every planner with an empty ledger and carried nothing forward,
-        while the committed document sat in the worktree unread
-        (TASKS.md #75). The repo is the thing that survives a run; this
-        is what reads it back.
+        while the committed document sat in the worktree unread. The
+        repo is the thing that survives a run; this is what reads it
+        back.
 
         Deduplicated on text against what is already held, so a resumed
         run that has the decisions in its state does not double them.
@@ -5706,8 +5703,8 @@ class PipelineRunner:
         and the wrong shape: a chunk's branch is cut from the prior
         IMPLEMENTATION tip, so it never carried that chunk's docs
         commits, so the ledger restarted each time — and two chunks
-        adding the same path collide on merge (TASKS.md #58). An issue
-        tracker is cross-branch and cross-campaign by construction.
+        adding the same path collide on merge. An issue tracker is
+        cross-branch and cross-campaign by construction.
 
         The file survives for ``publish: local`` and ``mode: none``,
         where there is no tracker to file into.
@@ -8546,8 +8543,7 @@ class PipelineRunner:
             # they are available" — has not refused to choose, it has
             # misjudged how many turns it gets. Asking once converts a
             # silent default into an actual decision; the alternative
-            # is discarding its judgement over a misunderstanding
-            # (TASKS.md #41).
+            # is discarding its judgement over a misunderstanding.
             click.echo(
                 f'[judge] {stage.id}: no SELECT line in the first '
                 f'reply — asking once more before halting.'
@@ -8596,7 +8592,7 @@ class PipelineRunner:
         # it picked.
         # Retain the losers BEFORE anything else touches the hub. Their
         # branches live only there, and the run directory holds the only
-        # copy — teardown deletes it (TASKS.md #32).
+        # copy — teardown deletes it.
         retained = self._retain_losers(candidates, sel)
         self._record_pick(
             stage.id, candidates, sel, stated, out, retained,
@@ -8796,11 +8792,10 @@ class PipelineRunner:
 
         The launcher asks for a model, an effort and a permission mode,
         and until now never checked it got any of them. Four separate
-        failures in two days turned on exactly that (TASKS.md #27, #28,
-        #34, #35): a mode downgraded because the model lacked a
-        capability, an effort discarded, a model substituted. Every one
-        was invisible in the launcher's logs and plainly on the agent's
-        screen.
+        failures in two days turned on exactly that: a mode downgraded
+        because the model lacked a capability, an effort discarded, a
+        model substituted. Every one was invisible in the launcher's
+        logs and plainly on the agent's screen.
 
         WARNS, never raises. It reads a TUI mid-draw, so a false alarm
         is entirely possible and must not be able to fail a run — and a
@@ -9121,13 +9116,13 @@ class PipelineRunner:
                 with_pane=True,
             )
             # Name the pane IN the error. A bare "failed: None" is what
-            # cost a day on the codex-3 run (TASKS.md #26/#27) — the
-            # blocking migration picker was on screen the whole time and
-            # nothing pointed at it.
+            # cost a day on the codex-3 run — the blocking migration
+            # picker was on screen the whole time and nothing
+            # pointed at it.
             # Say why there is no pane rather than dropping the
             # suffix. A bare 'failed: None' with nothing to open is what
-            # #26 exists to prevent, and a capture that returned nothing
-            # silently reproduced it.
+            # the pane capture exists to prevent, and a capture that
+            # returned nothing silently reproduced it.
             where = (
                 f' — see {pane_path}' if pane_path
                 else self._no_pane_note(session)
@@ -9327,7 +9322,7 @@ class PipelineRunner:
         the model family straight out of the author field, and the
         reviewers see the same through their ``:ro`` node mount. A judge
         that can tell which family wrote which candidate is not making
-        the blind comparison the two-writer race assumes (TASKS.md #33).
+        the blind comparison the two-writer race assumes.
 
         The agent name is not a parameter at all, rather than a
         parameter callers are trusted to pass neutrally: the only way to
@@ -9940,8 +9935,7 @@ class PipelineRunner:
         the results as soon as they are available" — a perfectly normal
         thing to say in a conversation, and fatal here, because nothing
         follows. Without a SELECT line the first candidate used to win
-        by default (TASKS.md #41); now the run halts, which a judge must
-        be told.
+        by default; now the run halts, which a judge must be told.
 
         :param stage: The judge stage.
         :param candidates: The writer nodes being judged.
@@ -9995,9 +9989,9 @@ class PipelineRunner:
         rather than naming it: the first version said "end with the
         SELECT line", and a judge that had already chosen wrote
         ``SELECT core-contracts-impl-a`` without the colon, which
-        parsed as nothing (TASKS.md #44). A judge that deferred has
-        usually done the reading; what it lacked was either the
-        knowledge that no further turn was coming, or the exact format.
+        parsed as nothing. A judge that deferred has usually done the
+        reading; what it lacked was either the knowledge that no further
+        turn was coming, or the exact format.
 
         :param candidates: The writer node ids being judged.
         :returns: The instruction text.
@@ -10372,7 +10366,7 @@ def reclaim_for_resume(
     freed seconds later. Observed live: a machine crashed mid-module
     leaving six orphaned microVMs holding ~26 GB, the host measured 15.6
     GB free against a 46.5 GB demand, and the reclaim that would have
-    returned the 26 GB sat behind the refusal (TASKS.md #7).
+    returned the 26 GB sat behind the refusal.
 
     Two things are provably dead on a resume:
 
@@ -10509,8 +10503,7 @@ def preflight_disk(
     :param worktrees_on_disk: Writer worktrees a RESUME already has,
         subtracted from the estimate. A resumed run does not re-cut the
         trees it already carries, and demanding their space a second
-        time is what refused a resume for roughly twice its honest
-        need (TASKS.md #7).
+        time is what refused a resume for roughly twice its honest need.
     :raises click.ClickException: If free space is below the estimate.
     """
     gb = 1_000_000_000
@@ -11082,8 +11075,7 @@ def main(
     # read should cost two seconds, not a finished module. The VALUE is
     # deliberately discarded — publish re-reads it at push time, hours
     # later, because a token captured here can be rotated or expired by
-    # then and a run that publishes at the end has no way to notice
-    # (TASKS.md #43).
+    # then and a run that publishes at the end has no way to notice.
     publish_token_provider()
     # Before anything touches sbx, including the resume reclaim below,
     # which disposes VMs through the server.
@@ -11092,7 +11084,7 @@ def main(
     if resume:
         # BEFORE the gate, not inside runner.run() behind it: a resume
         # was refused by space the resume itself would have freed
-        # seconds later (TASKS.md #7).
+        # seconds later.
         on_disk = _resume_worktree_count(worktree_root, run_id or config.name)
         on_disk -= reclaim_for_resume(
             run_id=run_id or config.name,

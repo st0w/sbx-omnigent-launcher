@@ -109,9 +109,9 @@ Ranked by what they actually save:
 4. **Replace the NAT gateway with a NAT instance — ~$30/month.** A
    `t4g.nano` doing NAT is a few dollars. Adds a single point of failure to
    maintain; worth it only once the instance bill is already small.
-5. **Shrink the volume.** 500 GB is $40/month forever. Tasks #7 and #8 in
-   the launcher backlog (reclaim on resume, pre-baked toolchain images)
-   attack the same problem from the software side.
+5. **Shrink the volume.** 500 GB is $40/month forever. Launcher issues #29
+   and #38 (reclaim on resume, pre-baked toolchain images) attack the
+   same problem from the software side.
 
 Two defaults here are deliberately the *free* gp3 tier — 3000 IOPS and
 125 MB/s — which saves $30/month over what this module originally hard-coded.

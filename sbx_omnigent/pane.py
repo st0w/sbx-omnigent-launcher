@@ -7,15 +7,15 @@ assistant message, no error — and the turn dies at its timeout carrying
 nothing but the timeout itself. The cause is on the screen the whole
 time, and until this module existed nothing ever looked at it.
 
-Three separate days were lost to that in 2026-08 alone (TASKS.md #26):
+Three separate days were lost to that in 2026-08 alone:
 
 * a retired codex model left the TUI blocked on a migration picker
   ("Choose how you'd like Codex to proceed"), so every turn failed at
   exactly 30s. Four other hypotheses were chased first; three of them
   were real bugs and none of them was the blocker.
-* agy sat in a first-run trust gate (#12), same silence.
+* agy sat in a first-run trust gate, same silence.
 * a Haiku reviewer ran in manual mode after ``--permission-mode auto``
-  was silently discarded (#28) — the pane footer said ``manual mode on``
+  was silently discarded — the pane footer said ``manual mode on``
   outright, which is what eventually diagnosed it.
 
 So this is not a codex fix or an agy fix. It is the launcher's missing
@@ -24,9 +24,9 @@ Omnigent launches lives on a ``/tmp/omnigent-terminal-*/tmux.sock``
 socket in a session named ``main``, so one capture serves all of them
 and any harness added later.
 
-It does NOT answer the prompt it finds. Same reasoning as #12: the
-orchestrator must not choose on the human's behalf. The goal is a
-legible diagnosis, not automation.
+It does NOT answer the prompt it finds: the orchestrator must not
+choose on the human's behalf. The goal is a legible diagnosis, not
+automation.
 
 Verified live 2026-08-19 against a running claude-native microVM.
 """
@@ -136,7 +136,7 @@ def blocked_on_prompt_message(label: str, prompt: str) -> str:
 
     Leads with the ACTION. The failure they see otherwise describes the
     paste mechanism and buries the thing to do, with the picker dumped
-    raw at the end of a RuntimeError (TASKS.md #12).
+    raw at the end of a RuntimeError.
 
     :param label: The node that is blocked.
     :param prompt: The prompt text from :func:`modal_prompt`.
