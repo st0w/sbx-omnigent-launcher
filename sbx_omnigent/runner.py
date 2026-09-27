@@ -6196,15 +6196,30 @@ class PipelineRunner:
         return '\n'.join(rows)
 
     def _dispose_prewarmed(self) -> None:
-        """Tear down writers pre-warmed during planning (campaign)."""
-        for node_id in self._prewarmed:
+        """
+        Tear down writers pre-warmed during planning (campaign).
+
+        A campaign's nodes are named ``<chunk>-<stage>``, so it can use
+        none of these. Each VM goes through :meth:`_free_session`, so
+        teardown does not dispose it a second time, and the clones are
+        removed now rather than left on disk until the run ends (#31).
+        ``--keep`` keeps both.
+        """
+        prewarmed = sorted(self._prewarmed)
+        for node_id in prewarmed:
             node = self._nodes.pop(node_id, None)
             if node and node.session:
-                try:
-                    self._sc.dispose(node.session)
-                except SwarmSessionError:
-                    pass
+                self._free_session(
+                    node.session,
+                    f'{node_id}: pre-warmed, but the plan chunked, so a '
+                    f'per-chunk writer replaces it.',
+                )
         self._prewarmed.clear()
+        if self._keep or not prewarmed:
+            return
+        # Reclaiming disk must never fail a healthy run.
+        with contextlib.suppress(click.ClickException):
+            self._wt.dispose_node_worktrees(self._run_id, prewarmed)
 
     def _refresh_build_cache(self, node_id: str) -> None:
         """
@@ -6924,7 +6939,7 @@ class PipelineRunner:
                 # per-module planner runs inside the loop — its
                 # (namespaced) writers aren't pre-warmable here, so it
                 # just awaits approval.
-                if not in_module:
+                if not in_module and self._config.prewarm:
                     self._prewarm_writers()
                 node.output = self._await_plan_approval(session, out)
             else:

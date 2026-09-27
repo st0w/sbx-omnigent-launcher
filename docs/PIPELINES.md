@@ -71,6 +71,7 @@ disk:                      # optional — per-unit estimates for the startup dis
   per_worktree_gb: 0.2     #   preflight; the defaults suit a COMPILED project
 build_cache: [target]      # optional — build output dirs handed from node to
                            #   node (see "Warm build cache")
+prewarm: false             # optional — default true; see "Pre-warm"
 verify:                    # optional — the mechanical gate run before publish
   coverage_min: 95         #   substituted for {coverage_min} in the command
   setup: |                 #   SHELL (not prose) — prepares the gate's own VM
@@ -313,6 +314,19 @@ output is used as-is with no human gate (useful for CI / automation).
 the swarm is warm the instant you approve instead of cold-starting node by node.
 `from:`-seeded writers are reseeded onto the upstream's committed tip before they
 run, so they still land exactly one commit above it.
+
+A flat planner that proposes two or more chunks turns the run into a campaign,
+whose writers are named `<chunk>-<stage>` and can't use the pre-warmed ones. The
+runner then frees those VMs and removes their clones (`--keep` keeps both), but
+the boots were wasted. For a pipeline whose planner usually chunks, turn
+pre-warming off:
+
+```yaml
+prewarm: false             # writers boot when they're first driven instead
+```
+
+The planner still waits for your approval; only the background boots are
+skipped.
 
 ### Plan of record
 

@@ -7140,6 +7140,63 @@ class TestPrewarm(_Base):
         self.assertEqual(sc.labels_at_approval, [])
 
 
+class TestAChunkedRunCleansUpItsPrewarm(_Base):
+    """A flat planner that chunks turns the run into a campaign, which
+    cannot use the un-namespaced pre-warmed writers. Their VMs were
+    disposed behind the run's back, so teardown disposed them again,
+    and their clones stayed on disk until the run ended (#31)."""
+
+    def _chunked(self, **kw):
+        return self._run(
+            _CAMPAIGN, {'plan': _plan_with_subtasks('m0', 'm1')}, **kw
+        )
+
+    def _sid(self, sc, label: str) -> str:
+        return next(
+            c['sid'] for c in sc.creates if sc.label_of(c['sid']) == label
+        )
+
+    def test_the_prewarmed_clones_are_reclaimed(self) -> None:
+        _r, _sc, wt = self._chunked()
+        self.assertIn('tests', wt.reclaimed)
+        self.assertIn('build', wt.reclaimed)
+
+    def test_each_prewarmed_vm_is_disposed_once(self) -> None:
+        _r, sc, _wt = self._chunked()
+        for label in ('tests', 'build'):
+            with self.subTest(label=label):
+                self.assertEqual(sc.disposed.count(self._sid(sc, label)), 1)
+
+    def test_keep_keeps_them(self) -> None:
+        _r, sc, wt = self._chunked(keep=True)
+        self.assertNotIn('tests', wt.reclaimed)
+        self.assertNotIn(self._sid(sc, 'tests'), sc.disposed)
+
+
+_NO_PREWARM = _TDD_FULL.replace('task: |', 'prewarm: false\ntask: |', 1)
+
+
+class TestPrewarmCanBeTurnedOff(_Base):
+    """``prewarm: false`` for a pipeline whose planner usually chunks,
+    where every pre-warmed VM would be thrown away (#31)."""
+
+    def test_no_writer_boots_during_planning(self) -> None:
+        self.assertNotEqual(_NO_PREWARM, _TDD_FULL)
+        _r, sc, _wt = self._run(_NO_PREWARM, dict(_PREWARM_REPLIES))
+        self.assertEqual(sc.labels_at_approval, ['plan'])
+
+    def test_the_run_still_completes(self) -> None:
+        result, sc, _wt = self._run(_NO_PREWARM, dict(_PREWARM_REPLIES))
+        self.assertEqual(result.status, 'completed')
+        labels = [c['title'].split('/', 1)[-1] for c in sc.creates]
+        self.assertEqual(labels.count('tests'), 1)
+        self.assertEqual(labels.count('build'), 1)
+
+    def test_the_approval_still_happens(self) -> None:
+        _r, sc, _wt = self._run(_NO_PREWARM, dict(_PREWARM_REPLIES))
+        self.assertNotEqual(sc.approvals, [])
+
+
 _LINEAR_REPLIES = {
     'plan': 'PLAN', 'build': 'b', 'review-sec': 'VERDICT: APPROVED',
 }
