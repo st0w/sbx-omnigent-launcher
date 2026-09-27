@@ -940,6 +940,20 @@ class TestDuplicateKeysAreRejected(_Base):
         self.assertEqual(cfg.agents['a'].template, 'coder')
 
 
+class TestPrewarmConfig(_Base):
+    def test_absent_means_on(self) -> None:
+        self.assertTrue(self._load(_FULL).prewarm)
+
+    def test_false_turns_it_off(self) -> None:
+        self.assertFalse(self._load(_FULL + 'prewarm: false\n').prewarm)
+
+    def test_anything_but_a_boolean_is_refused(self) -> None:
+        for bad in ('0', '"no"', '[]', 'off-ish'):
+            with self.subTest(bad=bad):
+                with self.assertRaises(P.PipelineError):
+                    self._load(_FULL + f'prewarm: {bad}\n')
+
+
 class TestBuildCacheConfig(_Base):
     """
     ``build_cache`` names directories carried between nodes as a warm

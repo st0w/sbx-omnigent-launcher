@@ -294,7 +294,8 @@ there (up to 1 hour). On approval the planner emits a clean consolidated plan
 that's shared with every builder. So **drive a planner pipeline live** — or pass
 **`--no-interactive-plan`** to run unattended (single-turn plan, no gate). While
 you plan, the writer VMs pre-warm in the background so the swarm is ready the
-instant you approve.
+instant you approve (`prewarm: false` turns that off, for a planner that
+usually splits the work into chunks).
 
 The planner's whole session is committed too, as **`docs/plans/<name>-session.md`**
 — every draft, your answers, and the diagrams a consolidated plan would summarize

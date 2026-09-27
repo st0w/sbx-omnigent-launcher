@@ -451,6 +451,8 @@ class PipelineConfig:
     #: default set; see ``runner._TEST_PATH_GLOBS``.
     test_paths: tuple[str, ...] = ()
     build_cache: tuple[str, ...] = ()
+    #: Boot writer VMs while the interactive planner waits on a human.
+    prewarm: bool = True
     subtasks: tuple[Subtask, ...] = ()
     turn_timeout: float | None = None
     verify: VerifySpec | None = None
@@ -958,6 +960,7 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
         guarded=_parse_globs(root.get('guarded'), 'guarded'),
         test_paths=_parse_globs(root.get('test_paths'), 'test_paths'),
         build_cache=_parse_cache_dirs(root.get('build_cache')),
+        prewarm=_parse_prewarm(root.get('prewarm')),
         subtasks=_parse_subtasks_config(root, base_dir),
         turn_timeout=_parse_turn_timeout(root.get('turn_timeout')),
         verify=_parse_verify(root.get('verify')),
@@ -1025,6 +1028,21 @@ def _parse_cache_dirs(value: object) -> tuple[str, ...]:
             )
         out.append(entry)
     return tuple(out)
+
+
+def _parse_prewarm(value: object) -> bool:
+    """
+    Validate the optional ``prewarm`` switch.
+
+    :param value: The raw field, or ``None`` when unset.
+    :returns: ``True`` when unset.
+    :raises PipelineError: If it is anything but a boolean.
+    """
+    if value is None:
+        return True
+    if not isinstance(value, bool):
+        raise PipelineError(f'prewarm must be true or false, not {value!r}')
+    return value
 
 
 def _parse_globs(value: object, what: str) -> tuple[str, ...]:
