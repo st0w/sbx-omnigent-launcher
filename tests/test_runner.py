@@ -9540,6 +9540,216 @@ class TestResumeReclaimsBeforeMeasuring(_Base):
         self.assertEqual(wt.written, [])
 
 
+_TERMINAL = """\
+name: term
+repo: ./proj
+publish:
+  mode: local
+  branch: impl
+task: |
+  build it
+agents:
+  w: {template: coder, model: claude-sonnet-5}
+  sec: {template: security-reviewer, model: claude-sonnet-5}
+stages:
+  - {id: tests, run: w, write: true}
+  - {id: impl, run: w, write: true, needs: [tests]}
+  - {id: review, run: [sec], needs: [impl], gate: consensus, on_block: impl}
+"""
+
+
+class TestAResumeReclaimsFinishedWriters(_Base):
+    """A resume reclaimed only published chunks, so a finished writer
+    nothing can drive again (a TDD writer, a losing candidate) kept its
+    build output and a resume could be refused for that space (#29)."""
+
+    class _WT(TestResumeReclaimsBeforeMeasuring._WT):
+        def __init__(self, state, off_hub=()):
+            super().__init__(state)
+            self._off_hub = set(off_hub)
+
+        def node_matches_hub(self, run_id, node_id):
+            return node_id not in self._off_hub
+
+    def _writers(self, *ids: str) -> dict:
+        return {n: {'kind': 'writer'} for n in ids}
+
+    def _reclaim(self, text, state, off_hub=(), keep=False, config=True):
+        wt = self._WT(state, off_hub)
+        said: list[str] = []
+        R.reclaim_for_resume(
+            run_id='r1', canonical_root='/c', worktree_root='/wt',
+            server='http://x', keep=keep, default_branch='main',
+            client=TestResumeReclaimsBeforeMeasuring._SC(), manager=wt,
+            echo=said.append,
+            config=self._cfg(text) if config else None,
+        )
+        removed = [n for _r, nodes in wt.removed for n in nodes]
+        return removed, ' '.join(said)
+
+    def _state(self, **over):
+        state = {
+            'completed': ['tests', 'impl'],
+            'nodes': {**self._writers('tests', 'impl')},
+        }
+        state.update(over)
+        return state
+
+    def test_a_writer_nothing_can_drive_again_is_reclaimed(self) -> None:
+        removed, said = self._reclaim(_TERMINAL, self._state())
+        self.assertEqual(removed, ['tests'])
+        self.assertIn('tests', said)
+
+    def test_a_writer_a_review_can_loop_back_to_is_kept(self) -> None:
+        removed, _said = self._reclaim(_TERMINAL, self._state())
+        self.assertNotIn('impl', removed)
+
+    def test_an_unfinished_writer_is_kept(self) -> None:
+        removed, _said = self._reclaim(
+            _TERMINAL, self._state(completed=['impl'])
+        )
+        self.assertEqual(removed, [])
+
+    def test_work_the_hub_lacks_is_kept_and_named(self) -> None:
+        removed, said = self._reclaim(
+            _TERMINAL, self._state(), off_hub={'tests'}
+        )
+        self.assertEqual(removed, [])
+        self.assertIn('tests', said)
+        self.assertIn('hub', said)
+
+    def test_readers_and_judges_are_not_touched(self) -> None:
+        state = self._state(
+            completed=['tests', 'impl', 'plan'],
+            nodes={**self._writers('impl'), 'tests': {'kind': 'reader'}},
+        )
+        removed, _said = self._reclaim(_TERMINAL, state)
+        self.assertEqual(removed, [])
+
+    def _picked(self, **over):
+        state = {
+            'completed': ['impl-a', 'impl-b', 'review-a', 'review-b', 'pick'],
+            'nodes': {**self._writers('impl-a', 'impl-b'),
+                      'pick': {'kind': 'judge'}},
+            'judge_picks': [{
+                'chunk': None, 'stage': 'pick',
+                'candidates': ['impl-a', 'impl-b'], 'selected': 'impl-a',
+            }],
+        }
+        state.update(over)
+        return state
+
+    def test_a_losing_candidate_is_reclaimed(self) -> None:
+        removed, _said = self._reclaim(_COMPETE_REVIEWED, self._picked())
+        self.assertEqual(removed, ['impl-b'])
+
+    def test_a_loser_whose_review_can_still_run_is_kept(self) -> None:
+        state = self._picked(
+            completed=['impl-a', 'impl-b', 'review-a', 'pick']
+        )
+        removed, _said = self._reclaim(_COMPETE_REVIEWED, state)
+        self.assertEqual(removed, [])
+
+    def test_a_chunks_nodes_are_matched_to_their_stages(self) -> None:
+        state = {
+            'subtasks': [{'id': 'm1', 'title': 'one'}],
+            'completed': ['m1-tests', 'm1-impl'],
+            'nodes': self._writers('m1-tests', 'm1-impl'),
+        }
+        removed, _said = self._reclaim(_TERMINAL, state)
+        self.assertEqual(removed, ['m1-tests'])
+
+    def test_a_chunks_losing_candidate_is_reclaimed(self) -> None:
+        state = {
+            'subtasks': [{'id': 'm1', 'title': 'one'}],
+            'completed': ['m1-impl-a', 'm1-impl-b', 'm1-review-a',
+                          'm1-review-b', 'm1-pick'],
+            'nodes': self._writers('m1-impl-a', 'm1-impl-b'),
+            'judge_picks': [{
+                'chunk': 'm1', 'stage': 'm1-pick',
+                'candidates': ['m1-impl-a', 'm1-impl-b'],
+                'selected': 'm1-impl-a',
+            }],
+        }
+        removed, _said = self._reclaim(_COMPETE_REVIEWED, state)
+        self.assertEqual(removed, ['m1-impl-b'])
+
+    def test_keep_reclaims_nothing(self) -> None:
+        removed, _said = self._reclaim(_TERMINAL, self._state(), keep=True)
+        self.assertEqual(removed, [])
+
+    def test_without_the_pipeline_only_chunks_are_reclaimed(self) -> None:
+        removed, _said = self._reclaim(
+            _TERMINAL, self._state(), config=False
+        )
+        self.assertEqual(removed, [])
+
+
+class TestAResumeCountsOnlyBuildTrees(_Base):
+    """Every directory under nodes/ was counted as a writer's tree, so
+    reader, judge and review clones hid the space still to be built."""
+
+    def _count(self, dirs, state) -> int:
+        nodes = self.root / 'wt' / 'r1' / 'nodes'
+        for name in dirs:
+            (nodes / name).mkdir(parents=True)
+        return R._resume_worktree_count(str(self.root / 'wt'), 'r1', state)
+
+    def test_writers_and_gate_clones_count(self) -> None:
+        state = {'nodes': {'impl': {'kind': 'writer'},
+                           'plan': {'kind': 'reader'},
+                           'pick': {'kind': 'judge'}}}
+        self.assertEqual(
+            self._count(['impl', 'plan', 'pick', 'impl-verify',
+                         'review-r1', 'review-r1.seed-0123456789ab'],
+                        state),
+            2,
+        )
+
+    def test_without_a_state_only_gate_clones_count(self) -> None:
+        self.assertEqual(self._count(['impl', 'impl-verify'], None), 1)
+
+    def test_no_run_directory_counts_nothing(self) -> None:
+        self.assertEqual(
+            R._resume_worktree_count(str(self.root / 'none'), 'r1', None), 0
+        )
+
+    def test_main_counts_after_it_reclaims(self) -> None:
+        cfg_path = self.root / 'pipeline.yaml'
+        cfg_path.write_text(_TERMINAL, encoding='utf-8')
+        order: list[str] = []
+
+        def reclaimed(**_kw: object) -> int:
+            order.append('reclaim')
+            return 5
+
+        def counted(*_args: object) -> int:
+            order.append('count')
+            return 3
+
+        with mock.patch.object(R, 'preflight_sbx'), \
+                mock.patch.object(
+                    R, 'reclaim_for_resume', side_effect=reclaimed
+                ) as reclaim, \
+                mock.patch.object(
+                    R, '_resume_worktree_count', side_effect=counted
+                ), \
+                mock.patch.object(R, 'preflight_disk') as disk, \
+                mock.patch.object(R, 'preflight_codex_auth'), \
+                mock.patch.object(R, 'preflight_codex_login'), \
+                mock.patch.object(R, '_drive'):
+            res = CliRunner().invoke(R.main, [
+                '-c', str(cfg_path),
+                '--canonical-root', str(self.root / 'c'),
+                '--worktree-root', str(self.root / 'w'),
+                '--skip-agy-check', '--resume',
+            ])
+        self.assertEqual(res.exit_code, 0, res.output)
+        self.assertEqual(order, ['reclaim', 'count'])
+        self.assertEqual(disk.call_args.kwargs['worktrees_on_disk'], 3)
+        self.assertIsNotNone(reclaim.call_args.kwargs['config'])
+
+
 class _DisposeRecorder(SwarmSessionClient):
     """A session client that only records what it disposes."""
 
