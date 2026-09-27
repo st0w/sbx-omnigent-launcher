@@ -208,7 +208,7 @@ class TestModalPrompt(unittest.TestCase):
 class TestBlockedMessage(unittest.TestCase):
     def test_it_leads_with_the_action(self) -> None:
         # The failure a human sees otherwise describes the paste
-        # mechanism and buries the thing to do (TASKS.md #12).
+        # mechanism and buries the thing to do.
         msg = pane.blocked_on_prompt_message(
             'm5-plan', pane.modal_prompt(AGY_PICKER) or ''
         )

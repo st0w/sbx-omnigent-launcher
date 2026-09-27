@@ -466,7 +466,7 @@ class TestSalientTail(unittest.TestCase):
     A capped tail keeps whatever ran LAST, which on this project's
     suite is Postgres shutdown chatter — so the cargo verdict was
     dropped and a writer was re-driven to "close the gap" with no idea
-    what the gap was (TASKS.md #42).
+    what the gap was.
     """
 
     NOISE = '\n'.join(

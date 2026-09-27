@@ -13,8 +13,8 @@
  *
  * WHY IT EXISTS AT ALL
  * --------------------
- * The runner re-reads the publish token AT PUSH TIME (see TASKS.md #43)
- * so a secret rotated mid-run is picked up. That read must therefore
+ * The runner re-reads the publish token AT PUSH TIME so a secret
+ * rotated mid-run is picked up. That read must therefore
  * hit the live store, and must not raise a GUI prompt — a dialog hours
  * into an unattended run blocks the publish with nobody there to click
  * it. Granting `/usr/bin/security` standing access to the item would

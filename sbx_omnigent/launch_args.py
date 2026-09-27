@@ -36,14 +36,13 @@ from sbx_omnigent._compat import CODEX_EFFORTS
 #: - ``auto``, until 2026-08-19. A Haiku 4.5 reviewer ran in MANUAL
 #:   mode and blocked on every tool call: auto needs a model-side risk
 #:   classifier Haiku does not implement, so Claude Code discarded the
-#:   requested mode with no warning and no log line (TASKS.md #28).
+#:   requested mode with no warning and no log line.
 #: - ``dontAsk``, until 2026-08-22. It does NOT auto-approve. It
 #:   suppresses the PROMPT and then DENIES anything that would have
 #:   raised one — "Permission to use Edit has been denied because
 #:   Claude Code is running in don't ask mode". Read-only Bash still
 #:   passed, so planners and reviewers looked healthy while every
-#:   writer was refused; a coder burned two turns changing no files
-#:   (TASKS.md #39).
+#:   writer was refused; a coder burned two turns changing no files.
 #:
 #: ``bypassPermissions`` opens a "Yes, I accept" dialog on first launch,
 #: which is fatal headless — cleared by pre-seeding

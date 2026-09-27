@@ -477,7 +477,7 @@ class TestPublishTokenIsReadLate(unittest.TestCase):
     A token captured at startup and held in memory can be rotated or
     expired by then, and the runner used to present exactly that: the
     whole campaign passed, then the push was refused with "Invalid
-    username or token" (TASKS.md #43).
+    username or token".
     """
 
     def setUp(self) -> None:
@@ -624,7 +624,7 @@ class TestPublishTokenIsReadLate(unittest.TestCase):
 
 class TestWarmBuildCache(unittest.TestCase):
     """
-    Carrying a build directory between nodes (TASKS.md #46, lever 2).
+    Carrying a build directory between nodes.
 
     Measured on gcp-custom-roles-1: every node compiled the workspace
     from clean, and that was the dominant cost of an increment — the

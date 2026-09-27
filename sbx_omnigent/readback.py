@@ -3,7 +3,7 @@
 Four separate failures in two days, all the same shape: the launcher
 asks for something, the CLI accepts the flag, and quietly does something
 else. Nothing in the launcher's own logs said so; every one was visible
-on the agent's screen (TASKS.md #27, #28, #34, #35):
+on the agent's screen:
 
 * ``--permission-mode auto`` on Haiku 4.5 → the session ran in MANUAL
   mode and blocked on an approval prompt for every tool call. Auto mode
@@ -19,11 +19,12 @@ on the agent's screen (TASKS.md #27, #28, #34, #35):
 * a retired ``--model`` on codex → the TUI sat in a migration picker and
   every turn died at the timeout.
 
-So this module reads the answer back off the pane that #26 already
-captures, and compares. It is deliberately CONSERVATIVE: a signal it
-cannot find is reported as "could not verify", never as a mismatch. A
-read-back that cries wolf gets switched off, and then the next silent
-substitution costs another day.
+So this module reads the answer back off the pane that
+:mod:`sbx_omnigent.pane` already captures, and compares. It is
+deliberately CONSERVATIVE: a signal it cannot find is reported as
+"could not verify", never as a mismatch. A read-back that cries
+wolf gets switched off, and then the next silent substitution costs
+another day.
 
 Pure functions over pane text — no I/O — so every case below is a real
 captured pane in the tests.
@@ -67,7 +68,7 @@ _CLAUDE_MODEL_ID = re.compile(
 
 #: Codex prints ``model: <slug> <effort>`` in its session header and
 #: repeats it in the status bar. ``default`` is codex's own word for
-#: "no effort pinned", which is exactly the #34 symptom.
+#: "no effort pinned", which is exactly how a discarded effort shows.
 #: The leading run is anything-but-word-characters on purpose: the
 #: header is inside a box-drawn frame, so the line really begins with
 #: U+2502 (a BOX DRAWINGS LIGHT VERTICAL), not an ASCII pipe.

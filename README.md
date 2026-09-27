@@ -846,8 +846,8 @@ per-sandbox `~/.claude`), so the `setup-token` path above is preferred.
 
 ### Publish token: reading it without a prompt
 
-`--publish-token-command` is re-run **at push time** (TASKS.md #43), hours
-after the run began, so a token rotated mid-run is picked up and a rejected
+`--publish-token-command` is re-run **at push time**, hours after the run
+began, so a token rotated mid-run is picked up and a rejected
 push can retry against the current value. That imposes two requirements that
 look contradictory:
 

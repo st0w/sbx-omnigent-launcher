@@ -148,7 +148,7 @@ class TestLaunchMismatches(unittest.TestCase):
     """The four live failures, each caught by its own harness's pane."""
 
     def test_claude_downgraded_to_manual_is_caught(self) -> None:
-        # #28: a Haiku reviewer ran in manual mode and blocked on an
+        # A Haiku reviewer ran in manual mode and blocked on an
         # approval prompt for every tool call.
         why = rb.launch_mismatches(
             'claude-native', CLAUDE_MANUAL, permission_mode='auto'
@@ -157,8 +157,8 @@ class TestLaunchMismatches(unittest.TestCase):
         self.assertIn('permission mode', why[0])
 
     def test_codex_effort_dropped_is_caught(self) -> None:
-        # #34: xhigh was accepted, persisted, returned by the API — and
-        # the turn ran at codex's default.
+        # xhigh was accepted, persisted, returned by the API — and the
+        # turn ran at codex's default.
         why = rb.launch_mismatches(
             'codex-native', CODEX_DEFAULT,
             model='gpt-5.6-sol', effort='xhigh',
@@ -167,7 +167,7 @@ class TestLaunchMismatches(unittest.TestCase):
         self.assertIn('reasoning effort', why[0])
 
     def test_agy_serving_a_different_model_is_caught(self) -> None:
-        # #35: asked for 3.7, the pane and the model itself said 3.6.
+        # Asked for 3.7, the pane and the model itself said 3.6.
         why = rb.launch_mismatches(
             'antigravity-native', AGY_SERVED_36,
             model='gemini-3.7-flash-high',

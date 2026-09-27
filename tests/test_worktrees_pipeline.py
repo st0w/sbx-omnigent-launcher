@@ -780,7 +780,7 @@ class TestRetainingLosingBranches(unittest.TestCase):
 
     Only the winner publishes, so the loser's branch lives on the run
     hub and dies with it at teardown. These exercise the actual git
-    bundle, not a fake (TASKS.md #32).
+    bundle, not a fake.
     """
 
     def setUp(self) -> None:

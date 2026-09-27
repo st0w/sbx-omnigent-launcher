@@ -943,7 +943,7 @@ class TestDuplicateKeysAreRejected(_Base):
 class TestBuildCacheConfig(_Base):
     """
     ``build_cache`` names directories carried between nodes as a warm
-    build cache (TASKS.md #46, lever 2).
+    build cache.
     """
 
     def test_absent_means_off(self) -> None:
@@ -1006,8 +1006,8 @@ class TestTemplates(unittest.TestCase):
         Hence a REPORTING requirement rather than "be more critical".
         The latter is unfalsifiable, and a lever asking an agent to
         exercise judgement about how much work to do was already tried
-        and reverted (TASKS.md #46, lever 5). Agents comply readily
-        with "state X in your reply" — SELECT, VERDICT, DISPUTED.
+        and reverted. Agents comply readily with "state X in your
+        reply" — SELECT, VERDICT, DISPUTED.
         """
         for role in ('security-reviewer', 'bug-reviewer'):
             with self.subTest(role=role):

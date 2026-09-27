@@ -4,14 +4,14 @@ Every disk figure this project has is either a one-off measurement
 someone took by hand during an incident, or an inference from one. That
 has now produced three open questions it cannot answer:
 
-* ``per_worktree_gb`` was 2.0 against writers measured at 2.2-26 GB
-  (TASKS.md #6). The 26 GB observation does not say WHICH node produced
-  it, so the spread cannot be attributed.
+* ``per_worktree_gb`` was 2.0 against writers measured at 2.2-26 GB.
+  The 26 GB observation does not say WHICH node produced it, so the
+  spread cannot be attributed.
 * whether reclaiming a superseded node's build output mid-module is
-  worth building (#7 item 2) depends entirely on that attribution: if
-  the big trees are the two implementers, they die the instant the judge
-  picks and reclaim is a large win; if they are the refactor and verify
-  nodes, those two coexist at the end and it saves almost nothing.
+  worth building depends entirely on that attribution: if the big trees
+  are the two implementers, they die the instant the judge picks and
+  reclaim is a large win; if they are the refactor and verify nodes,
+  those two coexist at the end and it saves almost nothing.
 * ``per_vm_gb`` models 3.5 GB per guest while the sbx store was observed
   at 29-35 GB for a 6-VM cadre — not directly comparable, because the
   store also holds base image layers shared across VMs, so the term
@@ -28,10 +28,10 @@ its inodes, and a full cadre has five of them across roughly eight stage
 boundaries; that is minutes of wall clock bought for data nobody needs
 on a routine run. Default-off keeps normal runs byte-identical.
 
-Written OUTSIDE the run directory for the reason #30 exists: a completed
-run deletes its own run dir, so a record kept there would survive only
-the failures. Same home as the retained loser bundles (#32) —
-``canonical_root``, which nothing in the launcher ever removes.
+Written OUTSIDE the run directory because a completed run deletes its
+own run dir, so a record kept there would survive only the failures.
+Same home as the retained loser bundles — ``canonical_root``, which
+nothing in the launcher ever removes.
 """
 
 from __future__ import annotations

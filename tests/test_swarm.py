@@ -568,12 +568,11 @@ class TestCodexIsAThirdHarness(unittest.TestCase):
 
         `auto` was silently downgraded to MANUAL on Haiku 4.5 — its
         classifier is not implemented there — and the agent then
-        blocked on an approval prompt for every tool call (TASKS.md
-        #28). `dontAsk` replaced it and turned out not to auto-approve
-        at all: it suppresses the prompt and DENIES, so every writer
-        was refused while read-only reviewers looked healthy (TASKS.md
-        #39). Omnigent's own value for claude-native is
-        `bypassPermissions`.
+        blocked on an approval prompt for every tool call. `dontAsk`
+        replaced it and turned out not to auto-approve at all: it
+        suppresses the prompt and DENIES, so every writer was refused
+        while read-only reviewers looked healthy. Omnigent's own value
+        for claude-native is `bypassPermissions`.
         """
         for harness in ('claude-native', None):
             with self.subTest(harness=harness):
