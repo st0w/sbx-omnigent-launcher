@@ -11,6 +11,7 @@ subscribe-before-post ordering. Run:
 from __future__ import annotations
 
 import contextlib
+import gc
 import http.server
 import json
 import os
@@ -20,8 +21,11 @@ import threading
 import time
 import unittest
 import urllib.error
-from collections.abc import Iterator
+import warnings
+from collections.abc import Callable, Iterator
 from unittest import mock
+
+import click
 
 from sbx_omnigent import pipeline, swarm_session
 from sbx_omnigent.runner import main as runner_main
@@ -457,6 +461,34 @@ class TestUrllibTransportOnlySpeaksHttp(unittest.TestCase):
             list(UrllibTransport().iter_lines(
                 f'{self.base}/missing', headers={}, read_timeout=5
             ))
+
+    def _resource_warnings(self, call: Callable[[], object]) -> list[str]:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always', ResourceWarning)
+            with contextlib.suppress(SwarmSessionError):
+                call()
+            gc.collect()
+        return [
+            str(w.message) for w in caught
+            if issubclass(w.category, ResourceWarning)
+        ]
+
+    def test_an_http_error_response_is_closed(self) -> None:
+        # Read but never closed, it held its connection and buffer
+        # until garbage collection, which Python 3.14 reports.
+        self.assertEqual(self._resource_warnings(
+            lambda: UrllibTransport().request(
+                'GET', f'{self.base}/missing', headers={}, body=None,
+                timeout=5,
+            )
+        ), [])
+
+    def test_a_stream_that_fails_to_open_closes_its_response(self) -> None:
+        self.assertEqual(self._resource_warnings(
+            lambda: list(UrllibTransport().iter_lines(
+                f'{self.base}/missing', headers={}, read_timeout=5
+            ))
+        ), [])
 
     def test_the_transport_cannot_read_a_file_past_its_check(self) -> None:
         # With the scheme check out of the way, the transport's own
@@ -2454,14 +2486,16 @@ class TestAutoApproveIsOnByDefault(unittest.TestCase):
         self.assertTrue(client._auto_approve)
 
     def test_the_pipeline_command_offers_the_opt_out(self) -> None:
-        flag = next(
-            (p for p in runner_main.params
-             if '--no-auto-approve' in getattr(p, 'opts', [])),
-            None,
-        )
-        self.assertIsNotNone(flag, '--no-auto-approve is not offered')
-        # Default OFF: not passing it must leave answering ON.
-        self.assertFalse(flag.default)
+        flags = [
+            p for p in runner_main.params
+            if isinstance(p, click.Option) and '--no-auto-approve' in p.opts
+        ]
+        self.assertEqual(len(flags), 1, '--no-auto-approve is not offered')
+        flag = flags[0]
+        # Default OFF: not passing it must leave answering ON. Read
+        # through get_default: Click 8.5 keeps an UNSET sentinel in
+        # `.default` for a flag that names none.
+        self.assertIs(flag.get_default(click.Context(runner_main)), False)
         self.assertTrue(flag.is_flag)
 
 

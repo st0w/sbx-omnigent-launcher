@@ -819,7 +819,10 @@ class UrllibTransport:
             with self._opener.open(req, timeout=timeout) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
+            # An error response is a response: closed, like one that
+            # succeeded, rather than left holding its connection.
+            with exc:
+                return exc.code, exc.read()
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise SwarmSessionError(f'{method} {url} failed: {exc}') from exc
 
@@ -842,6 +845,8 @@ class UrllibTransport:
         try:
             resp = self._opener.open(req, timeout=read_timeout)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if isinstance(exc, urllib.error.HTTPError):
+                exc.close()
             raise SwarmSessionError(
                 f'could not open stream {url}: {exc}'
             ) from exc
