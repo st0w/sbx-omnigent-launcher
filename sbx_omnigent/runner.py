@@ -55,6 +55,7 @@ from sbx_omnigent import (
     claude,
     codex,
     disk_metrics,
+    egress,
     guest_log,
     harness_versions,
     orphans,
@@ -3278,6 +3279,7 @@ class PipelineRunner:
         interactive_plan: bool = True,
         resume: bool = False,
         swap_age_s: Callable[[], float | None] | None = None,
+        gate_egress: tuple[str, ...] | None = None,
     ) -> None:
         self._config = config
         self._sc = session_client
@@ -3359,6 +3361,10 @@ class PipelineRunner:
         self._picks: list[JudgePick] = []
         #: Age of the agy swap secret, guarding every agy turn.
         self._swap_age_s = swap_age_s or agy.harvest_age_s
+        #: The operator's allowlist for the verify gate, as the server
+        #: published it (see :func:`read_gate_egress`). ``None`` only
+        #: when built outside ``main()``, which keeps the default.
+        self._gate_egress = gate_egress
         self._nodes: dict[str, NodeResult] = {}
         self._sessions: list[str] = []
         #: Sessions already freed at stage completion (a finished
@@ -4075,7 +4081,13 @@ class PipelineRunner:
                 else None
             ),
             image=spec.image or DEFAULT_HOST_IMAGE,
-            egress=DEFAULT_EGRESS_ALLOW,
+            # The operator's list, not the built-in default: the gate
+            # got the default even under `egress_allow: []` (#41).
+            egress=(
+                DEFAULT_EGRESS_ALLOW
+                if self._gate_egress is None
+                else self._gate_egress
+            ),
             # The gate builds its own sandbox, so the SERVER's
             # per-sandbox limits never reach it — these are the only
             # way it gets any.
@@ -10824,6 +10836,34 @@ def codex_agent_names(config: pipeline.PipelineConfig) -> list[str]:
     )
 
 
+def read_gate_egress(
+    config: pipeline.PipelineConfig, worktree_root: str
+) -> tuple[str, ...] | None:
+    """
+    Read the operator's allowlist for the verify gate.
+
+    The runner is a separate process from the server and never saw its
+    config, so the gate got the built-in default whatever the operator
+    had set, including ``[]`` (#41). The server publishes its resolved
+    ``sandbox.sbx.egress_allow`` at startup (see
+    :func:`sbx_omnigent.egress.publish_policy`).
+
+    :param config: The parsed pipeline.
+    :param worktree_root: The runner's ``--worktree-root``, which must
+        be the server's ``sbx.worktree_root``.
+    :returns: The operator's allowlist, or ``None`` when the pipeline
+        has no ``verify:`` and so no gate to give it to.
+    :raises click.ClickException: If the list is missing or unreadable:
+        a gate run on a guessed allowlist is what this replaces.
+    """
+    if config.verify is None:
+        return None
+    try:
+        return egress.read_policy(worktree_root)
+    except egress.PolicyError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def preflight_sbx() -> None:
     """
     Refuse to start unless the sbx daemon answers (#28).
@@ -11249,6 +11289,8 @@ def main(
     # later, because a token captured here can be rotated or expired by
     # then and a run that publishes at the end has no way to notice.
     publish_token_provider()
+    # A config problem, so it refuses in seconds, before sbx is asked.
+    gate_egress = read_gate_egress(config, worktree_root)
     # Before anything touches sbx, including the resume reclaim below,
     # which disposes VMs through the server.
     preflight_sbx()
@@ -11308,6 +11350,7 @@ def main(
             keep=keep,
             no_interactive_plan=no_interactive_plan,
             no_auto_approve=no_auto_approve,
+            gate_egress=gate_egress,
         )
     finally:
         stop_harvester(harvester)
@@ -11353,6 +11396,7 @@ def _drive(
     keep: bool,
     no_interactive_plan: bool,
     no_auto_approve: bool,
+    gate_egress: tuple[str, ...] | None = None,
 ) -> None:
     """Build the runner, drive the run, and report its outcome."""
     client = SwarmSessionClient(server, auto_approve=not no_auto_approve)
@@ -11372,6 +11416,7 @@ def _drive(
         keep=keep,
         interactive_plan=not no_interactive_plan,
         resume=resume,
+        gate_egress=gate_egress,
         **(
             {'turn_timeout': turn_timeout}
             if turn_timeout is not None

@@ -44,7 +44,7 @@ from omnigent.server.managed_hosts import (
     _parse_host_config,
 )
 
-from sbx_omnigent import claude, pipeline
+from sbx_omnigent import claude, egress, pipeline
 from sbx_omnigent._compat import load_agy_bridge
 from sbx_omnigent.defaults import (
     DEFAULT_EGRESS_ALLOW,
@@ -418,6 +418,31 @@ def _parse_worktree_root(sbx: dict[str, Any]) -> str | None:
     return value
 
 
+def _publish_egress_policy(
+    worktree_root: str, egress_allow: tuple[str, ...]
+) -> None:
+    """
+    Publish the resolved allowlist for the pipeline runner to read.
+
+    The runner builds the verify gate's sandbox itself and never saw
+    this config, so the gate got the built-in default whatever the
+    operator had set, including ``[]`` (#41). Only ``omni server``
+    parses the sandbox config, once at startup.
+
+    :param worktree_root: ``sbx.worktree_root``.
+    :param egress_allow: The resolved per-VM allowlist.
+    :raises ValueError: If it cannot be written, which fails startup:
+        a runner that cannot read it refuses to run a gate.
+    """
+    try:
+        egress.publish_policy(worktree_root, egress_allow)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f'could not publish the egress allowlist to '
+            f"'sandbox.sbx.worktree_root' ({worktree_root}): {exc}"
+        ) from exc
+
+
 def _build_sbx_config(raw: dict[str, Any]) -> ManagedSandboxConfig:
     """
     Build a :class:`ManagedSandboxConfig` for ``provider: sbx``.
@@ -491,6 +516,8 @@ def _build_sbx_config(raw: dict[str, Any]) -> ManagedSandboxConfig:
 
     host_config = _parse_host_config(raw)
     warn_on_inert_providers(host_config)
+    if worktree_root is not None:
+        _publish_egress_policy(worktree_root, egress_allow)
 
     def factory() -> SbxLauncher:
         return SbxLauncher(

@@ -619,8 +619,10 @@ tight, per-agent boundary.
 >
 > `omni-sbx server` prints a note at startup naming any of these a custom list
 > leaves out. It never adds them for you, and an empty list (`[]`, deliberate
-> lockdown) prints nothing. The verify gate is not affected: it always gets the
-> full default allowlist.
+> lockdown) prints nothing. The verify gate gets the same list: the server
+> publishes it at startup to `<worktree_root>/.sbx-omnigent-egress.json`, and the
+> runner reads it before a pipeline with `verify:` starts, so a server started
+> before this change must be restarted once.
 
 That boundary only *restricts* if there are no **broad global allow rules**
 underneath it: global allows apply to every sandbox and are additive, so a
@@ -651,7 +653,7 @@ All keys live under `sandbox:` in your server config.
 | `sbx.memory` | no | Memory cap per sandbox, e.g. `8g`. |
 | `sbx.worktree_root` | no | Absolute host dir holding per-swarm worktrees. Enables the collaborative-swarm/pipeline mount path: a `git@sbxmount:<path>#<rw\|ro>` workspace bind-mounts `<path>` (which must resolve strictly under this root) into the microVM. Omit to disable mounting. |
 | `sbx.provision_stagger_s` | no | Settle gap (seconds) between consecutive `sbx create` calls, on top of the serialization always applied. Prevents a swarm's near-simultaneous VM launches from racing the sbx daemon's proxy injection (an intermittent `500 … failed to inject network proxy`). Default `2.0`; set `0` to keep serialization but drop the extra gap. |
-| `sbx.egress_allow` | no | Per-sandbox network **allowlist** applied (scoped) to every managed VM, **plus the derived Omnigent dial-back**. Three-way: **unset → a curated default baseline** (LLM endpoints + trusted package registries — `DEFAULT_EGRESS_ALLOW`) so agents work out of the box; **`[]` (empty) → dial-back only** (block everything except the mandatory server connection — max lockdown); **a non-empty list → those hosts** (a stricter/custom set replacing the default), e.g. `[api.anthropic.com]`. Additive under a permissive baseline; the VM's only reachable set under a **deny-all** baseline. See [Network policy](#network-policy). |
+| `sbx.egress_allow` | no | Per-sandbox network **allowlist** applied (scoped) to every managed VM, **plus the derived Omnigent dial-back**. Three-way: **unset → a curated default baseline** (LLM endpoints + trusted package registries — `DEFAULT_EGRESS_ALLOW`) so agents work out of the box; **`[]` (empty) → dial-back only** (block everything except the mandatory server connection — max lockdown); **a non-empty list → those hosts** (a stricter/custom set replacing the default), e.g. `[api.anthropic.com]`. Additive under a permissive baseline; the VM's only reachable set under a **deny-all** baseline. The pipeline verify gate gets the same list. See [Network policy](#network-policy). |
 | `sbx.unset_env` | no | Env var names stripped from the host launch (`env -u`). For Claude `/login`, use `[ANTHROPIC_API_KEY, CLAUDECODE]`. See [Credentials](#credentials). |
 | `sbx.agy_enabled` | no | Default `false`. When `true`, seed each **agy** VM with the agy (Antigravity) **placeholder** OAuth token + onboarding marker at creation, so an `antigravity-native` agent passes Omnigent's readiness gate (the real token arrives via the wire swap). Only agy VMs are touched — the swarm tags them with an `-agy` mount-sentinel suffix; a Claude VM in the same server is never seeded. Requires a running harvester (`omni-sbx-agy`). See [Running agy agents](#running-agy-agents). |
 | `sbx.agy_enterprise` | no | Default `false`. Sets `enterpriseOnboardingComplete` in the seeded onboarding marker (and patches the in-VM bridge so agy's first-run wizard is skipped) — set `true` for a **Business/enterprise** Google account, else agy re-runs enterprise onboarding a headless VM can't answer. Ignored unless `agy_enabled`. |

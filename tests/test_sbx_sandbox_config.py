@@ -21,7 +21,7 @@ from sbx_omnigent.entrypoint import _SbxParseSandboxConfig
 _SBX: dict[str, object] = {
     'provider': 'sbx',
     'server_url': 'http://x:1',
-    'sbx': {'worktree_root': '/tmp/wt'},
+    'sbx': {},
 }
 
 
