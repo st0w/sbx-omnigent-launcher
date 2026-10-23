@@ -985,6 +985,14 @@ blamed the branch and re-drove a writer, which duly started editing the
 project's build config to work around a limit that was never the code's fault.
 Set `verify.cpus` and `verify.memory` to whatever the agent VMs get.
 
+**The gate gets the operator's allowlist.** Its network access is the server's
+`sandbox.sbx.egress_allow`, resolved the same way as for agent VMs (unset is the
+default list, `[]` is lockdown), plus anything sbx's own global rules allow. The
+runner can't read the server's config, so the server publishes the resolved list
+at startup to `.sbx-omnigent-egress.json` at the top of `sbx.worktree_root`. A
+pipeline with `verify:` refuses to start, before any VM, if that file is missing:
+restart the server, and check `--worktree-root` is the same directory.
+
 **`setup:` is PROSE, and `verify.setup:` is SHELL.** They look like they should
 be the same field and they are not. `setup:` is addressed to an agent — it can
 explain, insist, and say what is not acceptable, and it is relayed into turns as

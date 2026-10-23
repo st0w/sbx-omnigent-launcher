@@ -26,7 +26,7 @@ from unittest import mock
 import click
 from click.testing import CliRunner, Result
 
-from sbx_omnigent import pipeline
+from sbx_omnigent import egress, pipeline
 from sbx_omnigent import runner as R
 from sbx_omnigent.swarm_session import (
     SwarmRunnerUnavailable,
@@ -13368,6 +13368,110 @@ class TestNoBuildCacheFlag(_Base):
         res, _disk, driven = self._main(_LINEAR, '--no-build-cache')
         self.assertEqual(driven.build_cache, ())
         self.assertNotIn('--no-build-cache', res.output)
+
+
+
+class TestTheGateHonoursTheOperatorsAllowlist(_Base):
+    """The verify gate always got the built-in default allowlist,
+    whatever the operator had set, including ``[]`` (#41)."""
+
+    def _gate_egress(self, **kw):
+        cfg = self._cfg(_VERIFY)
+        calls: list[dict] = []
+
+        def fake(**kwargs):
+            calls.append(kwargs)
+            return _outcome(True)
+
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC(dict(_LINEAR_REPLIES)),
+            worktree_manager=FakeWT(), run_id='r1',
+            agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0, **kw,
+        )
+        with mock.patch.object(
+            R.verify, 'run_verification', side_effect=fake
+        ):
+            runner.run()
+        return calls[0]['egress']
+
+    def test_the_gate_gets_the_operators_list(self) -> None:
+        self.assertEqual(
+            self._gate_egress(gate_egress=('pypi.org',)), ('pypi.org',)
+        )
+
+    def test_a_lockdown_gives_the_gate_none(self) -> None:
+        self.assertEqual(self._gate_egress(gate_egress=()), ())
+
+    def test_built_without_one_it_keeps_the_default(self) -> None:
+        self.assertEqual(self._gate_egress(), R.DEFAULT_EGRESS_ALLOW)
+
+
+class TestTheGatesAllowlistIsReadBeforeTheRun(_Base):
+    """The runner reads the allowlist the server published, before sbx
+    is touched, so a gate never runs on the wrong one (#41)."""
+
+    def _publish(self, hosts) -> str:
+        root = str(self.root / 'w')
+        egress.publish_policy(root, tuple(hosts))
+        return root
+
+    def test_a_pipeline_without_a_gate_reads_nothing(self) -> None:
+        self.assertIsNone(
+            R.read_gate_egress(self._cfg(_LINEAR), str(self.root / 'none'))
+        )
+
+    def test_it_returns_the_operators_list(self) -> None:
+        root = self._publish(['pypi.org', '**.crates.io'])
+        self.assertEqual(
+            R.read_gate_egress(self._cfg(_VERIFY), root),
+            ('pypi.org', '**.crates.io'),
+        )
+
+    def test_a_lockdown_is_returned_as_empty(self) -> None:
+        root = self._publish([])
+        self.assertEqual(R.read_gate_egress(self._cfg(_VERIFY), root), ())
+
+    def test_a_missing_list_refuses_the_run(self) -> None:
+        with self.assertRaises(click.ClickException) as caught:
+            R.read_gate_egress(self._cfg(_VERIFY), str(self.root / 'none'))
+        self.assertIn('Restart the server', caught.exception.format_message())
+
+    def _main(self, text: str, root: str):
+        cfg_path = self.root / 'pipeline.yaml'
+        cfg_path.write_text(text, encoding='utf-8')
+        with mock.patch.object(R, 'preflight_sbx') as sbx, \
+                mock.patch.object(R, 'preflight_disk'), \
+                mock.patch.object(R, 'preflight_codex_auth'), \
+                mock.patch.object(R, 'preflight_codex_login'), \
+                mock.patch.object(R, '_drive') as drive:
+            res = CliRunner().invoke(R.main, [
+                '-c', str(cfg_path),
+                '--canonical-root', str(self.root / 'c'),
+                '--worktree-root', root,
+                '--skip-agy-check',
+            ])
+        return res, sbx, drive
+
+    def test_main_refuses_before_touching_sbx(self) -> None:
+        res, sbx, drive = self._main(_VERIFY, str(self.root / 'none'))
+        self.assertEqual(res.exit_code, 1)
+        self.assertIn('Restart the server', res.output)
+        sbx.assert_not_called()
+        drive.assert_not_called()
+
+    def test_main_hands_the_list_to_the_run(self) -> None:
+        root = self._publish(['pypi.org'])
+        res, _sbx, drive = self._main(_VERIFY, root)
+        self.assertEqual(res.exit_code, 0, res.output)
+        self.assertEqual(
+            drive.call_args.kwargs['gate_egress'], ('pypi.org',)
+        )
+
+    def test_main_without_a_gate_needs_no_list(self) -> None:
+        res, _sbx, drive = self._main(_LINEAR, str(self.root / 'none'))
+        self.assertEqual(res.exit_code, 0, res.output)
+        self.assertIsNone(drive.call_args.kwargs['gate_egress'])
 
 
 if __name__ == '__main__':
