@@ -72,6 +72,9 @@ disk:                      # optional — per-unit estimates for the startup dis
 build_cache: [target]      # optional — build output dirs handed from node to
                            #   node (see "Warm build cache")
 prewarm: false             # optional — default true; see "Pre-warm"
+egress: [sh.rustup.rs, static.rust-lang.org]  # optional — hosts setup and the
+                           #   gate fetch, checked before any turn (see
+                           #   "Declared egress")
 verify:                    # optional — the mechanical gate run before publish
   coverage_min: 95         #   substituted for {coverage_min} in the command
   setup: |                 #   SHELL (not prose) — prepares the gate's own VM
@@ -1096,6 +1099,32 @@ refuse. Live, this halted a module at review-r with both readings defensible
 and neither actionable. If your contract freezes tests, say which half is
 which — weakening an existing test (changing, deleting, relaxing, skipping) is
 a frozen-artifact change; adding coverage the gate demands is not.
+
+### Declared egress
+
+**List the hosts your setup and gate fetch, and the runner checks them first.**
+Without this, a host the VMs can't reach is found mid-campaign: a reviewer that
+can't install a toolchain, or a gate that can't run after every review passed.
+List each host under `egress:`, as `host` or `host:port` (port 443 when left
+off). A host is something the pipeline fetches from, not an allow rule, so
+patterns, URLs and IPv6 are refused when the file loads.
+
+Before the first turn, the runner creates a short-lived sandbox with nothing
+mounted. It gives that sandbox the same per-VM list the gate gets, asks sbx
+(`sbx policy check network`) about each declared host, then removes it. sbx
+decides with its global rules and the per-VM list together, as it does for a
+real VM. Agent VMs get that list plus their own dial-back and harness hosts, so
+a host that passes is reachable from every VM in the run.
+
+A denied host refuses the run, naming the host and sbx's reason. Add it to
+`sandbox.sbx.egress_allow` in the server config and restart the server, or drop
+it from `egress:`. A non-empty `egress_allow` replaces the default, so keep the
+default entries you still need. `egress:` never grants anything itself: the
+operator's list stays the ceiling. A pipeline without `egress:` gets no check
+and no extra VM.
+
+The check covers sbx's policy, the layer every past failure was in. It can't
+see a host firewall or an outage between the host and the internet.
 
 ### Polyglot repos: delegate to the repo
 

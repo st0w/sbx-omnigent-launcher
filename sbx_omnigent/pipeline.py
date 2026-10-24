@@ -453,6 +453,9 @@ class PipelineConfig:
     build_cache: tuple[str, ...] = ()
     #: Boot writer VMs while the interactive planner waits on a human.
     prewarm: bool = True
+    #: Hosts the pipeline's setup and gate fetch, checked against the
+    #: operator's allowlist before any turn. Empty checks nothing.
+    egress: tuple[str, ...] = ()
     subtasks: tuple[Subtask, ...] = ()
     turn_timeout: float | None = None
     verify: VerifySpec | None = None
@@ -961,6 +964,7 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
         test_paths=_parse_globs(root.get('test_paths'), 'test_paths'),
         build_cache=_parse_cache_dirs(root.get('build_cache')),
         prewarm=_parse_prewarm(root.get('prewarm')),
+        egress=_parse_egress(root.get('egress')),
         subtasks=_parse_subtasks_config(root, base_dir),
         turn_timeout=_parse_turn_timeout(root.get('turn_timeout')),
         verify=_parse_verify(root.get('verify')),
@@ -1043,6 +1047,50 @@ def _parse_prewarm(value: object) -> bool:
     if not isinstance(value, bool):
         raise PipelineError(f'prewarm must be true or false, not {value!r}')
     return value
+
+
+#: One declared host: a DNS name or IPv4 address, with an optional
+#: port. Deliberately narrower than what ``sbx`` accepts as a rule.
+_EGRESS_HOST_RE = re.compile(
+    r'(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*'
+    r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    r'(?::([1-9][0-9]{0,4}))?'
+)
+
+
+def _parse_egress(value: object) -> tuple[str, ...]:
+    """
+    Validate the optional ``egress`` list of declared hosts.
+
+    Each entry is a host the pipeline will fetch from, checked before
+    any turn against what its VMs may reach (#41). So it is a concrete
+    target, not an allow rule: patterns, URLs and comma lists are
+    refused, and so is IPv6, which ``sbx`` needs in bracket form.
+
+    :param value: The raw field, or ``None`` when unset.
+    :returns: The hosts, or ``()`` when unset.
+    :raises PipelineError: If it is not a list of ``host`` or
+        ``host:port`` strings.
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise PipelineError(
+            "egress must be a list of hosts, e.g. ['sh.rustup.rs']"
+        )
+    out = []
+    for i, entry in enumerate(value):
+        match = (
+            _EGRESS_HOST_RE.fullmatch(entry)
+            if isinstance(entry, str) else None
+        )
+        if match is None or int(match.group(1) or '1') > 65535:
+            raise PipelineError(
+                f'egress[{i}] must be a host or host:port, e.g. '
+                f"'sh.rustup.rs' or 'deb.debian.org:80', not {entry!r}"
+            )
+        out.append(entry)
+    return tuple(out)
 
 
 def _parse_globs(value: object, what: str) -> tuple[str, ...]:

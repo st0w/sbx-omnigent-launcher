@@ -954,6 +954,47 @@ class TestPrewarmConfig(_Base):
                     self._load(_FULL + f'prewarm: {bad}\n')
 
 
+class TestEgressConfig(_Base):
+    """``egress:`` declares the hosts a pipeline's setup and gate fetch,
+    so a missing one is caught before any turn is spent (#41)."""
+
+    def test_absent_declares_nothing(self) -> None:
+        self.assertEqual(self._load(_FULL).egress, ())
+
+    def test_hosts_and_ports_are_kept_in_order(self) -> None:
+        cfg = self._load(
+            _FULL + 'egress: [sh.rustup.rs, deb.debian.org:80, 10.0.0.7]\n'
+        )
+        self.assertEqual(
+            cfg.egress, ('sh.rustup.rs', 'deb.debian.org:80', '10.0.0.7')
+        )
+
+    def test_an_empty_list_declares_nothing(self) -> None:
+        self.assertEqual(self._load(_FULL + 'egress: []\n').egress, ())
+
+    def test_anything_but_a_list_is_refused(self) -> None:
+        for bad in ('pypi.org', '{a: b}', 'true', '7'):
+            with self.subTest(bad=bad):
+                with self.assertRaises(P.PipelineError):
+                    self._load(_FULL + f'egress: {bad}\n')
+
+    def test_an_entry_that_is_not_a_concrete_host_is_refused(self) -> None:
+        # A declared host is what the pipeline will fetch, not a rule:
+        # no patterns, URLs or lists in one entry.
+        for bad in (
+            '7', '""', '" "', 'a b', '"a,b"', '"*.crates.io"',
+            '"**.astral.sh"', '"api?.x.org"', '"api[12].x.org"', '"pypi.*"',
+            'https://sh.rustup.rs', 'sh.rustup.rs/install', '"[::1]:443"',
+            '"::1"', 'pypi.org:0', 'pypi.org:65536', 'pypi.org:http',
+            'pypi.org:', '.pypi.org', 'pypi..org', '-pypi.org',
+            'null', '[pypi.org]',
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(P.PipelineError) as caught:
+                    self._load(_FULL + f'egress: [{bad}]\n')
+                self.assertIn('egress[0]', str(caught.exception))
+
+
 class TestBuildCacheConfig(_Base):
     """
     ``build_cache`` names directories carried between nodes as a warm

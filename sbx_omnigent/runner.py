@@ -3362,8 +3362,8 @@ class PipelineRunner:
         #: Age of the agy swap secret, guarding every agy turn.
         self._swap_age_s = swap_age_s or agy.harvest_age_s
         #: The operator's allowlist for the verify gate, as the server
-        #: published it (see :func:`read_gate_egress`). ``None`` only
-        #: when built outside ``main()``, which keeps the default.
+        #: published it (see :func:`read_operator_egress`). ``None``
+        #: only when built outside ``main()``, which keeps the default.
         self._gate_egress = gate_egress
         self._nodes: dict[str, NodeResult] = {}
         self._sessions: list[str] = []
@@ -10836,11 +10836,11 @@ def codex_agent_names(config: pipeline.PipelineConfig) -> list[str]:
     )
 
 
-def read_gate_egress(
+def read_operator_egress(
     config: pipeline.PipelineConfig, worktree_root: str
 ) -> tuple[str, ...] | None:
     """
-    Read the operator's allowlist for the verify gate.
+    Read the operator's allowlist, for the verify gate and ``egress:``.
 
     The runner is a separate process from the server and never saw its
     config, so the gate got the built-in default whatever the operator
@@ -10852,16 +10852,73 @@ def read_gate_egress(
     :param worktree_root: The runner's ``--worktree-root``, which must
         be the server's ``sbx.worktree_root``.
     :returns: The operator's allowlist, or ``None`` when the pipeline
-        has no ``verify:`` and so no gate to give it to.
+        has neither a ``verify:`` gate to give it to nor ``egress:``
+        hosts to check against it.
     :raises click.ClickException: If the list is missing or unreadable:
         a gate run on a guessed allowlist is what this replaces.
     """
-    if config.verify is None:
+    if config.verify is None and not config.egress:
         return None
     try:
         return egress.read_policy(worktree_root)
     except egress.PolicyError as exc:
         raise click.ClickException(str(exc)) from exc
+
+
+def preflight_egress(
+    config: pipeline.PipelineConfig,
+    allowlist: tuple[str, ...],
+    *,
+    run_id: str,
+) -> None:
+    """
+    Refuse a run whose VMs cannot reach a host it declares.
+
+    Every gap entry in the default allowlist was added after a live run
+    failed mid-campaign for want of it (#41). A pipeline that declares
+    ``egress:`` has those hosts checked by sbx's own authorizer, in a
+    short-lived sandbox scoped like the gate, before any turn.
+
+    :param config: The parsed pipeline; no ``egress:`` checks nothing.
+    :param allowlist: The operator's resolved allowlist.
+    :param run_id: The run id, for the check sandbox's name.
+    :raises click.ClickException: If a host is denied, or the check
+        cannot run.
+    """
+    if not config.egress:
+        return
+    n = len(config.egress)
+    click.echo(
+        f'[egress] checking {n} declared host(s) in a short-lived '
+        f"sandbox scoped like this run's VMs..."
+    )
+    image = (config.verify.image if config.verify else None) or (
+        DEFAULT_HOST_IMAGE
+    )
+    try:
+        verdicts = egress.check_declared_hosts(
+            name=egress.check_box_name(run_id),
+            hosts=config.egress,
+            allowlist=allowlist,
+            image=image,
+        )
+    except egress.EgressCheckError as exc:
+        raise click.ClickException(
+            f'could not check the declared egress hosts: {exc}'
+        ) from exc
+    denied = [v for v in verdicts if not v.allowed]
+    if denied:
+        lines = '\n'.join(f'  - {v.host}: {v.reason}' for v in denied)
+        raise click.ClickException(
+            f'{len(denied)} of {n} declared egress host(s) are not '
+            f"allowed for this run's VMs:\n{lines}\n"
+            f"Add them to 'sandbox.sbx.egress_allow' in the server "
+            f'config and restart the server (a non-empty list replaces '
+            f'the default, so keep the default entries you still need), '
+            f'or drop them from egress: if the pipeline no longer needs '
+            f'them.'
+        )
+    click.echo(f'[egress] all {n} declared host(s) are allowed.')
 
 
 def preflight_sbx() -> None:
@@ -11290,7 +11347,7 @@ def main(
     # then and a run that publishes at the end has no way to notice.
     publish_token_provider()
     # A config problem, so it refuses in seconds, before sbx is asked.
-    gate_egress = read_gate_egress(config, worktree_root)
+    operator_egress = read_operator_egress(config, worktree_root)
     # Before anything touches sbx, including the resume reclaim below,
     # which disposes VMs through the server.
     preflight_sbx()
@@ -11328,6 +11385,12 @@ def main(
     # would otherwise fail every turn, minutes and several microVMs in.
     preflight_codex_auth(config)
     preflight_codex_login(config, skip=skip_codex_check)
+    if operator_egress is not None:
+        # Last, because it boots a VM: a host the setup or gate needs
+        # is found missing here, not after every review has passed.
+        preflight_egress(
+            config, operator_egress, run_id=run_id or config.name
+        )
     harvester: subprocess.Popen[bytes] | None = None
     if not skip_agy_check:
         # An agy pipeline needs a live harvester or every agy turn dies
@@ -11350,7 +11413,7 @@ def main(
             keep=keep,
             no_interactive_plan=no_interactive_plan,
             no_auto_approve=no_auto_approve,
-            gate_egress=gate_egress,
+            gate_egress=operator_egress,
         )
     finally:
         stop_harvester(harvester)
