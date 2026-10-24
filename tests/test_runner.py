@@ -4027,6 +4027,145 @@ _ROUTED_REPLIES = {
 }
 
 
+_AUDIT = 'cargo audit: api.osv.dev was refused by the sandbox'
+_SCAN = 'trivy: its database download from ghcr.io was refused'
+
+
+def _limited(*items: str, verdict: str = 'APPROVED') -> str:
+    listed = '\n'.join(f'- {item}' for item in items)
+    return (
+        f'Ran the suite: 12 passed.\n\nENVIRONMENT-LIMITS:\n{listed}'
+        f'\n\nVERDICT: {verdict}'
+    )
+
+
+class TestEnvironmentLimitsAreSurfacedOncePerStage(_Base):
+    """A check the sandbox stopped is shown once, never filed (#41).
+
+    Filed as a finding, the same sentence reached the tracker once per
+    reviewer, per round. It is said once per stage on the console, and
+    once per stage on the pull request, where a reader is looking.
+    """
+
+    def _run_env(self, replies, source=_COMPETE_REVIEWED, wt=None):
+        wt = wt if wt is not None else FakeWT()
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            self._run(source, dict(replies), wt=wt)
+        said = [
+            str(c.args[0]) for c in echo.call_args_list if c.args
+        ]
+        notes = [line for line in said if line.startswith('[environment]')]
+        return notes, wt
+
+    def _replies(self, **over):
+        return {**_REVIEWED_REPLIES, **over}
+
+    def test_it_is_said_once_across_rounds(self) -> None:
+        # Round one blocks on a real defect, round two approves; both
+        # report the same blocked audit.
+        notes, _wt = self._run_env(self._replies(**{
+            'review-a-sec': [
+                _limited(_AUDIT, verdict='BLOCKING'), _limited(_AUDIT),
+            ],
+        }))
+        review_a = [n for n in notes if 'review-a' in n]
+        self.assertEqual(len(review_a), 1, notes)
+        self.assertIn(_AUDIT, review_a[0])
+        self.assertIn('not run', review_a[0])
+
+    def test_a_later_round_says_only_what_is_new(self) -> None:
+        notes, _wt = self._run_env(self._replies(**{
+            'review-a-sec': [
+                _limited(_AUDIT, verdict='BLOCKING'),
+                _limited(_AUDIT, _SCAN),
+            ],
+        }))
+        review_a = [n for n in notes if 'review-a' in n]
+        self.assertEqual(len(review_a), 2, notes)
+        self.assertIn(_SCAN, review_a[1])
+        self.assertNotIn(_AUDIT, review_a[1])
+
+    def test_each_stage_says_its_own(self) -> None:
+        notes, _wt = self._run_env(self._replies(**{
+            'review-a-sec': _limited(_AUDIT),
+            'review-b-sec': _limited(_AUDIT),
+        }))
+        self.assertEqual(
+            sorted(n.split(':')[0] for n in notes),
+            ['[environment] review-a', '[environment] review-b'],
+        )
+
+    def test_it_is_never_filed_as_a_finding(self) -> None:
+        _notes, wt = self._run_env(self._replies(**{
+            'review-a-sec': _limited(_AUDIT),
+        }))
+        self.assertEqual(wt.issues, [])
+
+    def test_the_pull_request_lists_it_once_per_stage(self) -> None:
+        _notes, wt = self._run_env(self._replies(**{
+            'review-a-sec': [
+                _limited(_AUDIT, verdict='BLOCKING'), _limited(_AUDIT),
+            ],
+        }))
+        body = wt.pr_bodies[-1]
+        self.assertIn('## Checks the sandbox could not run', body)
+        self.assertEqual(body.count(_AUDIT), 1, body)
+        self.assertIn('`review-a`', body)
+        self.assertIn('sandbox.sbx.egress_allow', body)
+
+    def test_a_clean_review_adds_no_section(self) -> None:
+        notes, wt = self._run_env(self._replies())
+        self.assertEqual(notes, [])
+        self.assertNotIn('Checks the sandbox could not run', wt.pr_bodies[-1])
+
+    def test_a_local_run_still_says_it_and_ledgers_nothing(self) -> None:
+        notes, wt = self._run_env(
+            {**_LINEAR_REPLIES, 'review-sec': _limited(_AUDIT)},
+            source=_LINEAR,
+        )
+        self.assertEqual(len(notes), 1, notes)
+        self.assertEqual(
+            [r for _t, r, _c in wt.tracked_files if 'findings' in r], []
+        )
+
+    def test_a_note_cannot_write_to_the_terminal(self) -> None:
+        notes, _wt = self._run_env(self._replies(**{
+            'review-a-sec': _limited('audit\x1b[2J blocked'),
+        }))
+        self.assertIn('audit[2J blocked', notes[0])
+        self.assertNotIn('\x1b', notes[0])
+
+
+class TestThePullRequestGroupsEnvironmentLimits(unittest.TestCase):
+    def _rec(self, reviewer, stage='review-a', round_no=1, env=()):
+        return R.ReviewRecord(
+            chunk=None, stage=stage, reviewer=reviewer, round_no=round_no,
+            verdict='APPROVED', environment=tuple(env),
+        )
+
+    def test_one_line_per_check_naming_everyone_who_raised_it(self) -> None:
+        body = R.render_pr_body(summary='s', reviews=[
+            self._rec('sec', env=[_AUDIT]),
+            self._rec('bugs', env=[_AUDIT, _SCAN]),
+            self._rec('sec', round_no=2, env=[_AUDIT]),
+        ])
+        self.assertEqual(body.count(_AUDIT), 1, body)
+        self.assertIn(f'- {_AUDIT} (raised by `sec`, `bugs`)', body)
+        self.assertIn(f'- {_SCAN} (raised by `bugs`)', body)
+
+    def test_stages_are_kept_apart(self) -> None:
+        body = R.render_pr_body(summary='s', reviews=[
+            self._rec('sec', env=[_AUDIT]),
+            self._rec('sec', stage='review-b', env=[_AUDIT]),
+        ])
+        self.assertEqual(body.count(_AUDIT), 2, body)
+        self.assertLess(body.index('`review-a`'), body.index('`review-b`'))
+
+    def test_no_limits_no_section(self) -> None:
+        body = R.render_pr_body(summary='s', reviews=[self._rec('sec')])
+        self.assertNotIn('Checks the sandbox could not run', body)
+
+
 class TestDispositionsDecideWhatIsFiled(_Base):
     """
     The gate's conclusions reaching the tracker.
@@ -5502,6 +5641,97 @@ class TestFindingSections(unittest.TestCase):
         # list is dropped.
         got = R.FindingSections.of('DEFECTS:\n- a\n\nFINDINGS:\n- b')
         self.assertEqual(got.defects, ('a', 'b'))
+
+
+class TestEnvironmentLimitsAreTheirOwnSection(unittest.TestCase):
+    """
+    A check the SANDBOX stopped is not a finding against the code (#41).
+
+    An advisory audit that could not reach its database was filed as
+    a finding by every reviewer, every round: 15 of 174 filed findings
+    in one module were that one sentence. It is lifted into its own
+    section and kept out of the union, so nothing files it.
+    """
+
+    _TEXT = (
+        'Ran the suite: 212 passed.\n\n'
+        'DEFECTS:\n- the retry budget is undocumented\n\n'
+        'ENVIRONMENT-LIMITS:\n'
+        '- cargo audit: api.osv.dev was refused by the sandbox\n\n'
+        'VERDICT: APPROVED'
+    )
+
+    def test_the_block_is_lifted_into_its_own_section(self) -> None:
+        self.assertEqual(
+            R.FindingSections.of(self._TEXT).environment,
+            ('cargo audit: api.osv.dev was refused by the sandbox',),
+        )
+
+    def test_it_is_not_part_of_the_findings_union(self) -> None:
+        # The union is what is filed, ledgered and verified.
+        self.assertEqual(
+            R.FindingSections.of(self._TEXT).all,
+            ('the retry budget is undocumented',),
+        )
+
+    def test_the_header_may_be_decorated_like_every_other_marker(
+        self,
+    ) -> None:
+        for header in ('ENVIRONMENT-LIMITS:', '## Environment limits',
+                       '**ENVIRONMENT_LIMITS:**', 'environment-limits'):
+            with self.subTest(header=header):
+                self.assertEqual(
+                    R.FindingSections.of(f'{header}\n- x').environment,
+                    ('x',),
+                )
+
+    def test_a_plain_environment_heading_is_not_the_block(self) -> None:
+        # Reviewers describe their setup under "## Environment". That
+        # is what they DID run, and must never read as what they could
+        # not.
+        for header in ('## Environment', 'ENVIRONMENT:', 'Environment'):
+            with self.subTest(header=header):
+                self.assertEqual(
+                    R.FindingSections.of(
+                        f'{header}\n- rustc 1.80 installed'
+                    ).environment,
+                    (),
+                )
+
+    def test_absent_is_empty(self) -> None:
+        for text in ('', None, 'VERDICT: APPROVED'):
+            with self.subTest(text=text):
+                self.assertEqual(R.FindingSections.of(text).environment, ())
+
+    def _restored(self, raw: dict) -> R.ReviewRecord:
+        rec = R.ReviewRecord.from_dict(raw)
+        if rec is None:
+            self.fail(f'the record did not restore: {raw!r}')
+        return rec
+
+    def test_the_section_round_trips_through_state(self) -> None:
+        rec = R.ReviewRecord(
+            chunk='m1', stage='review-a', reviewer='sec', round_no=1,
+            verdict='APPROVED', environment=('audit blocked',),
+        )
+        self.assertEqual(
+            self._restored(rec.as_dict()).environment, ('audit blocked',)
+        )
+
+    def test_state_written_before_it_still_loads(self) -> None:
+        raw = {
+            'stage': 'review-a', 'reviewer': 'sec', 'round_no': 1,
+            'verdict': 'APPROVED', 'turns': [],
+        }
+        self.assertEqual(self._restored(raw).environment, ())
+
+    def test_a_malformed_entry_is_dropped_not_fatal(self) -> None:
+        raw = {
+            'stage': 'review-a', 'reviewer': 'sec', 'round_no': 1,
+            'verdict': 'APPROVED', 'turns': [],
+            'environment': ['keep', 7, None],
+        }
+        self.assertEqual(self._restored(raw).environment, ('keep',))
 
 
 class TestReviewRecordCarriesTheSections(unittest.TestCase):
@@ -10795,6 +11025,78 @@ class TestAReviewerIsToldHowToDisputeTheContract(_Base):
         for surface, text in self._surfaces().items():
             with self.subTest(surface=surface):
                 self.assertEqual(R.parse_disputes(text), ())
+
+
+class TestAReviewerIsAskedWhatTheSandboxStopped(_Base):
+    """A reviewer can say what the sandbox stopped it running (#41).
+
+    Without it, an audit that could not reach its advisory database
+    was filed as a finding against the code by every reviewer, every
+    round. The block must not become a way to approve unexecuted code:
+    the build and the suite are never supplementary."""
+
+    def _runner(self, source):
+        cfg = self._cfg(source)
+        return R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+
+    def _instructions(self) -> dict[str, str]:
+        impl = self._runner(_COMPETE_REVIEWED)
+        refactor = self._runner(_JUDGE_REFACTOR)
+        refactor._nodes['refactor'] = R.NodeResult(
+            'refactor', 'writer', branch='b/refactor'
+        )
+        return {
+            'implementation review': impl._review_instruction(
+                impl._stage_by_id['review-a']
+            ),
+            'refactor review': refactor._refactor_review_instruction(
+                refactor._stage_by_id['review-r']
+            ),
+        }
+
+    def _templates(self) -> dict[str, str]:
+        return {
+            name: pipeline.template_prompt(name)
+            for name in ('security-reviewer', 'bug-reviewer')
+        }
+
+    def test_every_review_instruction_asks_for_the_block(self) -> None:
+        for surface, text in self._instructions().items():
+            for phrase in (
+                'ENVIRONMENT-LIMITS:',
+                'NEVER for the build or the test suite',
+                '`VERDICT: BLOCKING`',
+                'was not run',
+                'not filed as a finding',
+            ):
+                with self.subTest(surface=surface, phrase=phrase):
+                    self.assertIn(phrase, text)
+
+    def test_every_surface_says_the_network_is_an_allowlist(self) -> None:
+        # "Outbound network access for exactly that" was untrue: only
+        # the allowlisted hosts are reachable.
+        for surface, text in {
+            **self._instructions(), **self._templates(),
+        }.items():
+            with self.subTest(surface=surface):
+                self.assertIn('allowlist', text)
+                self.assertNotIn('network access for exactly that', text)
+
+    def test_the_templates_point_at_the_block(self) -> None:
+        for surface, text in self._templates().items():
+            with self.subTest(surface=surface):
+                self.assertIn('ENVIRONMENT-LIMITS:', text)
+
+    def test_no_surface_lifts_an_item_if_quoted_back(self) -> None:
+        for surface, text in {
+            **self._instructions(), **self._templates(),
+        }.items():
+            with self.subTest(surface=surface):
+                self.assertEqual(R.FindingSections.of(text).environment, ())
 
 
 class TestAReviewerDoesNotReRunTheGate(_Base):
