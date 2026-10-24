@@ -174,6 +174,18 @@ _PREMISES_HEADER_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
+#: Checks the SANDBOX stopped a reviewer running (#41): an audit whose
+#: advisory database a blocked host serves, a tool whose download is
+#: refused. Not a finding against the code, so it is kept out of the
+#: union that is filed. Two words, not ``ENVIRONMENT``: reviewers
+#: describe what they DID set up under an "Environment" heading, and
+#: that must never read as what they could not run.
+_ENVIRONMENT_HEADER_RE = re.compile(
+    r'^[ \t]*#{0,6}[ \t]*\*{0,2}[ \t]*'
+    r'ENVIRONMENT[- _]?LIMITS[ \t]*:?[ \t]*\*{0,2}[ \t]*$',
+    re.MULTILINE | re.IGNORECASE,
+)
+
 #: Verdict-token synonyms, normalized to the two canonical values.
 _APPROVE_WORDS = frozenset({
     'APPROVED', 'APPROVE', 'PASS', 'PASSED', 'PASSES',
@@ -863,6 +875,28 @@ _FINDINGS_ASK = (
     '`DEFECTS:` is the safe choice.'
 )
 
+#: Where a reviewer puts a check the SANDBOX stopped (#41). Before it,
+#: an audit that could not reach its advisory database was filed as a
+#: finding against the code by every reviewer, every round: 15 of 174
+#: filed findings in one module were that one sentence.
+#:
+#: The second half is what keeps it from becoming a way to approve
+#: unexecuted code. The marker stays mid-sentence, so a reviewer
+#: quoting this back lifts nothing.
+_ENVIRONMENT_ASK = (
+    '\n\nIf the SANDBOX, not the code, stopped you running a '
+    'supplementary check — an audit whose advisory database sits behind '
+    'a host the sandbox refuses, a scanner whose download is blocked — '
+    'list it in a block headed `ENVIRONMENT-LIMITS:`, one `- ` item per '
+    'check: what you tried to run and what stopped it, naming the host '
+    'if one was refused. Each is recorded once for this review stage and '
+    'shown on the pull request; it is not filed as a finding, so do not '
+    'repeat it under `DEFECTS:`. This block is NEVER for the build or the '
+    'test suite: if those could not run, you could not verify, and your '
+    'verdict is `VERDICT: BLOCKING`. A check listed here was not run, so '
+    'nothing in your verdict may rest on it.'
+)
+
 #: What a reviewer must NOT re-run, and why it is not its job.
 #:
 #: A reviewer is handed the whole task, success criteria included, and
@@ -950,7 +984,8 @@ _REVIEW_VERIFY = (
     '\n\nBefore any verdict, CHECK THAT THE CODE IS REALLY THERE and '
     'that the test suite really passes — run it. If the tooling you '
     'need is missing, install it (see the environment notes above); '
-    'your VM has network access for that. You may NOT return `VERDICT: '
+    'your VM can reach an allowlist of hosts for that. You may NOT '
+    'return `VERDICT: '
     'APPROVED` on a change you could not execute, and "the code looks '
     'correct" is not a substitute for running it. If you could not '
     'verify, return `VERDICT: BLOCKING` and say exactly what stopped '
@@ -1868,6 +1903,11 @@ def report_names_nothing(text: str | None) -> bool:
     return len(stripped.strip()) < 40
 
 
+def _printable(text: str) -> str:
+    """*text* without unprintable characters, for the terminal."""
+    return ''.join(ch for ch in text if ch.isprintable())
+
+
 def _strings(value: object) -> tuple[str, ...]:
     """
     The string items of a persisted list, dropping anything else.
@@ -1929,15 +1969,20 @@ class FindingSections:
     :param premises: Assumptions an APPROVAL rests on. Mostly they hold;
         the value is that a wrong one becomes visible instead of
         invisible, so they are verified rather than triaged.
+    :param environment: Supplementary checks the sandbox stopped the
+        reviewer running. Not part of :attr:`all`: they say nothing
+        about the code, so they are surfaced once per stage rather than
+        filed (#41).
     """
 
     defects: tuple[str, ...] = ()
     later_increment: tuple[str, ...] = ()
     premises: tuple[str, ...] = ()
+    environment: tuple[str, ...] = ()
 
     @property
     def all(self) -> tuple[str, ...]:
-        """Every item, defects first — the pre-split list."""
+        """Every finding, defects first — the pre-split list."""
         return self.defects + self.later_increment + self.premises
 
     @classmethod
@@ -1962,6 +2007,7 @@ class FindingSections:
             ),
             later_increment=_lift_marked_items(text, _LATER_HEADER_RE),
             premises=_lift_marked_items(text, _PREMISES_HEADER_RE),
+            environment=_lift_marked_items(text, _ENVIRONMENT_HEADER_RE),
         )
 
 
@@ -2185,6 +2231,11 @@ class ReviewRecord:
     defects: tuple[str, ...] = ()
     later_increment: tuple[str, ...] = ()
     premises: tuple[str, ...] = ()
+    #: Checks the sandbox stopped this reviewer running. NOT in
+    #: :attr:`findings`, so nothing files, ledgers or verifies them;
+    #: they are surfaced once per stage instead (#41). Additive like the
+    #: sections above.
+    environment: tuple[str, ...] = ()
     #: The writer node this vote was cast against. Two candidates are
     #: reviewed per chunk, so a finding is meaningless without it.
     target: str | None = None
@@ -2255,6 +2306,7 @@ class ReviewRecord:
             'defects': list(self.defects),
             'later_increment': list(self.later_increment),
             'premises': list(self.premises),
+            'environment': list(self.environment),
             'target': self.target,
             'blocking_report': self.blocking_report,
         }
@@ -2296,6 +2348,7 @@ class ReviewRecord:
             defects=_strings(raw.get('defects')),
             later_increment=_strings(raw.get('later_increment')),
             premises=_strings(raw.get('premises')),
+            environment=_strings(raw.get('environment')),
             target=target if isinstance(target, str) else None,
             blocking_report=(
                 raw['blocking_report']
@@ -2881,6 +2934,60 @@ def _pr_selection_lines(
     return parts
 
 
+def environment_by_stage(
+    records: Sequence[ReviewRecord],
+) -> list[tuple[str, list[tuple[str, list[str]]]]]:
+    """
+    Each stage's environment limits once, with who raised them.
+
+    Deduplicated on text within a stage, like referrals: two reviewers
+    hitting the same refused host, and one hitting it every round, are
+    the normal case, and the reader needs it once (#41).
+
+    :param records: Votes, in the order cast.
+    :returns: ``(stage, [(text, reviewers)])`` in first-seen order;
+        stages that raised none are left out.
+    """
+    grouped: dict[str, dict[str, list[str]]] = {}
+    for rec in records:
+        for text in rec.environment:
+            who = grouped.setdefault(rec.stage, {}).setdefault(text, [])
+            if rec.reviewer not in who:
+                who.append(rec.reviewer)
+    return [(stage, list(items.items())) for stage, items in grouped.items()]
+
+
+def _pr_environment_lines(reviews: list[ReviewRecord] | None) -> list[str]:
+    """
+    The pull request's "Checks the sandbox could not run" section.
+
+    :param reviews: The votes cast on this branch.
+    :returns: Lines to append, empty when no reviewer raised one.
+    """
+    grouped = environment_by_stage(reviews or [])
+    if not grouped:
+        return []
+    lines = [
+        '',
+        '## Checks the sandbox could not run',
+        '',
+        'Reviewers could not run these supplementary checks because of '
+        'the sandbox, not the code, so none of them was run. Each is '
+        'listed once per review stage and is not filed as a finding. A '
+        'check that needs a host the sandbox refuses can run once that '
+        'host is in `sandbox.sbx.egress_allow` in the server config; '
+        "declare it under the pipeline's `egress:` too, so the next run "
+        'checks it before any turn.',
+    ]
+    for stage, items in grouped:
+        lines += ['', f'`{stage}`:', '']
+        lines += [
+            f'- {text} (raised by {", ".join(f"`{r}`" for r in who)})'
+            for text, who in items
+        ]
+    return lines
+
+
 def _pr_finding_lines(
     findings: list[tuple[str, str]] | None,
 ) -> list[str]:
@@ -3007,6 +3114,7 @@ def render_pr_body(
             ]
     parts += _pr_selection_lines(picks, pick_doc)
     parts += _pr_finding_lines(findings)
+    parts += _pr_environment_lines(reviews)
     for step in outcome.steps if outcome else ():
         heading, collapse = _PR_STEPS.get(
             step.label, (step.label.title(), True)
@@ -5026,6 +5134,7 @@ class PipelineRunner:
             defects=sections.defects,
             later_increment=sections.later_increment,
             premises=sections.premises,
+            environment=sections.environment,
             target=target,
             blocking_report=blocking_report,
         )
@@ -8068,6 +8177,7 @@ class PipelineRunner:
                 # both rather than leaking a guest AND a clone.
                 self._dispose_sessions(created)
                 self._dispose_review_snapshot(stage.id, round_no)
+            self._note_environment_limits(stage.id, round_no)
             # A reviewer that never stated a verdict did not vote
             # AGAINST the branch — it failed to review. Those are
             # different failures with different remedies, and
@@ -8134,6 +8244,46 @@ class PipelineRunner:
                 f'[{r}]\n{outputs[r]}' for r in blocking
             )
             self._redrive_writer(stage.on_block, findings)
+
+    def _note_environment_limits(self, stage_id: str, round_no: int) -> None:
+        """
+        Say what the sandbox stopped this round's reviewers running.
+
+        Only what is NEW to the stage: an item an earlier round already
+        reported is not repeated, so each is said once per stage (#41).
+        Derived from the records, so a resumed run does not repeat
+        what it said before stopping.
+
+        :param stage_id: The review stage whose round just voted.
+        :param round_no: That round.
+        """
+        with self._lock:
+            records = [r for r in self._reviews if r.stage == stage_id]
+        earlier = {
+            text
+            for rec in records
+            if rec.round_no < round_no
+            for text in rec.environment
+        }
+        fresh = [
+            (text, who)
+            for _stage, items in environment_by_stage(
+                [r for r in records if r.round_no == round_no]
+            )
+            for text, who in items
+            if text not in earlier
+        ]
+        if not fresh:
+            return
+        listed = '\n'.join(
+            f'  - {_printable(text)} [{", ".join(who)}]'
+            for text, who in fresh
+        )
+        click.echo(
+            f'[environment] {stage_id}: the sandbox stopped '
+            f'{len(fresh)} supplementary check(s). They were not run, '
+            f'and are not filed as findings:\n{listed}'
+        )
 
     def _warn_dispute_near_miss(self, label: str, text: str | None) -> None:
         """
@@ -9717,6 +9867,7 @@ class PipelineRunner:
             + self._scope_block()
             + self._rulings_block()
             + _FINDINGS_ASK
+            + _ENVIRONMENT_ASK
             + self._guarded_block(stage)
             + _REVIEW_DISPUTE
             + _REVIEW_VERDICT_LINE
@@ -9823,6 +9974,7 @@ class PipelineRunner:
             + _REVIEW_NOT_WEIGHTED.format(later='')
             + self._rulings_block()
             + _FINDINGS_ASK
+            + _ENVIRONMENT_ASK
             + self._guarded_block(stage)
             + _REVIEW_DISPUTE
             + _REVIEW_VERDICT_LINE

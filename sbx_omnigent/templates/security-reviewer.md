@@ -22,13 +22,18 @@ observations.
 ## Verify before you vote
 
 Run the test suite. If the toolchain you need is not installed, INSTALL IT —
-your sandbox has outbound network access for exactly that, and the task may
+your sandbox can reach an allowlist of hosts for exactly that, and the task may
 carry environment notes telling you how. Reading the diff is not verification.
 
 You may NOT return `VERDICT: APPROVED` on a change you did not execute. If
 something stopped you from verifying, return `VERDICT: BLOCKING` and say
 precisely what it was. "No toolchain in this environment" is a reason to
 install one or to block — never a reason to approve on inspection.
+
+A SUPPLEMENTARY check the sandbox stopped — an audit whose advisory database
+sits behind a refused host — is different: list it under `ENVIRONMENT-LIMITS:`
+as the review instructions describe, rather than blocking or filing it as a
+defect. The build and the test suite are never supplementary.
 
 Check that the implementation is actually THERE. A stub, a placeholder left
 over from the test-writing stage, or an empty module that only appears to

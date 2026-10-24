@@ -1126,6 +1126,25 @@ and no extra VM.
 The check covers sbx's policy, the layer every past failure was in. It can't
 see a host firewall or an outage between the host and the internet.
 
+### When the sandbox stops a reviewer's check
+
+**A check the sandbox stopped is reported once, not filed as a finding.** A
+reviewer that can't run a *supplementary* check because of the sandbox (an
+audit whose advisory database sits behind a refused host, a scanner whose
+download is blocked) lists it in a block headed `ENVIRONMENT-LIMITS:`, one `- `
+item per check. Without it, every reviewer filed the same sentence against the
+code every round.
+
+The runner prints each check once per review stage, the first round it appears,
+and the pull request lists them under "Checks the sandbox could not run", with
+who raised each one. They are never filed as issues or added to the findings
+ledger. If a check needs a refused host, add the host to
+`sandbox.sbx.egress_allow` and declare it under `egress:`.
+
+The block is never for the build or the test suite. A reviewer that couldn't
+run those couldn't verify, and still has to return `VERDICT: BLOCKING`. A check
+listed there wasn't run, so no approval rests on it.
+
 ### Polyglot repos: delegate to the repo
 
 For a repo spanning several languages, do NOT inline the detection logic in
