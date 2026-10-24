@@ -28,6 +28,7 @@ Run ``omni-sbx server ...`` exactly as you would ``omni server ...``.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -281,10 +282,14 @@ def warn_on_global_allow_rules() -> None:
     operator to review them and offers the opt-in, destructive command
     to adopt a strict deny-all baseline. Best-effort: never blocks
     startup, and never changes any policy itself.
+
+    Reads the JSON listing: the text table prints one summary row per
+    policy, so counting its lines reported sbx's six default bundles
+    as one rule.
     """
     try:
         proc = subprocess.run(
-            ['sbx', 'policy', 'ls', '--type', 'network'],
+            ['sbx', 'policy', 'ls', '--type', 'network', '--json'],
             capture_output=True,
             text=True,
             timeout=15,
@@ -293,21 +298,25 @@ def warn_on_global_allow_rules() -> None:
         return
     if proc.returncode != 0:
         return
-    # Heuristic: count global (APPLIES_TO 'all') allow rule lines.
-    n = sum(
-        1
-        for line in proc.stdout.splitlines()
-        if 'allow' in line
-        and 'local' in line
-        and _has_word(line, 'all')
-    )
-    if n == 0:
+    rules = _global_allow_rules(proc.stdout)
+    if rules is None:
+        print(
+            "[sbx-omnigent] NOTE: could not read sbx's network policy "
+            'listing, so global allow rules were not checked. Review '
+            'them yourself:  sbx policy ls --type network',
+            file=sys.stderr,
+        )
         return
+    if not rules:
+        return
+    hosts = sum(count for _name, count in rules)
+    named = ', '.join(f'{name} ({count})' for name, count in rules)
     print(
-        f'[sbx-omnigent] NOTE: {n} global sbx network allow rule(s) grant '
-        'broad access to EVERY sandbox — including swarm agent VMs — and '
-        'are additive, so a per-sandbox allowlist cannot restrict below '
-        'them.\n'
+        f'[sbx-omnigent] NOTE: {len(rules)} global sbx network allow '
+        f'rule(s), covering {hosts} host pattern(s), grant broad access '
+        'to EVERY sandbox — including swarm agent VMs — and are '
+        'additive, so a per-sandbox allowlist cannot restrict below '
+        f'them:\n  {named}\n'
         '  Review them:  sbx policy ls --type network\n'
         '  For a strict deny-all baseline (recommended for secure '
         'swarms):\n'
@@ -319,9 +328,43 @@ def warn_on_global_allow_rules() -> None:
     )
 
 
-def _has_word(line: str, word: str) -> bool:
-    """Return whether *word* appears as a whitespace-delimited token."""
-    return word in line.split()
+def _global_allow_rules(stdout: str) -> list[tuple[str, int]] | None:
+    """
+    The active, local, global allow rules in a JSON policy listing.
+
+    Only local rules count, because the advised reset only removes
+    those; a rule from org governance is not the operator's to change.
+
+    :param stdout: ``sbx policy ls --type network --json`` output.
+    :returns: ``(name, host pattern count)`` per rule, in listed order,
+        with the name stripped of unprintable characters; ``None`` if
+        the output is not a listing this can read.
+    """
+    try:
+        raw: object = json.loads(stdout)
+    except ValueError:
+        return None
+    rules = raw.get('rules') if isinstance(raw, dict) else None
+    if not isinstance(rules, list):
+        return None
+    found = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            return None
+        resources = rule.get('resources')
+        if not isinstance(resources, list):
+            return None
+        if (
+            rule.get('scope') == 'global'
+            and rule.get('decision') == 'allow'
+            and rule.get('origin') == 'local'
+            and rule.get('status') == 'active'
+        ):
+            name = ''.join(
+                ch for ch in str(rule.get('name')) if ch.isprintable()
+            )
+            found.append((name, len(resources)))
+    return found
 
 
 def _as_bool(value: object, field: str) -> bool:
