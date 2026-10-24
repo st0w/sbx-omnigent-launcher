@@ -631,8 +631,9 @@ That boundary only *restricts* if there are no **broad global allow rules**
 underneath it: global allows apply to every sandbox and are additive, so a
 scoped allowlist can't reduce below them. sbx ships permissive global bundles
 (`default-ai-services`, etc.). On `omni-sbx server` startup the launcher
-**warns** (never changes) when such global allows exist and advises the opt-in,
-one-time command to adopt a strict deny-all baseline:
+**warns** (never changes) when such global allows exist, naming each rule and how
+many host patterns it allows, and advises the opt-in, one-time command to adopt
+a strict deny-all baseline:
 
 ```bash
 sbx policy reset && sbx policy init deny-all   # wipes ALL global sbx rules

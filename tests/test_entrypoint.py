@@ -10,7 +10,9 @@ mutated. Run with:
 from __future__ import annotations
 
 import io
+import json
 import os
+import subprocess
 import types
 import unittest
 from typing import ClassVar
@@ -148,54 +150,122 @@ class TestAsEgressAllow(unittest.TestCase):
             _as_egress_allow(['ok', ''])
 
 
+def _rule(
+    name: str,
+    resources: object,
+    *,
+    scope: str = 'global',
+    decision: str = 'allow',
+    origin: str = 'local',
+    status: str = 'active',
+) -> dict[str, object]:
+    """One rule as ``sbx policy ls --type network --json`` lists it."""
+    return {
+        'name': name, 'scope': scope, 'decision': decision,
+        'origin': origin, 'status': status, 'resources': resources,
+    }
+
+
 class TestWarnOnGlobalAllowRules(unittest.TestCase):
-    """Startup advisory for broad global sbx allow rules."""
+    """Startup advisory for broad global sbx allow rules.
 
-    _GLOBALS = (
-        'PROVENANCE APPLIES_TO POLICY TYPE DECISION RESOURCES\n'
-        'local all default-ai-services network allow api.anthropic.com\n'
-        '                                            openai.com\n'
-        'local all default-package-managers network allow pypi.org\n'
-        'local sandbox:box-1 rule-x network allow oauth2.googleapis.com\n'
-    )
-    _NO_GLOBALS = (
-        'PROVENANCE APPLIES_TO POLICY TYPE DECISION RESOURCES\n'
-        'local sandbox:box-1 rule-x network allow oauth2.googleapis.com\n'
-    )
+    It counted lines of ``sbx policy ls`` text, which now prints one
+    summary row per policy, so sbx's six default bundles (194 host
+    patterns) were reported as one rule. It reads ``--json`` instead.
+    """
 
-    def _run(self, stdout: str, rc: int = 0) -> str:
+    _GLOBALS: ClassVar[list[dict[str, object]]] = [
+        _rule('default-ai-services', ['api.example.com:443', '**.a.example']),
+        _rule(
+            'default-package-managers', ['pypi.org:443', 'crates.io', 'x.io']
+        ),
+        _rule('scoped', ['one.example'], scope='sandbox:box-1'),
+        _rule('a-deny', ['bad.example'], decision='deny'),
+        _rule('off', ['off.example'], status='inactive'),
+        _rule('from-org', ['org.example'], origin='org'),
+    ]
+
+    def _run(self, stdout: str, rc: int = 0) -> tuple[str, mock.Mock]:
         proc = mock.Mock(returncode=rc, stdout=stdout)
         with (
             mock.patch(
                 'sbx_omnigent.entrypoint.subprocess.run', return_value=proc
-            ),
+            ) as run,
             mock.patch('sys.stderr', io.StringIO()) as err,
         ):
             warn_on_global_allow_rules()
-        return err.getvalue()
+        return err.getvalue(), run
 
-    def test_warns_and_counts_only_global_allows(self) -> None:
-        out = self._run(self._GLOBALS)
-        self.assertIn('sbx policy reset && sbx policy init deny-all', out)
-        # 2 global 'all' allows; the scoped rule is excluded.
-        self.assertIn('2 global', out)
+    def _note(self, rules: object) -> str:
+        return self._run(json.dumps({'rules': rules}))[0]
 
-    def test_silent_when_no_global_allows(self) -> None:
-        self.assertEqual(self._run(self._NO_GLOBALS), '')
+    def test_it_reads_the_json_listing(self) -> None:
+        _out, run = self._run(json.dumps({'rules': []}))
+        self.assertEqual(
+            run.call_args.args[0],
+            ['sbx', 'policy', 'ls', '--type', 'network', '--json'],
+        )
+
+    def test_it_counts_rules_and_the_hosts_they_allow(self) -> None:
+        out = self._note(self._GLOBALS)
+        self.assertIn('2 global sbx network allow rule(s)', out)
+        self.assertIn('5 host pattern(s)', out)
+
+    def test_it_names_each_counted_rule(self) -> None:
+        out = self._note(self._GLOBALS)
+        self.assertIn('default-ai-services (2)', out)
+        self.assertIn('default-package-managers (3)', out)
+        for left_out in ('scoped', 'a-deny', 'off', 'from-org'):
+            with self.subTest(rule=left_out):
+                self.assertNotIn(left_out, out)
+
+    def test_it_still_offers_the_deny_all_baseline(self) -> None:
+        self.assertIn(
+            'sbx policy reset && sbx policy init deny-all',
+            self._note(self._GLOBALS),
+        )
+
+    def test_silent_under_a_deny_all_baseline(self) -> None:
+        self.assertEqual(self._note([]), '')
+
+    def test_silent_when_only_other_rules_exist(self) -> None:
+        self.assertEqual(self._note(self._GLOBALS[2:]), '')
+
+    def test_a_rule_name_cannot_write_to_the_terminal(self) -> None:
+        out = self._note([_rule('evil\x1b[2Jname\n', ['a.example'])])
+        self.assertIn('evil[2Jname (1)', out)
+        self.assertNotIn('\x1b', out)
+
+    def test_unreadable_output_says_so_instead_of_a_count(self) -> None:
+        for stdout in (
+            'POLICY SOURCE APPLIES TO SUMMARY', '[]', '{}',
+            '{"rules": {}}', '{"rules": ["x"]}',
+            json.dumps({'rules': [_rule('r', 'a.example')]}),
+        ):
+            with self.subTest(stdout=stdout):
+                out, _run = self._run(stdout)
+                self.assertIn('could not read', out)
+                self.assertIn('sbx policy ls --type network', out)
+                self.assertNotIn('rule(s)', out)
 
     def test_silent_on_nonzero_exit(self) -> None:
-        self.assertEqual(self._run(self._GLOBALS, rc=1), '')
+        self.assertEqual(self._run('', rc=1)[0], '')
 
-    def test_never_raises_when_sbx_missing(self) -> None:
-        with (
-            mock.patch(
-                'sbx_omnigent.entrypoint.subprocess.run',
-                side_effect=FileNotFoundError,
-            ),
-            mock.patch('sys.stderr', io.StringIO()) as err,
+    def test_never_raises_when_sbx_missing_or_hung(self) -> None:
+        for failure in (
+            FileNotFoundError(),
+            subprocess.TimeoutExpired(['sbx'], 15),
         ):
-            warn_on_global_allow_rules()  # must not raise
-        self.assertEqual(err.getvalue(), '')
+            with self.subTest(failure=type(failure).__name__):
+                with (
+                    mock.patch(
+                        'sbx_omnigent.entrypoint.subprocess.run',
+                        side_effect=failure,
+                    ),
+                    mock.patch('sys.stderr', io.StringIO()) as err,
+                ):
+                    warn_on_global_allow_rules()  # must not raise
+                self.assertEqual(err.getvalue(), '')
 
 
 class TestAgyEnterprisePatch(unittest.TestCase):
