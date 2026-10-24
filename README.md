@@ -622,7 +622,10 @@ tight, per-agent boundary.
 > lockdown) prints nothing. The verify gate gets the same list: the server
 > publishes it at startup to `<worktree_root>/.sbx-omnigent-egress.json`, and the
 > runner reads it before a pipeline with `verify:` starts, so a server started
-> before this change must be restarted once.
+> before this change must be restarted once. A pipeline can also list the hosts
+> its setup and gate fetch under `egress:`, and the runner checks each one against
+> this list before the first turn. See
+> [Declared egress](./docs/PIPELINES.md#declared-egress).
 
 That boundary only *restricts* if there are no **broad global allow rules**
 underneath it: global allows apply to every sandbox and are additive, so a

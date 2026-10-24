@@ -13418,23 +13418,23 @@ class TestTheGatesAllowlistIsReadBeforeTheRun(_Base):
 
     def test_a_pipeline_without_a_gate_reads_nothing(self) -> None:
         self.assertIsNone(
-            R.read_gate_egress(self._cfg(_LINEAR), str(self.root / 'none'))
+            R.read_operator_egress(self._cfg(_LINEAR), str(self.root / 'none'))
         )
 
     def test_it_returns_the_operators_list(self) -> None:
         root = self._publish(['pypi.org', '**.crates.io'])
         self.assertEqual(
-            R.read_gate_egress(self._cfg(_VERIFY), root),
+            R.read_operator_egress(self._cfg(_VERIFY), root),
             ('pypi.org', '**.crates.io'),
         )
 
     def test_a_lockdown_is_returned_as_empty(self) -> None:
         root = self._publish([])
-        self.assertEqual(R.read_gate_egress(self._cfg(_VERIFY), root), ())
+        self.assertEqual(R.read_operator_egress(self._cfg(_VERIFY), root), ())
 
     def test_a_missing_list_refuses_the_run(self) -> None:
         with self.assertRaises(click.ClickException) as caught:
-            R.read_gate_egress(self._cfg(_VERIFY), str(self.root / 'none'))
+            R.read_operator_egress(self._cfg(_VERIFY), str(self.root / 'none'))
         self.assertIn('Restart the server', caught.exception.format_message())
 
     def _main(self, text: str, root: str):
@@ -13472,6 +13472,137 @@ class TestTheGatesAllowlistIsReadBeforeTheRun(_Base):
         res, _sbx, drive = self._main(_LINEAR, str(self.root / 'none'))
         self.assertEqual(res.exit_code, 0, res.output)
         self.assertIsNone(drive.call_args.kwargs['gate_egress'])
+
+
+_DECLARES = _LINEAR.replace(
+    'publish: local', 'publish: local\negress: [sh.rustup.rs, crates.io]'
+)
+
+
+class TestDeclaredEgressIsCheckedBeforeTheRun(_Base):
+    """A pipeline's ``egress:`` hosts are checked against what its VMs
+    may reach before any turn, rather than found missing mid-campaign
+    (#41)."""
+
+    def _verdicts(self, *denied: str):
+        def check(*, name, hosts, allowlist, image, runner=None):
+            self.seen = {
+                'name': name, 'hosts': hosts, 'allowlist': allowlist,
+                'image': image,
+            }
+            return tuple(
+                egress.HostVerdict(
+                    h, h not in denied, 'No matching allow rule'
+                    if h in denied else '',
+                )
+                for h in hosts
+            )
+        return mock.patch.object(
+            egress, 'check_declared_hosts', side_effect=check
+        )
+
+    def test_a_pipeline_declaring_egress_reads_the_list(self) -> None:
+        root = str(self.root / 'w')
+        egress.publish_policy(root, ('pypi.org',))
+        self.assertEqual(
+            R.read_operator_egress(self._cfg(_DECLARES), root), ('pypi.org',)
+        )
+
+    def test_nothing_declared_checks_nothing(self) -> None:
+        with self._verdicts() as check:
+            R.preflight_egress(
+                self._cfg(_VERIFY), ('pypi.org',), run_id='r1'
+            )
+        check.assert_not_called()
+
+    def test_the_check_gets_the_hosts_list_and_run(self) -> None:
+        with self._verdicts(), contextlib.redirect_stdout(io.StringIO()):
+            R.preflight_egress(
+                self._cfg(_DECLARES), ('pypi.org',), run_id='r1'
+            )
+        self.assertEqual(self.seen['hosts'], ('sh.rustup.rs', 'crates.io'))
+        self.assertEqual(self.seen['allowlist'], ('pypi.org',))
+        self.assertEqual(self.seen['image'], R.DEFAULT_HOST_IMAGE)
+        self.assertTrue(self.seen['name'].startswith('egress-check-r1-'))
+
+    def test_a_lockdown_is_checked_as_a_lockdown(self) -> None:
+        with self._verdicts(), contextlib.redirect_stdout(io.StringIO()):
+            R.preflight_egress(self._cfg(_DECLARES), (), run_id='r1')
+        self.assertEqual(self.seen['allowlist'], ())
+
+    def test_the_gates_image_is_used_when_set(self) -> None:
+        text = _DECLARES.replace(
+            'publish: local',
+            'publish: local\nverify:\n  command: make test\n'
+            '  image: example.invalid/gate:1',
+        )
+        with self._verdicts(), contextlib.redirect_stdout(io.StringIO()):
+            R.preflight_egress(self._cfg(text), (), run_id='r1')
+        self.assertEqual(self.seen['image'], 'example.invalid/gate:1')
+
+    def test_all_allowed_says_so(self) -> None:
+        out = io.StringIO()
+        with self._verdicts(), contextlib.redirect_stdout(out):
+            R.preflight_egress(self._cfg(_DECLARES), (), run_id='r1')
+        self.assertIn('2 declared host(s)', out.getvalue())
+
+    def test_a_denied_host_refuses_naming_it_and_the_fix(self) -> None:
+        quiet = contextlib.redirect_stdout(io.StringIO())
+        with self._verdicts('crates.io'), quiet:
+            with self.assertRaises(click.ClickException) as caught:
+                R.preflight_egress(self._cfg(_DECLARES), (), run_id='r1')
+        msg = caught.exception.format_message()
+        self.assertIn('crates.io: No matching allow rule', msg)
+        self.assertNotIn('sh.rustup.rs', msg)
+        self.assertIn('sandbox.sbx.egress_allow', msg)
+
+    def test_a_check_that_cannot_run_refuses(self) -> None:
+        with mock.patch.object(
+            egress, 'check_declared_hosts',
+            side_effect=egress.EgressCheckError('sbx gave no verdict'),
+        ), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(click.ClickException) as caught:
+                R.preflight_egress(self._cfg(_DECLARES), (), run_id='r1')
+        self.assertIn('sbx gave no verdict', caught.exception.format_message())
+
+    def _main(self, text: str, root: str):
+        cfg_path = self.root / 'pipeline.yaml'
+        cfg_path.write_text(text, encoding='utf-8')
+        with mock.patch.object(R, 'preflight_sbx'), \
+                mock.patch.object(R, 'preflight_disk'), \
+                mock.patch.object(R, 'preflight_codex_auth'), \
+                mock.patch.object(R, 'preflight_codex_login'), \
+                mock.patch.object(R, '_drive') as drive:
+            res = CliRunner().invoke(R.main, [
+                '-c', str(cfg_path),
+                '--canonical-root', str(self.root / 'c'),
+                '--worktree-root', root,
+                '--skip-agy-check',
+            ])
+        return res, drive
+
+    def test_main_refuses_a_denied_host_before_the_run(self) -> None:
+        root = str(self.root / 'w')
+        egress.publish_policy(root, ('pypi.org',))
+        with self._verdicts('crates.io'):
+            res, drive = self._main(_DECLARES, root)
+        self.assertEqual(res.exit_code, 1)
+        self.assertIn('crates.io', res.output)
+        drive.assert_not_called()
+
+    def test_main_runs_once_every_host_is_allowed(self) -> None:
+        root = str(self.root / 'w')
+        egress.publish_policy(root, ('pypi.org',))
+        with self._verdicts():
+            res, drive = self._main(_DECLARES, root)
+        self.assertEqual(res.exit_code, 0, res.output)
+        drive.assert_called_once()
+
+    def test_main_without_egress_creates_no_check_box(self) -> None:
+        with self._verdicts() as check:
+            res, _drive = self._main(_LINEAR, str(self.root / 'none'))
+        self.assertEqual(res.exit_code, 0, res.output)
+        check.assert_not_called()
 
 
 if __name__ == '__main__':
