@@ -768,14 +768,17 @@ its process table. (Full model:
 > server dial-back and runner↔harness IPC on `NO_PROXY`. Without it, sbx
 > credential injection reaches **no** Omnigent harness, for any provider.
 
-You store secrets once, out-of-band, on the server host. Two forms:
+You store secrets once, out-of-band, on the server host. A secret applies to every
+sandbox unless you scope it with `--sandbox`. (Older sbx releases needed `-g` for
+that; as of sbx v0.46.0 it is the default and `-g` is deprecated, with a warning.)
+Two forms:
 
 **Built-in services** — `sbx` knows the provider's domains and header. Store the
 key globally and every new sandbox is covered:
 
 ```bash
-echo "$ANTHROPIC_API_KEY" | sbx secret set -g anthropic
-echo "$GEMINI_API_KEY"    | sbx secret set -g google   # generativelanguage.googleapis.com, …
+echo "$ANTHROPIC_API_KEY" | sbx secret set anthropic
+echo "$GEMINI_API_KEY"    | sbx secret set google   # generativelanguage.googleapis.com, …
 ```
 
 **Custom** — use this when the agent reads a specific env var and/or you want to
@@ -785,20 +788,20 @@ needs *something* to resolve at config time, and the proxy then swaps the real
 value on the wire:
 
 ```bash
-sbx secret set-custom -g \
+sbx secret set-custom \
   --host generativelanguage.googleapis.com \
   --env GEMINI_API_KEY \
   --value "$GEMINI_API_KEY"
 ```
 
 Notes:
-- **Global (`-g`) secrets apply at sandbox *creation*.** Change one → recreate
+- **Global secrets apply at sandbox *creation*.** Change one → recreate
   the sandbox (new session) for it to take effect.
 - **Placeholder vs. validation.** If the harness validates the key's *format* at
   boot, a sentinel like `proxy-managed` may not pass; `set-custom` lets you
   shape the placeholder. This is the most likely thing to tune for a given
   harness — verify with a real turn.
-- **`git` / GitHub** works the same way via `sbx secret set -g github`.
+- **`git` / GitHub** works the same way via `sbx secret set github`.
 
 ### Claude via subscription (no per-VM `/login`)
 
@@ -817,7 +820,7 @@ claude setup-token                       # prints an sk-ant-oat… token
 # 2. Store it zero-exposure: OMIT --value so the token is read from a HIDDEN
 #    prompt (no shell history, no argv), and shape the placeholder like a real
 #    token so Claude Code's format check passes.
-sbx secret set-custom -g \
+sbx secret set-custom \
   --host api.anthropic.com \
   --env CLAUDE_CODE_OAUTH_TOKEN \
   --placeholder 'sk-ant-oat01-{rand}'
@@ -843,7 +846,7 @@ Notes:
 - **One rule only:** if `set-custom` is run twice you get two placeholders for
   the same env var; the injected value and the swap rule can then disagree and
   auth fails. Keep exactly one (`sbx secret ls`; remove extras with
-  `sbx secret rm -g --placeholder <value> -f`).
+  `sbx secret rm --placeholder <value> -f`).
 - Works because the launcher forwards the sbx proxy env to the harness (see the
   callout above) — that is what lets the swap reach Claude Code.
 

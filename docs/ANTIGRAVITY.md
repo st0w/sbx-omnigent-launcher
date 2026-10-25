@@ -78,7 +78,7 @@ Three planes, so the durable refresh credential never touches an untrusted agent
 
 | Approach | Why not |
 |---|---|
-| Store a Gemini **API key** (`sbx secret set -g google`) | `agy` uses OAuth, not an API key; the built-in `google` secret injects the wrong header. |
+| Store a Gemini **API key** (`sbx secret set google`) | `agy` uses OAuth, not an API key; the built-in `google` secret injects the wrong header. |
 | Extract `client_secret` and mint tokens host-side | Not extractable from the Go binary (no `GOCSPX`/`client_id` strings; assembled at runtime). |
 | Service-account / Vertex key on each VM | We don't want to add an atypical, friction-heavy SA-key export step just to run a coding agent; and it *is* a durable credential on a YOLO box — the thing we're avoiding. |
 | Interactive `agy /login` in every fresh VM | No TTY in a headless microVM; and it would put a durable refresh token on every agent box. |

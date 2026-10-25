@@ -58,10 +58,11 @@ CLAUDE_NATIVE_HARNESSES: frozenset[str] = frozenset(
 #: Largest agent instructions, in bytes, a claude-native agent is
 #: allowed at pipeline load.
 #:
-#: Omnigent v0.13.0 starts Claude Code inside tmux and passes the
-#: agent's instructions on that command line (``--append-system-prompt
-#: <text>``). tmux 3.5a refuses a command over about 16,329 bytes
-#: (measured in a guest), and the same command also carries an inline
+#: Omnigent starts Claude Code inside tmux and passes the agent's
+#: instructions on that command line (``--append-system-prompt
+#: <text>``); v0.13.0 and v0.19.1 both do. tmux 3.5a refuses a command
+#: over about 16,329 bytes (measured in a v0.13.0 guest), and the same
+#: command also carries an inline
 #: MCP config, tool lists and the model and permission flags. Over the
 #: limit the terminal never starts, and the run fails with
 #: ``failed: None``. Observed: 13,584 bytes launched; 16,763 and 17,719

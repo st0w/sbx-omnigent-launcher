@@ -84,6 +84,8 @@ verify:                    # optional — the mechanical gate run before publish
     cargo test --workspace
     cargo llvm-cov --workspace --fail-under-lines {coverage_min}
   demo: ./scripts/demo.sh  #   optional — its output becomes the PR's proof
+  image: ghcr.io/omnigent-ai/omnigent-host:v0.19.1  # optional — pin the gate's VM
+                           #   to the image your agents use (default: `:latest`)
 # task/acceptance/context each accept a *_file variant (task_file:, acceptance_file:,
 # context_file:) that reads the text from a path relative to this yaml — pick ONE
 # of the pair. See "Text from a file" below.
@@ -987,6 +989,11 @@ agent VM — and the runner has no way to tell that from a failing suite, so it
 blamed the branch and re-drove a writer, which duly started editing the
 project's build config to work around a limit that was never the code's fault.
 Set `verify.cpus` and `verify.memory` to whatever the agent VMs get.
+
+**Pin the gate's image too.** `sandbox.sbx.image` doesn't reach the gate either: it
+boots the launcher's default, `ghcr.io/omnigent-ai/omnigent-host:latest`, unless
+`verify.image` names another. Set it to the image your agents run, or the branch is
+verified on a different toolchain from the one it was built and reviewed on.
 
 **The gate gets the operator's allowlist.** Its network access is the server's
 `sandbox.sbx.egress_allow`, resolved the same way as for agent VMs (unset is the

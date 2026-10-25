@@ -27,7 +27,15 @@ inside an `except ImportError` and would have gone silent.
 
 Last checked against **v0.13.0** and **v0.19.1**: the full unit suite passes on
 both, and mypy reports the same errors against both, none of them in code that
-touches Omnigent.
+touches Omnigent. A pipeline run on v0.19.1 also completed, with a Claude writer,
+a Codex and an agy reviewer, and the verify gate. It needed the one-line server
+fix described under [v0.19.0 and v0.19.1 need an upstream
+fix](#v0190-and-v0191-need-an-upstream-fix). The CLI versions it read are in
+`docs/HARNESS-VERSIONS.md`.
+
+Unit tests can't exercise the server itself, so check a new release with a small
+pipeline run too: one writer, a reviewer for each harness you use, and a verify
+gate.
 
 To check another release, install its published wheel into a throwaway virtual
 environment and run the suite and mypy from the repository root, so the launcher
@@ -61,6 +69,38 @@ When the supported floor rises past both changes:
 `tests/test_compat.py` and the delegation tests in
 `tests/test_launcher.py` are what make that deletion safe to attempt.
 
+## v0.19.0 and v0.19.1 need an upstream fix
+
+On v0.19.0 and v0.19.1, every pipeline turn fails at once with `the turn failed:
+None` and an empty pane, on a server with a single local user:
+
+1. The runner sends a session's first message as soon as the server's stream is
+   ready, before the VM's own runner has connected.
+2. Since v0.19.0, the server saves such a message and delivers it once the runner
+   connects (`omnigent/server/startup_inputs.py`).
+3. On a single-user server every request is the reserved user `"local"`, and
+   Omnigent stores no author for it. The saved message was authorized later as
+   that stored author, so delivery found no user: `Unable to deliver saved
+   message` and `OmnigentError: Authentication required` in the server log.
+
+v0.13.0 doesn't have this code, so it isn't affected. Upstream commit `b9e80e9d3`
+(`omnigent-ai/omnigent`, merged 2026-10-21) fixes it, but no release contains it
+yet. It changes one line in `omnigent/server/routes/sessions/routes_events.py`,
+inside `_post_event_impl`:
+
+```diff
+-                session_id, body, user_id=created_by, headers=request.headers, first=False
++                session_id, body, user_id=user_id, headers=request.headers, first=False
+```
+
+Until a release includes it, apply that change to the installed package. Any
+reinstall or upgrade undoes it. Before installing a newer release, check that it
+contains the commit (expect `behind` or `identical`):
+
+```bash
+gh api repos/omnigent-ai/omnigent/compare/<tag>...b9e80e9d3 --jq .status
+```
+
 ## Two things this does NOT paper over
 
 **The host image is pinned separately.** `sandbox.sbx.image` in the
@@ -69,7 +109,9 @@ from the server's. The in-VM agy bridge patch spans both layouts for
 exactly this reason. Upstream's public image tags are `sha-<short>`,
 `latest-nightly`, `vX.Y.Z` and `latest` — a `dev-<short>` tag is a
 locally built image and has to be rebuilt to follow a server upgrade.
-See `docs/HARNESS-VERSIONS.md`.
+Two VMs the launcher boots itself don't read it and default to `:latest`: the
+verify gate (set `verify.image` in the pipeline) and the trusted agy box (pass
+`omni-sbx-agy bootstrap --image`). See `docs/HARNESS-VERSIONS.md`.
 
 **Omnigent now has a real provider plugin hook.** The
 `omnigent.sandbox_providers` entry-point group
