@@ -580,7 +580,12 @@ class SbxLauncher(ExecModelHostLauncher):
             # carries no harness signal, so an agy VM is
             # indistinguishable from a Claude one. Only the swarm mount
             # path tags agy VMs.
-            return super().start_host(
+            # The repository keywords are chosen at run time from the
+            # installed base's signature (see _base_repo_kwargs), so no
+            # one static signature describes this call: typed against
+            # either Omnigent, the other one's keywords do not exist.
+            base_start_host: Callable[..., str] = super().start_host
+            return base_start_host(
                 sandbox_id,
                 token=token,
                 host_id=host_id,

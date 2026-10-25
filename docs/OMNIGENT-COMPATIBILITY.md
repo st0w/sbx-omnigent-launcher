@@ -23,6 +23,30 @@ failed loudly at import — taking `omni-sbx server` with them, since
 `entrypoint -> launcher -> swarm` is a top-level chain. The third was
 inside an `except ImportError` and would have gone silent.
 
+## Checking a new release
+
+Last checked against **v0.13.0** and **v0.19.1**: the full unit suite passes on
+both, and mypy reports the same errors against both, none of them in code that
+touches Omnigent.
+
+To check another release, install its published wheel into a throwaway virtual
+environment and run the suite and mypy from the repository root, so the launcher
+is imported from the working tree:
+
+```bash
+uv venv --python 3.14 /tmp/omni-check
+uv pip install --python /tmp/omni-check/bin/python omnigent==X.Y.Z
+/tmp/omni-check/bin/python -W default -m unittest discover -s tests
+uvx mypy --python-executable /tmp/omni-check/bin/python sbx_omnigent/ tests/
+```
+
+Run mypy against a wheel install, not an editable one. mypy can't follow an
+editable install's import hook, so against an editable Omnigent every import of it
+is `import-not-found` and nothing that touches Omnigent is type-checked at all.
+That is how a `start_host` override that no longer matched the base class, and
+tests reading attributes the factory's declared type doesn't have, went unnoticed
+until v0.19.1 was checked this way.
+
 ## The straddle is meant to be temporary
 
 When the supported floor rises past both changes:

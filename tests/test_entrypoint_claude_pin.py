@@ -11,21 +11,28 @@ from __future__ import annotations
 import unittest
 
 from sbx_omnigent.entrypoint import _build_sbx_config
+from sbx_omnigent.launcher import SbxLauncher
 
 
 def _cfg(sbx: dict[str, object]) -> dict[str, object]:
     return {'server_url': 'http://host.docker.internal:6767', 'sbx': sbx}
 
 
+def _launcher(sbx: dict[str, object]) -> SbxLauncher:
+    """The launcher the sbx config's factory builds, typed as one."""
+    launcher = _build_sbx_config(_cfg(sbx)).launcher_factory()
+    if not isinstance(launcher, SbxLauncher):
+        raise AssertionError(f'the factory built {launcher!r}')
+    return launcher
+
+
 class TestTheVersionReachesTheLauncher(unittest.TestCase):
     def test_unset_means_no_pin(self) -> None:
-        launcher = _build_sbx_config(_cfg({})).launcher_factory()
+        launcher = _launcher({})
         self.assertIsNone(launcher._claude_version)
 
     def test_a_version_is_handed_to_the_launcher(self) -> None:
-        launcher = _build_sbx_config(
-            _cfg({'claude_version': '2.1.280'})
-        ).launcher_factory()
+        launcher = _launcher({'claude_version': '2.1.280'})
         self.assertEqual(launcher._claude_version, '2.1.280')
 
 

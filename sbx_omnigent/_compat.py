@@ -126,11 +126,27 @@ class RepoWorkspaceLike(Protocol):
     Named as a protocol rather than imported as a class because the
     class lives at a different path per release, and this package
     only ever reads these fields off it.
+
+    Read-only, because Omnigent's record is a frozen dataclass: plain
+    attributes would ask for settable fields, which a frozen record
+    does not satisfy, and ``SbxLauncher.start_host`` would then accept
+    less than the base class it overrides.
     """
 
-    url: str
-    branch: str | None
-    repo_name: str
+    @property
+    def url(self) -> str:
+        """The clone URL, with any ``#<branch>`` fragment stripped."""
+        ...
+
+    @property
+    def branch(self) -> str | None:
+        """The branch to clone, or ``None`` for the default."""
+        ...
+
+    @property
+    def repo_name(self) -> str:
+        """The directory the clone lands in."""
+        ...
 
 
 def repo_workspace(
