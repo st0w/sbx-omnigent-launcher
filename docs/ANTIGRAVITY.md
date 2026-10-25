@@ -318,7 +318,13 @@ sandbox:
     agy_enterprise: true               # Business/enterprise (Vertex) account
     agy_gcp_project: <gcp-project-id>   # required for that account
     agy_gcp_location: us
+    agy_update: false                  # true: run `agy update` in each agy VM first
 ```
+
+`agy_update` is for a model newer than the image's agy, which would otherwise be
+served by a different model without an error. See
+[`HARNESS-VERSIONS.md`](./HARNESS-VERSIONS.md#updating-agy-sbxagy_update) for
+what it costs.
 
 Restart the server so the launcher loads these. Then run an agy swarm agent like
 any other, acknowledging support with `--agy`:

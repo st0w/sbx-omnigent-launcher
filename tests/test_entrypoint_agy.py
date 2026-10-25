@@ -64,5 +64,35 @@ class TestAgyEnabledConfig(unittest.TestCase):
             _build_sbx_config(_cfg({'agy_gcp_project': '   '}))
 
 
+
+class TestAgyUpdateConfig(unittest.TestCase):
+    """`sbx.agy_update` reaches the launcher, off unless asked for."""
+
+    def test_default_off(self) -> None:
+        self.assertFalse(_launcher({'agy_enabled': True})._agy_update)
+
+    def test_true_reaches_the_launcher(self) -> None:
+        launcher = _launcher({'agy_enabled': True, 'agy_update': True})
+        self.assertTrue(launcher._agy_update)
+
+    def test_rejects_non_bool(self) -> None:
+        for bad in ('yes', 1, 'true'):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    _build_sbx_config(
+                        _cfg({'agy_enabled': True, 'agy_update': bad})
+                    )
+
+    def test_refused_without_agy_enabled(self) -> None:
+        # With no agy VMs it would update nothing, so a config that
+        # sets it is refused rather than quietly ignored.
+        with self.assertRaises(ValueError) as caught:
+            _build_sbx_config(_cfg({'agy_update': True}))
+        self.assertIn('agy_enabled', str(caught.exception))
+
+    def test_false_without_agy_enabled_is_fine(self) -> None:
+        self.assertFalse(_launcher({'agy_update': False})._agy_update)
+
+
 if __name__ == '__main__':
     unittest.main()
