@@ -32,13 +32,13 @@ CLIS: tuple[str, ...] = ('claude', 'codex', 'agy')
 #: the two disagree, so update both together when a new image is
 #: checked.
 KNOWN_GOOD: Mapping[str, str] = {
-    'claude': '2.1.280',
-    'codex': '0.153.4',
-    'agy': '1.2.9',
+    'claude': '2.1.310',
+    'codex': '0.163.0',
+    'agy': '1.1.16',
 }
 
 #: The date :data:`KNOWN_GOOD` was recorded.
-KNOWN_GOOD_RECORDED = '2026-09-23'
+KNOWN_GOOD_RECORDED = '2026-10-25'
 
 #: Wall clock for the whole round-trip. ``sbx exec`` may start a stopped
 #: box, and three CLIs each start a runtime to print one line.

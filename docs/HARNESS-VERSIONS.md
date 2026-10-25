@@ -15,30 +15,39 @@ not theoretical — it has cost this project four separate days:
 
 ## Known-good set
 
-Recorded on **2026-09-23**: image `ghcr.io/omnigent-ai/omnigent-host:v0.13.0`
-with `sbx.claude_version: "2.1.280"`. The image itself carries Claude Code
-2.1.266; the pin moves every Claude VM to 2.1.280 before its host starts. codex
-comes from the unchanged image: read from a fresh VM on 2026-09-14 and again by
-pipeline runs since. agy does not: the image carries 1.1.16, and agy updates
-itself inside the VM (see below). A pipeline's agy judge read **1.2.9** on
-2026-09-23, and its turn completed and made its selection.
+Recorded on **2026-10-25**: image `ghcr.io/omnigent-ai/omnigent-host:v0.19.1`
+with no `sbx.claude_version` pin, read by a pipeline run from each agent's VM
+after its first turn. Each CLI got there differently:
+
+- **claude:** the image carries Claude Code 2.1.307. Without a pin, Claude Code's
+  own updater runs in every VM, and the writer's VM had moved to **2.1.310**
+  before its first turn. Expect this one to drift from run to run.
+- **codex:** the image's version, unchanged in the VM.
+- **agy:** the image's pinned version, also unchanged. agy updates itself only
+  when the VM can reach its updater host (see below), and the current global sbx
+  rules do not allow it.
 
 | CLI | Version |
 | --- | --- |
-| `@anthropic-ai/claude-code` | 2.1.280 |
-| `@openai/codex` | 0.153.4 |
-| `agy` (Antigravity CLI) | 1.2.9 |
+| `@anthropic-ai/claude-code` | 2.1.310 |
+| `@openai/codex` | 0.163.0 |
+| `agy` (Antigravity CLI) | 1.1.16 |
 
-Models confirmed on that image — one real turn each:
+Models confirmed on that image, each through a real pipeline turn:
+
+| Harness | Model | Effort | How | Recorded |
+| --- | --- | --- | --- | --- |
+| `claude-native` | `claude-opus-5-5` | default | a writer turn completed the task, and the verify gate passed on its branch | 2026-10-25 |
+| `codex-native` | `gpt-6-astra` | default | a reviewer turn returned `VERDICT: APPROVED` | 2026-10-25 |
+| `antigravity-native` | `gemini-3.8-flash-high` | in the model id | a reviewer turn returned `VERDICT: APPROVED` | 2026-10-25 |
+
+Earlier rows, on `v0.13.0`:
 
 | Harness | Model | Effort | How | Recorded |
 | --- | --- | --- | --- | --- |
 | `claude-native` | `claude-opus-5-5` | default | `claude -p` in a v0.13.0 VM after `npm install -g @anthropic-ai/claude-code@2.1.280` replied `ok`. Before the install, the same VM gave the 400 above. | 2026-09-23 |
 | `claude-native` | `claude-fable-5-1` | `xhigh` | the pane banner read `Fable 5.1 with xhigh effort`, on Claude Code 2.1.266 | 2026-09-14 |
 | `codex-native` | `gpt-6-astra` | `xhigh` | launch read-back: `model: gpt-6-astra xhigh` | 2026-09-14 |
-
-The Opus 5.5 row has not yet been through a pipeline turn, whose launch read-back
-checks the pane banner's model and effort. The Fable 5.1 row predates the pin.
 
 Read the set out of any running agent VM with:
 
@@ -82,6 +91,7 @@ rows is what a run that wedges right after an upgrade gets compared against.
 
 | Recorded | Image | claude | codex | agy |
 | --- | --- | --- | --- | --- |
+| 2026-10-25 | `omnigent-host:v0.19.1`, no Claude pin; Claude updated itself in the VM from the image's 2.1.307 | 2.1.310 | 0.163.0 | 1.1.16 |
 | 2026-09-23 | `omnigent-host:v0.13.0` + `claude_version: 2.1.280`; agy updated itself in the VM | 2.1.280 | 0.153.4 | 1.2.9 |
 | 2026-09-23 | `omnigent-host:v0.13.0` + `claude_version: 2.1.280` | 2.1.280 | 0.153.4 | 1.1.16 |
 | 2026-09-14 | `omnigent-host:v0.13.0` | 2.1.266 | 0.153.4 | 1.1.16 |
@@ -100,8 +110,10 @@ But pinning the image would not be enough, because **these CLIs update themselve
 at runtime, inside the VM**:
 
 - agy reported **1.0.10** in one VM and **1.1.15** in another, both built from the
-  same image tag on the same day. The egress policy carries a global allow rule
-  for `antigravity-cli-auto-updater-…run.app`, which is how.
+  same image tag on the same day, and **1.2.9** in a VM whose image carried 1.1.16.
+  The egress policy then carried a global allow rule for
+  `antigravity-cli-auto-updater-…run.app`, which is how. sbx's default rules don't
+  include it: once that rule was gone, agy stayed on the image's version.
 - A Claude pane was observed showing `✔ Update installed · Restart to apply`
   mid-session; `claude --version` then reported 2.1.236 while the image's
   `node_modules` still held 2.1.235 (its updater installs to a user-local path).
