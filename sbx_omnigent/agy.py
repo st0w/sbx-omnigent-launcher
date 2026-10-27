@@ -608,6 +608,55 @@ SEED_OK_MARKER = 'AGY_SEED_OK'
 #: Sentinel printed by the in-VM enterprise-onboarding bridge patch.
 BRIDGE_PATCH_OK_MARKER = 'AGY_BRIDGE_PATCHED'
 
+#: Sentinel the update script prints, with the versions before and
+#: after, once ``agy update`` has run (see :func:`build_update_script`).
+UPDATE_OK_MARKER = '__omni_agy_update_ok__'
+
+#: Hosts ``agy update`` reaches: the version check, then the download.
+#: Measured with ``sbx policy log`` on 2026-10-25, updating the v0.19.1
+#: image's agy 1.1.16 to 1.4.7; nothing else was contacted. Applied per
+#: VM, to agy VMs only, and only with ``sbx.agy_update`` on. The updater
+#: host is the one compiled into the image's agy, so a new image can
+#: name another, and the update then fails loudly rather than quietly.
+UPDATE_EGRESS: tuple[str, ...] = (
+    'antigravity-cli-auto-updater-974169037036.us-central1.run.app',
+    'storage.googleapis.com',
+)
+
+
+def build_update_script() -> str:
+    """
+    The in-VM shell program that updates agy to its latest release.
+
+    The host image pins agy, and Omnigent passes ``--model`` through to
+    it unchecked, so a model released after the image was built is
+    quietly substituted rather than refused. Updating before the host
+    starts means the session's agy is the one that knows the model.
+
+    Written for a minimal POSIX ``sh`` (the VM's is dash). stdin is
+    ``/dev/null`` so the updater can never wait on a prompt.
+
+    :returns: A ``sh -c`` program that prints :data:`UPDATE_OK_MARKER`
+        with the versions before and after. On failure it exits
+        non-zero and prints the updater's last lines.
+    """
+    return (
+        'before=$(agy --version 2>/dev/null | head -n 1)\n'
+        'log=$(mktemp)\n'
+        'if ! agy update </dev/null >"$log" 2>&1; then\n'
+        '  echo "agy update failed (agy ${before:-?}):"\n'
+        '  tail -n 20 "$log"\n'
+        '  exit 3\n'
+        'fi\n'
+        'after=$(agy --version 2>/dev/null | head -n 1)\n'
+        'if [ -z "$after" ]; then\n'
+        '  echo "agy reports no version after the update:"\n'
+        '  tail -n 20 "$log"\n'
+        '  exit 4\n'
+        'fi\n'
+        f'echo "{UPDATE_OK_MARKER} ${{before:-?}} $after"\n'
+    )
+
 #: In-VM patch of the installed ``antigravity_native_bridge`` module,
 #: run BEFORE the runner imports it. Two independent best-effort edits
 #: (see :func:`build_bridge_patch_script`): flip the hardcoded

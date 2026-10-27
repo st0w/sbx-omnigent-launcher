@@ -25,7 +25,8 @@ after its first turn. Each CLI got there differently:
 - **codex:** the image's version, unchanged in the VM.
 - **agy:** the image's pinned version, also unchanged. agy updates itself only
   when the VM can reach its updater host (see below), and the current global sbx
-  rules do not allow it.
+  rules do not allow it. `sbx.agy_update` updates it on purpose; see
+  [Updating agy](#updating-agy-sbxagy_update).
 
 | CLI | Version |
 | --- | --- |
@@ -152,6 +153,39 @@ pin mid-run. Codex and agy VMs are untouched.
   takes a different path and keeps the image's version.
 - Bump the pin deliberately, after a run on the new version, and record it in the
   known-good set above.
+
+### Updating agy: `sbx.agy_update`
+
+The image pins agy, and an agy older than a model doesn't refuse it: it serves a
+different one. On the v0.19.1 image, an agent pinned to `gemini-4-argon-high` ran
+as `Gemini 3.8 Flash (High)` on the image's agy 1.1.16. The launch check flags it
+(`[launch] … a DIFFERENT model`), but the turn still runs on the wrong model.
+
+```yaml
+sandbox:
+  sbx:
+    agy_enabled: true
+    agy_update: true    # default false
+```
+
+With it set, every agy VM runs `agy update` after its egress is applied and before
+its host starts, and fails the VM loudly if the update fails. On 2026-10-25 that
+took the image's 1.1.16 to 1.4.7 in 8 seconds. Claude and Codex VMs are
+untouched.
+
+- **It's off by default for a reason.** Omnigent pins agy because its bridge drives
+  agy's screen, and a newer agy can draw it differently. Run a small pipeline with
+  it on before a campaign relies on it.
+- **The VM's agy floats.** Each VM gets whatever is newest that day, so expect a
+  `[versions]` warning against the known-good set, and versions that differ between
+  runs.
+- **Two hosts are allowed per agy VM, only while it's on:** the updater,
+  `antigravity-cli-auto-updater-974169037036.us-central1.run.app`, and
+  `storage.googleapis.com` for the download. Those were the only two an update
+  contacted. The updater host is compiled into the image's agy, so a new image can
+  name a different one; the update then fails loudly, naming the VM.
+- Only pipeline and swarm VMs are updated. A session started from the Omnigent UI
+  keeps the image's agy.
 
 ## The operational rule
 

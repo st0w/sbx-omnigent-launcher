@@ -348,6 +348,11 @@ class SbxLauncher(ExecModelHostLauncher):
         moved to before its host starts, with Claude's auto-updater
         turned off so it stays there; ``None`` keeps whatever the image
         carries. See :func:`claude.build_version_pin_script`.
+    :param agy_update: Run ``agy update`` in every **agy** VM before its
+        host starts, with :data:`agy.UPDATE_EGRESS` allowed for that VM.
+        Off by default: the image pins agy because Omnigent's bridge
+        drives agy's screen, and a newer agy can draw it differently.
+        See :func:`agy.build_update_script`.
 
     Credentials are NOT handled here. ``sbx``'s host-side proxy injects
     them into the agent's outbound API calls from its own secret store
@@ -433,6 +438,7 @@ class SbxLauncher(ExecModelHostLauncher):
         agy_gcp_project: str | None = None,
         agy_gcp_location: str = 'us',
         claude_version: str | None = None,
+        agy_update: bool = False,
     ) -> None:
         self._image = image
         self._profile = profile
@@ -451,6 +457,7 @@ class SbxLauncher(ExecModelHostLauncher):
             None if claude_version is None
             else claude.validate_claude_version(claude_version)
         )
+        self._agy_update = agy_update
 
     def prepare(self) -> None:
         """
@@ -623,11 +630,15 @@ class SbxLauncher(ExecModelHostLauncher):
         self._apply_egress(
             sandbox_id,
             server_url,
-            extra=codex.CODEX_EGRESS if credential == 'codex' else (),
+            extra=self._harness_egress(credential),
         )
         # Seed ONLY the credential this VM's own sentinel names — never
         # a Claude VM, and never the wrong harness's credential.
         if credential == 'agy':
+            # After egress, which the update needs; before the host, so
+            # the session's agy is the updated one.
+            if self._agy_update:
+                self._update_agy(sandbox_id)
             self._inject_agy_credentials(sandbox_id)
         elif credential == 'codex':
             self._inject_codex_credentials(sandbox_id)
@@ -1098,6 +1109,62 @@ class SbxLauncher(ExecModelHostLauncher):
                 f'dialog in {name!r} (exit {proc.returncode}): '
                 f'{detail[-800:]}'
             )
+
+    def _harness_egress(self, credential: str | None) -> tuple[str, ...]:
+        """
+        The hosts one harness's VM needs beyond the shared allowlist.
+
+        :param credential: The VM's credential kind from its sentinel:
+            ``'codex'``, ``'agy'``, or ``None`` for Claude.
+        :returns: Codex's auth hosts for a Codex VM; agy's updater hosts
+            for an agy VM when ``agy_update`` is on; otherwise none.
+        """
+        if credential == 'codex':
+            return codex.CODEX_EGRESS
+        if credential == 'agy' and self._agy_update:
+            return agy.UPDATE_EGRESS
+        return ()
+
+    def _update_agy(self, name: str) -> None:
+        """
+        Update the VM's agy to its latest release.
+
+        The host image pins agy, and Omnigent passes the model through
+        unchecked, so an agy older than a model serves a different one
+        without error: ``gemini-4-argon-high`` ran as Gemini 3.8 Flash
+        on the image's 1.1.16. Updating before the host starts means
+        the first turn already runs the new agy.
+
+        Fail-loud, like the Claude pin: a VM left on the old agy would
+        quietly serve a model nobody asked for.
+
+        :param name: The agy sandbox to update.
+        :raises click.ClickException: If the update cannot run, fails,
+            or leaves agy reporting no version.
+        :raises sbx_cli.SbxNotResponding: If it does not finish within
+            :data:`sbx_cli.INSTALL_TIMEOUT_S`.
+        """
+        try:
+            proc = sbx_cli.run(
+                ['sbx', 'exec', name, '--', 'sh', '-c',
+                 agy.build_update_script()],
+                timeout_s=sbx_cli.INSTALL_TIMEOUT_S,
+            )
+        except OSError as exc:
+            raise click.ClickException(
+                f'failed to update agy in {name!r}: {exc}'
+            ) from exc
+        out = proc.stdout or ''
+        if proc.returncode != 0 or agy.UPDATE_OK_MARKER not in out:
+            detail = (out + (proc.stderr or '')).strip()
+            raise click.ClickException(
+                f'failed to update agy in {name!r} (rc={proc.returncode}). '
+                f"Turn off 'sandbox.sbx.agy_update' to run the image's "
+                f'agy instead: {detail[-800:]}'
+            )
+        versions = out.split(agy.UPDATE_OK_MARKER, 1)[1].split()
+        before, after = [*versions, '?', '?'][:2]
+        _logger.info('agy updated in %s: %s -> %s', name, before, after)
 
     def _pin_claude_version(self, name: str) -> None:
         """
