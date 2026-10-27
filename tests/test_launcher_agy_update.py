@@ -43,7 +43,8 @@ class _Base(unittest.TestCase):
 
     def _launcher(self, update: bool = True) -> SbxLauncher:
         return SbxLauncher(
-            worktree_root=self.root, agy_enabled=True, agy_update=update
+            worktree_root=self.root, agy_enabled=True, agy_update=update,
+            agy_gcp_project='proj-1',
         )
 
     def _start(
@@ -64,6 +65,9 @@ class _Base(unittest.TestCase):
             steps.append('_apply_egress')
             extras.append(tuple(extra))
 
+        def launch(*_a: object, adc: bool = False, **_k: object) -> None:
+            steps.append('_launch_host' + (' (adc)' if adc else ''))
+
         with (
             mock.patch.object(launcher, '_create_sandbox'),
             mock.patch.object(launcher, '_apply_egress', side_effect=egress),
@@ -72,7 +76,7 @@ class _Base(unittest.TestCase):
             note('_inject_codex_credentials'),
             note('_pin_claude_version'),
             note('_seed_claude_settings'),
-            note('_launch_host'),
+            mock.patch.object(launcher, '_launch_host', side_effect=launch),
         ):
             launcher.start_host(
                 'box', token='t', host_id='h', host_name='n',
@@ -92,7 +96,7 @@ class TestOnlyAgyVmsAreUpdated(_Base):
             steps.index('_apply_egress'), steps.index('_update_agy')
         )
         self.assertLess(
-            steps.index('_update_agy'), steps.index('_launch_host')
+            steps.index('_update_agy'), steps.index('_launch_host (adc)')
         )
 
     def test_an_agy_vm_gets_the_updater_hosts_per_vm(self) -> None:
@@ -180,6 +184,75 @@ class TestTheUpdateStep(_Base):
         ):
             with self.assertRaises(sbx_cli.SbxNotResponding):
                 self._launcher()._update_agy('box')
+
+
+class TestTheHostSignsAgyInThroughAdc(_Base):
+    """agy 1.4.x reads no token file, so an updated agy VM's host starts
+    the metadata stand-in and passes the ADC env through to agy."""
+
+    def test_only_an_updated_agy_vm_launches_with_adc(self) -> None:
+        for mode, update, adc in (
+            ('rw-agy', True, True), ('ro-agy', True, True),
+            ('rw-agy', False, False), ('rw', True, False),
+            ('rw-codex', True, False),
+        ):
+            with self.subTest(mode=mode, update=update):
+                steps, _extras = self._start(self._launcher(update), mode)
+                self.assertIn(
+                    '_launch_host (adc)' if adc else '_launch_host', steps
+                )
+
+    def _remote(self, *, adc: bool) -> str:
+        launcher = self._launcher()
+        with mock.patch(
+            'sbx_omnigent.launcher.subprocess.Popen'
+        ) as popen, mock.patch(
+            'sbx_omnigent.launcher._retain_host_process'
+        ):
+            launcher._launch_host(
+                'box', token='t', host_id='h', host_name='n',
+                server_url='http://host.docker.internal:6767', adc=adc,
+            )
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[:5], ['sbx', 'exec', 'box', '--', 'sh'])
+        return argv[-1]
+
+    def test_the_stand_in_starts_in_the_hosts_own_session(self) -> None:
+        # A separate `sbx exec` would be reaped when it returns, so the
+        # stand-in shares the long-lived exec that keeps the host alive.
+        remote = self._remote(adc=True)
+        stub = remote.index('python3 -c')
+        self.assertLess(stub, remote.index('omnigent host'))
+        self.assertIn(str(agy.ADC_METADATA_PORT), remote)
+        self.assertIn('&', remote[stub:remote.index('omnigent host')])
+
+    def test_the_adc_env_reaches_the_harness(self) -> None:
+        remote = self._remote(adc=True)
+        for name, value in agy.adc_launch_env('proj-1'):
+            with self.subTest(name=name):
+                self.assertIn(f'{name}={value}', remote)
+        passthrough = next(
+            part for part in remote.split()
+            if part.startswith('OMNIGENT_RUNNER_ENV_PASSTHROUGH=')
+        )
+        for name, _value in agy.adc_launch_env('proj-1'):
+            self.assertIn(name, passthrough)
+        self.assertIn('HTTPS_PROXY', passthrough)
+
+    def test_a_plain_launch_has_neither(self) -> None:
+        remote = self._remote(adc=False)
+        self.assertNotIn('python3 -c', remote)
+        self.assertNotIn('AGY_ADC_AUTH', remote)
+
+    def test_adc_without_a_project_fails_loudly(self) -> None:
+        launcher = SbxLauncher(
+            worktree_root=self.root, agy_enabled=True, agy_update=True
+        )
+        with self.assertRaises(click.ClickException):
+            launcher._launch_host(
+                'box', token='t', host_id='h', host_name='n',
+                server_url='http://host.docker.internal:6767', adc=True,
+            )
 
 
 if __name__ == '__main__':

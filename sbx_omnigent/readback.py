@@ -79,9 +79,13 @@ _CODEX_HEADER = re.compile(
 )
 
 #: agy names the SERVED model in its banner and status bar, e.g.
-#: ``Gemini 3.6 Flash (High)`` or ``Gemini 3.7 Flash · high``.
+#: ``Gemini 3.6 Flash (High)``, ``Gemini 3.7 Flash · high`` or
+#: ``Gemini 4 Argon (High)``. The families are listed rather than
+#: matched as any word: the pattern is case-insensitive, and a task
+#: mentioning "Gemini 3 models" must not read as a banner.
 _AGY_MODEL = re.compile(
-    r'\bGemini\s+([\d.]+)\s+(Flash|Pro)\b(?:\s*[(·]\s*(low|medium|high)\)?)?',
+    r'\bGemini\s+([\d.]+)\s+(Flash|Pro|Argon)\b'
+    r'(?:\s*[(·]\s*(low|medium|high)\)?)?',
     re.I,
 )
 
@@ -217,10 +221,12 @@ def _agy_mismatches(pane: str, model: str | None) -> list[str]:
     served = agy_model(pane)
     if served is None or served == _fold(model):
         return []
+    shown = _AGY_MODEL.search(pane)
+    label = f' ({shown.group(0).strip()!r})' if shown else ''
     return [
         f'model: asked for {model!r}, but the pane reports a DIFFERENT '
-        f'model serving this session. agy accepts an unavailable model '
-        f'id without error and quietly serves a nearby one.'
+        f'model serving this session{label}. agy accepts an unavailable '
+        f'model id without error and quietly serves a nearby one.'
     ]
 
 

@@ -624,6 +624,94 @@ UPDATE_EGRESS: tuple[str, ...] = (
 )
 
 
+#: Loopback port the in-VM metadata stand-in listens on (see
+#: :func:`build_metadata_stub`). Fixed so the launch env can name it.
+ADC_METADATA_PORT = 18089
+
+_METADATA_STUB = r"""
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+TOKEN = json.dumps({{
+    'access_token': {token!r}, 'expires_in': 3599, 'token_type': 'Bearer',
+}}).encode()
+TEXT = {{
+    '/computeMetadata/v1/project/project-id': {project!r},
+    '/computeMetadata/v1/instance/service-accounts/default/email': 'default',
+    '/computeMetadata/v1/instance/service-accounts/default/scopes':
+        'https://www.googleapis.com/auth/cloud-platform\n',
+}}
+TOKEN_PATH = '/computeMetadata/v1/instance/service-accounts/default/token'
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype):
+        self.send_response(code)
+        self.send_header('Metadata-Flavor', 'Google')
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.headers.get('Metadata-Flavor') != 'Google':
+            return self._send(403, b'missing Metadata-Flavor', 'text/plain')
+        path = self.path.split('?', 1)[0]
+        if path == TOKEN_PATH:
+            return self._send(200, TOKEN, 'application/json')
+        if path in TEXT:
+            return self._send(200, TEXT[path].encode(), 'application/text')
+        return self._send(404, b'not found', 'text/plain')
+
+    def log_message(self, *args):
+        pass
+
+
+HTTPServer(('127.0.0.1', {port}), Handler).serve_forever()
+"""
+
+
+def build_metadata_stub(project: str, *, port: int = ADC_METADATA_PORT) -> str:
+    """
+    The in-VM metadata stand-in agy 1.4.x signs in through.
+
+    agy 1.4.x dropped the token file the placeholder used to be seeded
+    into: it keeps sign-in in the OS keyring, or an encrypted file
+    store without one. With ``AGY_ADC_AUTH`` it instead asks Google's
+    auth library for Application Default Credentials, which reads a
+    token from the metadata server ``GCE_METADATA_HOST`` names. This
+    serves the SAME inert :data:`PLACEHOLDER_TOKEN`; sbx's proxy swaps
+    the real token in on the wire, so nothing real ever exists inside
+    the VM. Proven on 2026-10-25: agy 1.4.7 served ``gemini-4-argon``
+    through Vertex.
+
+    Binds loopback only, and refuses a request without the
+    ``Metadata-Flavor: Google`` header, as the real server does.
+
+    :param project: The GCP project id agy runs against.
+    :param port: Loopback port to listen on.
+    :returns: A ``python3 -c`` program that serves until killed.
+    """
+    return _METADATA_STUB.format(
+        token=PLACEHOLDER_TOKEN, project=project, port=int(port)
+    )
+
+
+def adc_launch_env(project: str) -> tuple[tuple[str, str], ...]:
+    """
+    The env that makes agy 1.4.x sign in through the metadata stand-in.
+
+    :param project: The GCP project id agy runs against.
+    :returns: ``(name, value)`` pairs for the host launch env.
+    """
+    return (
+        ('AGY_ADC_AUTH', 'true'),
+        ('GCE_METADATA_HOST', f'127.0.0.1:{ADC_METADATA_PORT}'),
+        ('GOOGLE_CLOUD_PROJECT', project),
+        ('ANTIGRAVITY_PROJECT_ID', project),
+    )
+
+
 def build_update_script() -> str:
     """
     The in-VM shell program that updates agy to its latest release.

@@ -674,6 +674,9 @@ class SbxLauncher(ExecModelHostLauncher):
             host_id=host_id,
             host_name=host_name,
             server_url=server_url,
+            # An updated agy (1.4.x) reads no token file; it signs in
+            # through the metadata stand-in instead.
+            adc=credential == 'agy' and self._agy_update,
         )
         return worktree
 
@@ -1267,6 +1270,7 @@ class SbxLauncher(ExecModelHostLauncher):
         host_id: str,
         host_name: str,
         server_url: str,
+        adc: bool = False,
     ) -> None:
         """
         Start ``omnigent host`` in the sandbox with its identity+token.
@@ -1282,6 +1286,11 @@ class SbxLauncher(ExecModelHostLauncher):
         :param host_id: Server-chosen host id.
         :param host_name: Server-chosen host name.
         :param server_url: URL the host dials back to.
+        :param adc: Start :func:`agy.build_metadata_stub` beside the
+            host and pass :func:`agy.adc_launch_env` through to agy, for
+            an agy VM whose agy was updated (see ``agy_update``).
+        :raises click.ClickException: If *adc* is set without a GCP
+            project to sign in against.
         """
         env_prefix = ' '.join(
             f'{key}={shlex.quote(value)}'
@@ -1291,9 +1300,26 @@ class SbxLauncher(ExecModelHostLauncher):
                 (HOST_NAME_ENV_VAR, host_name),
             )
         )
+        command = (
+            f'{env_prefix} omnigent host --server {shlex.quote(server_url)}'
+        )
+        if not adc:
+            self.run_background(sandbox_id, command)
+            return
+        project = self._agy_gcp_project
+        if not project:
+            raise click.ClickException(
+                f'cannot sign agy in for {sandbox_id!r}: an updated agy '
+                f"signs in through a GCP project, and "
+                f"'sandbox.sbx.agy_gcp_project' is not set"
+            )
         self.run_background(
             sandbox_id,
-            f'{env_prefix} omnigent host --server {shlex.quote(server_url)}',
+            command,
+            background=(
+                f'python3 -c {shlex.quote(agy.build_metadata_stub(project))}'
+            ),
+            extra_env=agy.adc_launch_env(project),
         )
 
     def run(
@@ -1353,7 +1379,9 @@ class SbxLauncher(ExecModelHostLauncher):
                 return urlparse(tokens[idx + 1]).hostname
         return None
 
-    def _proxy_launch_assignments(self, command: str) -> list[str]:
+    def _proxy_launch_assignments(
+        self, command: str, *, extra_names: Sequence[str] = ()
+    ) -> list[str]:
         """
         Build ``env`` assignments that forward sbx's proxy to agents.
 
@@ -1367,6 +1395,8 @@ class SbxLauncher(ExecModelHostLauncher):
 
         :param command: The host launch command (parsed for
             ``--server``).
+        :param extra_names: More env var names for the runner to pass
+            through to the harness.
         :returns: A list of ``NAME=value`` assignment tokens
             (shell-quoted) to place on the ``env`` line.
         """
@@ -1375,7 +1405,7 @@ class SbxLauncher(ExecModelHostLauncher):
         if host and host not in bypass:
             bypass.append(host)
         no_proxy = ','.join(bypass)
-        names = ','.join(_PROXY_PASSTHROUGH_VARS)
+        names = ','.join((*_PROXY_PASSTHROUGH_VARS, *extra_names))
         return [
             f'NO_PROXY={shlex.quote(no_proxy)}',
             f'no_proxy={shlex.quote(no_proxy)}',
@@ -1388,6 +1418,8 @@ class SbxLauncher(ExecModelHostLauncher):
         command: str,
         *,
         log_path: str = '/tmp/omnigent-host.log',
+        background: str | None = None,
+        extra_env: Sequence[tuple[str, str]] = (),
     ) -> RemoteCommandResult:
         """
         Launch omnigent host so it survives the launching session.
@@ -1404,6 +1436,13 @@ class SbxLauncher(ExecModelHostLauncher):
             ``HOST_*`` identity/token assignments from ``start_host``.
         :param log_path: In-VM file the host's output is written to
             (inspect with ``sbx exec <id> -- cat <log_path>``).
+        :param background: A command started in the background of the
+            same session first, so it lives exactly as long as the host
+            (a separate ``sbx exec`` would be reaped when it returned).
+            Its output goes to ``<log_path>.background``.
+        :param extra_env: ``(name, value)`` pairs set on the host and
+            named in ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``, so the runner
+            hands them on to the harness.
         :returns: A synthetic ``launched`` result.
         """
         # Wrap the launch in ``env`` to (1) drop inherited vars via
@@ -1415,9 +1454,17 @@ class SbxLauncher(ExecModelHostLauncher):
         # sbx-hosted launch, so the wrapper is unconditional.
         env_parts = ['env']
         env_parts += [f'-u {shlex.quote(name)}' for name in self._unset_env]
-        env_parts += self._proxy_launch_assignments(command)
+        env_parts += self._proxy_launch_assignments(
+            command, extra_names=[name for name, _value in extra_env]
+        )
+        env_parts += [
+            f'{name}={shlex.quote(value)}' for name, value in extra_env
+        ]
         launch = ' '.join(env_parts) + ' ' + command
         remote = f'{launch} > {shlex.quote(log_path)} 2>&1 < /dev/null'
+        if background is not None:
+            bg_log = shlex.quote(f'{log_path}.background')
+            remote = f'{background} > {bg_log} 2>&1 < /dev/null & {remote}'
         proc = subprocess.Popen(
             ['sbx', 'exec', sandbox_id, '--', 'sh', '-c', remote],
             stdout=subprocess.PIPE,
