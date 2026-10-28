@@ -55,6 +55,18 @@ AGY_SERVED_36 = (
 )
 AGY_STATUS_37 = '? for shortcuts                    Gemini 3.7 Flash · high'
 
+#: agy 1.4.8 serving Gemini 4 Argon, as captured from a pipeline VM on
+#: 2026-10-25 (identity lines replaced with placeholders).
+AGY_SERVED_ARGON = (
+    '      ▄▀▀▄        Antigravity CLI 1.4.8\n'
+    '     ▀▀▀▀▀▀       ADC: user@example.com (Agent Platform)\n'
+    '    ▀▀▀▀▀▀▀▀      GCP Project: example-project\n'
+    '   ▄▀▀    ▀▀▄     Gemini 4 Argon (High)\n'
+)
+AGY_STATUS_ARGON = 'esc to cancel                        Gemini 4 Argon · high'
+#: The image's agy 1.1.16 asked for Argon: it served 3.8 Flash instead.
+AGY_STATUS_38 = 'esc to cancel                    Gemini 3.8 Flash · high'
+
 
 class TestClaudeMode(unittest.TestCase):
     def test_each_mode_is_read_off_the_footer(self) -> None:
@@ -143,6 +155,18 @@ class TestAgyModel(unittest.TestCase):
             rb.agy_model(AGY_SERVED_36), rb._fold('gemini-3.6-flash-high')
         )
 
+    def test_an_argon_banner_is_read(self) -> None:
+        # It was not: the family list stopped at Flash and Pro, so a
+        # fallback from Argon went unflagged.
+        for pane in (AGY_SERVED_ARGON, AGY_STATUS_ARGON):
+            with self.subTest(pane=pane[-30:]):
+                self.assertEqual(
+                    rb.agy_model(pane), rb._fold('gemini-4-argon-high')
+                )
+
+    def test_prose_mentioning_gemini_is_not_a_banner(self) -> None:
+        self.assertIsNone(rb.agy_model('compare against Gemini 3 models'))
+
 
 class TestLaunchMismatches(unittest.TestCase):
     """The four live failures, each caught by its own harness's pane."""
@@ -165,6 +189,26 @@ class TestLaunchMismatches(unittest.TestCase):
         )
         self.assertTrue(why)
         self.assertIn('reasoning effort', why[0])
+
+    def test_argon_falling_back_is_caught_and_names_the_served_model(
+        self,
+    ) -> None:
+        why = rb.launch_mismatches(
+            'antigravity-native', AGY_STATUS_38, model='gemini-4-argon-high'
+        )
+        self.assertTrue(why)
+        self.assertIn('Gemini 3.8 Flash', why[0])
+
+    def test_argon_served_as_asked_is_not_flagged(self) -> None:
+        for pane in (AGY_SERVED_ARGON, AGY_STATUS_ARGON):
+            with self.subTest(pane=pane[-30:]):
+                self.assertEqual(
+                    rb.launch_mismatches(
+                        'antigravity-native', pane,
+                        model='gemini-4-argon-high',
+                    ),
+                    [],
+                )
 
     def test_agy_serving_a_different_model_is_caught(self) -> None:
         # Asked for 3.7, the pane and the model itself said 3.6.

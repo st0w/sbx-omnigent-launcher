@@ -322,7 +322,9 @@ sandbox:
 ```
 
 `agy_update` is for a model newer than the image's agy, which would otherwise be
-served by a different model without an error. See
+served by a different model without an error. It needs `agy_gcp_project`: agy 1.4.x
+has no token file, so an updated VM signs in through Application Default Credentials
+and a loopback metadata stand-in that serves the same inert placeholder. See
 [`HARNESS-VERSIONS.md`](./HARNESS-VERSIONS.md#updating-agy-sbxagy_update) for
 what it costs.
 

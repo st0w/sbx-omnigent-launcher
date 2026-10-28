@@ -367,15 +367,20 @@ def _global_allow_rules(stdout: str) -> list[tuple[str, int]] | None:
     return found
 
 
-def _as_agy_update(value: object, agy_enabled: bool) -> bool:
+def _as_agy_update(
+    value: object, agy_enabled: bool, gcp_project: str | None
+) -> bool:
     """
     Resolve ``sbx.agy_update``: whether agy VMs update agy at start.
 
     :param value: Raw config value; ``None`` is off.
     :param agy_enabled: Whether ``sbx.agy_enabled`` is on.
+    :param gcp_project: ``sbx.agy_gcp_project``. An updated agy signs in
+        through Application Default Credentials against it, the only
+        route verified for agy 1.4.x.
     :returns: Whether to update.
     :raises ValueError: If it is not a boolean, or is on without agy
-        enabled, where there are no agy VMs for it to update.
+        enabled (there are no agy VMs to update) or without a project.
     """
     update = _as_bool(value, 'sbx.agy_update')
     if update and not agy_enabled:
@@ -384,6 +389,13 @@ def _as_agy_update(value: object, agy_enabled: bool) -> bool:
             "'sandbox.sbx.agy_enabled: true': it updates agy in agy VMs, "
             'and without agy enabled there are none. Remove it, or '
             'enable agy.'
+        )
+    if update and not gcp_project:
+        raise ValueError(
+            "server config 'sandbox.sbx.agy_update' needs "
+            "'sandbox.sbx.agy_gcp_project': an updated agy signs in "
+            'through Application Default Credentials against a GCP '
+            'project, and that is the only sign-in verified for it.'
         )
     return update
 
@@ -574,7 +586,9 @@ def _build_sbx_config(raw: dict[str, Any]) -> ManagedSandboxConfig:
     )
     if agy_enterprise:
         install_agy_enterprise_onboarding_patch()
-    agy_update = _as_agy_update(sbx.get('agy_update'), agy_enabled)
+    agy_update = _as_agy_update(
+        sbx.get('agy_update'), agy_enabled, agy_gcp_project
+    )
     claude_version = _as_claude_version(
         sbx.get('claude_version'), egress_allow
     )

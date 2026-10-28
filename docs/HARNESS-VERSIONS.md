@@ -165,13 +165,30 @@ as `Gemini 3.8 Flash (High)` on the image's agy 1.1.16. The launch check flags i
 sandbox:
   sbx:
     agy_enabled: true
-    agy_update: true    # default false
+    agy_gcp_project: <gcp-project-id>   # required with agy_update
+    agy_update: true                    # default false
 ```
 
 With it set, every agy VM runs `agy update` after its egress is applied and before
 its host starts, and fails the VM loudly if the update fails. On 2026-10-25 that
 took the image's 1.1.16 to 1.4.7 in 8 seconds. Claude and Codex VMs are
 untouched.
+
+**How an updated agy signs in.** agy 1.4.x dropped the token file the inert
+placeholder is seeded into: it keeps sign-in in the OS keyring, or an encrypted file
+store without one, so a placeholder can't be planted. It can instead use Google's
+Application Default Credentials (`AGY_ADC_AUTH`), which fetch a token from the
+metadata server `GCE_METADATA_HOST` names. So an updated agy VM's host also starts a
+small metadata stand-in on `127.0.0.1:18089`, in the same session as the host. It
+serves the **same inert placeholder**, and sbx swaps the real token in on the wire as
+before; the trusted box, the harvester and the swap secret are unchanged.
+
+- The host passes `AGY_ADC_AUTH`, `GCE_METADATA_HOST`, `GOOGLE_CLOUD_PROJECT` and
+  `ANTIGRAVITY_PROJECT_ID` through to agy. Requests go to Vertex AI in
+  `agy_gcp_project`, so `agy_update` needs it and is refused without it.
+- Proven on 2026-10-25 outside Omnigent: agy 1.4.7 signed in this way and served
+  `gemini-4-argon` (`models/gemini-4-argon:streamGenerateContent`, read from agy's
+  own log).
 
 - **It's off by default for a reason.** Omnigent pins agy because its bridge drives
   agy's screen, and a newer agy can draw it differently. Run a small pipeline with

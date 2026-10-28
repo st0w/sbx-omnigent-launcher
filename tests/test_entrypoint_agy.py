@@ -72,16 +72,29 @@ class TestAgyUpdateConfig(unittest.TestCase):
         self.assertFalse(_launcher({'agy_enabled': True})._agy_update)
 
     def test_true_reaches_the_launcher(self) -> None:
-        launcher = _launcher({'agy_enabled': True, 'agy_update': True})
+        launcher = _launcher({
+            'agy_enabled': True, 'agy_update': True,
+            'agy_gcp_project': 'p-1',
+        })
         self.assertTrue(launcher._agy_update)
+
+    def test_refused_without_a_gcp_project(self) -> None:
+        # An updated agy signs in through Application Default
+        # Credentials against a GCP project; nothing else is verified.
+        with self.assertRaises(ValueError) as caught:
+            _build_sbx_config(
+                _cfg({'agy_enabled': True, 'agy_update': True})
+            )
+        self.assertIn('agy_gcp_project', str(caught.exception))
 
     def test_rejects_non_bool(self) -> None:
         for bad in ('yes', 1, 'true'):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
-                    _build_sbx_config(
-                        _cfg({'agy_enabled': True, 'agy_update': bad})
-                    )
+                    _build_sbx_config(_cfg({
+                        'agy_enabled': True, 'agy_update': bad,
+                        'agy_gcp_project': 'p-1',
+                    }))
 
     def test_refused_without_agy_enabled(self) -> None:
         # With no agy VMs it would update nothing, so a config that
