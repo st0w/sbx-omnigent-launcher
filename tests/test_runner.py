@@ -1205,6 +1205,122 @@ class TestAWriterDisputeHaltsTheRun(_Base):
         self.assertIn('cannot both hold', str(caught.exception))
 
 
+#: The shape #50 proposes: a read-only check between the tests stage and
+#: the writers who build against it.
+_CONTRACT_CHECK = """\
+name: contractcheck
+repo: ./proj
+publish: none
+task: |
+  build parse_ports
+acceptance: |
+  handles ranges
+agents:
+  plan: {template: planner, model: claude-sonnet-5}
+  tw: {template: tdd-writer, model: claude-sonnet-5}
+  check: {template: bug-reviewer, model: claude-sonnet-5}
+  build: {template: coder, model: claude-sonnet-5}
+stages:
+  - {id: plan, run: plan}
+  - {id: tests, run: tw, write: true, needs: [plan]}
+  - {id: check, run: check, needs: [tests]}
+  - {id: build, run: build, write: true, from: tests, needs: [plan, check]}
+"""
+
+_CONTRACT_CHECK_REPLIES = {
+    'plan': 'P', 'tests': 't', 'check': 'the contract holds', 'build': 'b',
+}
+
+
+class TestAReaderDisputeHaltsTheRun(_Base):
+    """
+    A READER saying the contract cannot be satisfied stops the run too.
+
+    Every reader turn ends with the instruction to stop on a
+    `DISPUTED:` line when a conflict cannot be resolved, and nothing
+    read it: a reader that did exactly as told was ignored, and the
+    writers built against the contract it had just disputed. A
+    read-only check before the writers (#50) or after the plan (#49)
+    is only worth running if its dispute stops the run.
+    """
+
+    _DISPUTE = (
+        'DISPUTED: tests/test_ports.py:12 requires a range the brief '
+        'forbids.'
+    )
+
+    def _halted(self, sc=None) -> R.PipelineRunError:
+        replies = {**_CONTRACT_CHECK_REPLIES, 'check': self._DISPUTE}
+        with self.assertRaises(R.PipelineRunError) as caught:
+            self._run(_CONTRACT_CHECK, replies, sc=sc)
+        return caught.exception
+
+    def test_a_reader_dispute_halts_the_run(self) -> None:
+        message = str(self._halted())
+        self.assertTrue(message.startswith('check: '), message)
+        self.assertIn('requires a range the brief forbids', message)
+
+    def test_no_writer_builds_against_the_disputed_contract(self) -> None:
+        # Its VM may be warm already (it boots during plan approval),
+        # but it is never given a turn.
+        sc = FakeSC({**_CONTRACT_CHECK_REPLIES, 'check': self._DISPUTE})
+        self._halted(sc)
+        self.assertEqual(sc.message_for_label('build'), '')
+        self.assertNotEqual(sc.message_for_label('check'), '')
+
+    def test_the_disputing_reader_s_reply_is_captured(self) -> None:
+        # The claim is one line; the reasoning is the rest of the reply,
+        # and the halt disposes the VM that holds it.
+        wt = FakeWT()
+        sc = FakeSC({**_CONTRACT_CHECK_REPLIES, 'check': self._DISPUTE})
+        sc.transcript_for_label['check'] = [
+            ('assistant', self._DISPUTE),
+            ('assistant', 'The brief says ranges are inclusive; line 12 '
+                          'asserts the upper bound is excluded.'),
+        ]
+        with self.assertRaises(R.PipelineRunError):
+            self._run(_CONTRACT_CHECK, {}, wt=wt, sc=sc)
+        doc = wt.artifacts['turns/check.md']
+        self.assertIn('upper bound is excluded', doc)
+        self.assertIn('dispute', doc.lower())
+
+    def test_a_reader_with_no_dispute_runs_on(self) -> None:
+        result, _sc, _wt = self._run(
+            _CONTRACT_CHECK, dict(_CONTRACT_CHECK_REPLIES)
+        )
+        self.assertEqual(result.status, 'completed')
+
+    def test_an_echo_of_the_instruction_does_not_halt(self) -> None:
+        # The bare word is in almost every healthy report.
+        result, _sc, _wt = self._run(
+            _CONTRACT_CHECK,
+            {
+                **_CONTRACT_CHECK_REPLIES,
+                'check': 'Nothing here is DISPUTED; the contract holds.',
+            },
+        )
+        self.assertEqual(result.status, 'completed')
+
+    def test_a_near_miss_is_reported_not_halted_on(self) -> None:
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            result, _sc, _wt = self._run(
+                _CONTRACT_CHECK,
+                {**_CONTRACT_CHECK_REPLIES, 'check': _NEAR_MISS_REPLY},
+            )
+        self.assertEqual(result.status, 'completed')
+        printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
+        self.assertIn('[dispute] check:', printed)
+
+    def test_a_planner_is_not_held_to_it(self) -> None:
+        # The planner is never told about the marker, and it talks to
+        # a human, who approves or corrects the plan.
+        result, _sc, _wt = self._run(
+            _CONTRACT_CHECK,
+            {**_CONTRACT_CHECK_REPLIES, 'plan': 'DISPUTED: x\nPLAN'},
+        )
+        self.assertEqual(result.status, 'completed')
+
+
 class TestADisputeHaltsInsteadOfReDriving(_Base):
     """
     A stage saying its CONTRACT is impossible stops the run.

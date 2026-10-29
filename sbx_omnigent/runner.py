@@ -7052,6 +7052,8 @@ class PipelineRunner:
             stage.id, 'reader', worktree=wt, session=session, output=out
         )
         self._nodes[stage.id] = node
+        if not self._is_planner(stage):
+            self._halt_on_reader_dispute(stage)
         if self._is_planner(stage):
             in_module = self._active_subtask is not None
             if self._interactive_plan:
@@ -8342,24 +8344,10 @@ class PipelineRunner:
         :param stage: The writer stage that just finished.
         :raises PipelineRunError: When the writer raised a dispute.
         """
-        node = self._nodes.get(stage.id)
-        output = node.output if node else None
-        claims = parse_disputes(output)
+        claims = self._stage_disputes(stage, 'disputed its own contract')
         if not claims:
-            self._warn_dispute_near_miss(stage.id, output)
             return
         listed = '\n'.join(f'  {claim}' for claim in claims)
-        # The claim after the marker is one line. The REASONING that
-        # makes it actionable — which test, which two clauses, why no
-        # code satisfies both — is the rest of the reply, and this
-        # stage is about to end the run and dispose the VM. Capture
-        # before raising, the same reason `_await_plan_approval` does.
-        # Live on `ingestion-m2-5` this was missing: the halt fired
-        # correctly and the human was left with "m2 cannot be marked
-        # complete under the binding constraints" and no way to learn
-        # why.
-        if node is not None and node.session:
-            self._capture_turn(node.session, 'disputed its own contract')
         raise PipelineRunError(
             f'{stage.id}: the writer raised {len(claims)} dispute(s) — it '
             f'says its own contract is impossible, not that its code is '
@@ -8371,6 +8359,70 @@ class PipelineRunner:
             f'in the run directory under turns/; read it, settle the '
             f'contract, and re-run.'
         )
+
+    def _halt_on_reader_dispute(self, stage: pipeline.PipelineStage) -> None:
+        """
+        Stop when a READER says the contract cannot be satisfied.
+
+        Every reader turn ends with :data:`_UNATTENDED`, which tells it
+        to stop on a ``DISPUTED:`` line when a conflict cannot be
+        resolved, and nothing read it: a reader that did as told was
+        ignored, and the writers after it built against the contract it
+        had just disputed. A read-only check of the tests before the
+        writers (#50), or of the plan's claims after it (#49), is only
+        worth running if its dispute stops the run.
+
+        Called before the stage completes, so a resume runs the reader
+        again once the contract is settled. Not for the planner: it is
+        never told about the marker, and a human approves its plan.
+
+        :param stage: The reader stage that just finished.
+        :raises PipelineRunError: When the reader raised a dispute.
+        """
+        claims = self._stage_disputes(stage, 'disputed the contract')
+        if not claims:
+            return
+        listed = '\n'.join(f'  {claim}' for claim in claims)
+        raise PipelineRunError(
+            f'{stage.id}: the reader raised {len(claims)} dispute(s) — it '
+            f'says the contract the stages after it would build on cannot '
+            f'be satisfied:\n\n{listed}\n\nNothing after {stage.id} has '
+            f'run. Its full reply is in the run directory under turns/; '
+            f'read it, settle the contract, and re-run. A --resume runs '
+            f'{stage.id} again.'
+        )
+
+    def _stage_disputes(
+        self, stage: pipeline.PipelineStage, captured_as: str
+    ) -> tuple[str, ...]:
+        """
+        The disputes in a finished stage's reply, its reply captured.
+
+        Warns on a near miss and returns nothing, so the caller only
+        has to word its halt.
+
+        :param stage: The writer or reader stage that just finished.
+        :param captured_as: Why the turn is captured, for its record.
+        :returns: The claims, or ``()`` when there are none.
+        """
+        node = self._nodes.get(stage.id)
+        output = node.output if node else None
+        claims = parse_disputes(output)
+        if not claims:
+            self._warn_dispute_near_miss(stage.id, output)
+            return ()
+        # The claim after the marker is one line. The REASONING that
+        # makes it actionable — which test, which two clauses, why no
+        # code satisfies both — is the rest of the reply, and this
+        # stage is about to end the run and dispose the VM. Capture
+        # before raising, the same reason `_await_plan_approval` does.
+        # Live on `ingestion-m2-5` this was missing: the halt fired
+        # correctly and the human was left with "m2 cannot be marked
+        # complete under the binding constraints" and no way to learn
+        # why.
+        if node is not None and node.session:
+            self._capture_turn(node.session, captured_as)
+        return claims
 
     def _halt_on_dispute(
         self,
