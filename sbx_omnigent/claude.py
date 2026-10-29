@@ -60,10 +60,10 @@ CLAUDE_NATIVE_HARNESSES: frozenset[str] = frozenset(
 #:
 #: Omnigent starts Claude Code inside tmux and passes the agent's
 #: instructions on that command line (``--append-system-prompt
-#: <text>``); v0.13.0 and v0.19.1 both do. tmux 3.5a refuses a command
-#: over about 16,329 bytes (measured in a v0.13.0 guest), and the same
-#: command also carries an inline
-#: MCP config, tool lists and the model and permission flags. Over the
+#: <text>``); v0.13.0, v0.19.1 and v0.20.0 all do. tmux 3.5a refuses a
+#: command over about 16,329 bytes (measured in a v0.13.0 guest), and
+#: the same command also carries an inline MCP config, tool lists and
+#: the model and permission flags. Over the
 #: limit the terminal never starts, and the run fails with
 #: ``failed: None``. Observed: 13,584 bytes launched; 16,763 and 17,719
 #: did not. This leaves about 2 KB for the rest of the command.
