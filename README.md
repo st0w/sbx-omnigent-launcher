@@ -500,11 +500,19 @@ real token is short-lived (~1h), so one **trusted auth-agy box** holds the
 *only* refresh token and self-refreshes; the host-side `omni-sbx-agy` helper
 keeps the swap secret's value current.
 
-The swap secret is scoped to `**.googleapis.com` (plus `*.googleapis.com` and
-the explicit Vertex/CloudCode hosts). The `**` (any number of labels) is
-**required** — enterprise/GCP accounts route the model call to the 3-label
-regional host `aiplatform.us.rep.googleapis.com`, which a single-`*` wildcard
-misses, yielding `UNAUTHENTICATED (401)`.
+The swap secret is scoped to the exact hosts agy authenticates to, never a
+wildcard: Vertex AI (`aiplatform.googleapis.com`, `aiplatform.us.rep.googleapis.com`,
+`aiplatform.eu.rep.googleapis.com`), Code Assist (`cloudcode-pa.googleapis.com`)
+and userinfo (`www.googleapis.com`). This matters because the secret is global
+and sbx puts its placeholder in **every** sandbox's environment: any process in
+any sandbox can present it, so a target is a Google API anyone in a sandbox can
+call with your real token. You can confirm it with `sbx policy log <sandbox>`: the
+listed hosts show `forward` (decrypted, so the swap happens) and every other Google
+host `forward-bypass`. A regional `agy_gcp_location` such as `us-central1` calls
+`<region>-aiplatform.googleapis.com`, which isn't on the list. For one, run the
+harvester yourself with a `--host` for every host you need: `--host` replaces the
+default list rather than adding to it. A pipeline run uses a harvester that's
+already running instead of starting its own.
 
 **One-time setup** — stand up the trusted box and log in once:
 

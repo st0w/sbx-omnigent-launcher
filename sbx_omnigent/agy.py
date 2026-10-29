@@ -87,16 +87,31 @@ AGY_HARNESSES: frozenset[str] = frozenset(
 #: this var), so the name is cosmetic — but ``set-custom`` wants one.
 SWAP_ENV = 'AGY_OAUTH_ACCESS_TOKEN'
 
-#: Hosts the swap secret is scoped to. ``**.googleapis.com`` (any number
-#: of labels) is REQUIRED because enterprise/GCP accounts route the
-#: call to the 3-label Vertex regional host — a single-``*`` wildcard
-#: would miss it and yield ``UNAUTHENTICATED (401)``. The explicit hosts
-#: are belt-and-suspenders for the single- and no-label backends.
+#: Hosts the swap secret is scoped to: the APIs agy authenticates to,
+#: and nothing else (#130). The secret is global, and sbx puts its
+#: placeholder in EVERY sandbox's environment, so a target here is one
+#: any process in any sandbox can reach with the user's real Google
+#: token. They were ``**.googleapis.com`` and ``*.googleapis.com``,
+#: which reached Storage, IAM, Secret Manager and the rest.
+#:
+#: - Vertex AI, where the model runs: the global endpoint (agy 1.4.x)
+#:   and the multi-region ones for ``agy_gcp_location`` ``us`` and
+#:   ``eu`` (agy 1.1.16 calls ``aiplatform.us.rep`` for ``us``). Both
+#:   agy builds construct exactly these three forms, plus
+#:   ``<region>-aiplatform`` for a regional location, which this list
+#:   does not cover: pass ``harvest --host`` for one.
+#: - ``cloudcode-pa``: Code Assist, which agy 1.1.16 calls at start.
+#: - ``www``: userinfo, for the account agy shows.
+#:
+#: Left out although agy VMs contact them: ``play`` (telemetry) and
+#: ``storage`` (the agy update download), neither of which needs the
+#: user's token.
 SWAP_HOSTS: tuple[str, ...] = (
-    '**.googleapis.com',
-    '*.googleapis.com',
+    'aiplatform.googleapis.com',
     'aiplatform.us.rep.googleapis.com',
+    'aiplatform.eu.rep.googleapis.com',
     'cloudcode-pa.googleapis.com',
+    'www.googleapis.com',
 )
 
 #: Minimal STEADY-STATE egress for the trusted box (Stage 0): refresh +
@@ -1060,7 +1075,10 @@ def set_custom_argv(
     (``set-custom`` reads it from its hidden prompt when the flag is
     absent), so the secret never lands in argv/``ps``/shell history. A
     **fixed** ``--placeholder`` makes re-runs *update in place* (same
-    entry, new value) rather than pile up duplicate placeholders.
+    entry, new value) rather than pile up duplicate placeholders; the
+    host list is replaced too (checked on sbx v0.46.0), so a narrowed
+    list takes effect on the next refresh. Global, sbx's default; ``-g``
+    is deprecated as of sbx v0.46.0 and no longer passed.
 
     :param placeholder: The fixed placeholder token (must equal what agy
         agent VMs emit).
@@ -1073,7 +1091,7 @@ def set_custom_argv(
     """
     if not hosts:
         raise ValueError('set_custom_argv requires at least one host')
-    argv = ['sbx', 'secret', 'set-custom', '-g']
+    argv = ['sbx', 'secret', 'set-custom']
     for host in hosts:
         argv += ['--host', host]
     argv += ['--env', env, '--placeholder', placeholder]

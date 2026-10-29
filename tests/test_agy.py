@@ -405,12 +405,37 @@ class TestSetCustomArgv(unittest.TestCase):
         hosts = [argv[i + 1] for i, a in enumerate(argv) if a == '--host']
         self.assertEqual(hosts, list(SWAP_HOSTS))
 
-    def test_multilabel_wildcard_included(self) -> None:
-        # Enterprise Vertex host has 3 labels: needs the ** wildcard.
-        self.assertIn('**.googleapis.com', set_custom_argv())
+    def test_the_hosts_are_exact_never_a_wildcard(self) -> None:
+        # The secret puts its placeholder in EVERY sandbox's
+        # environment, so a wildcard target handed the real Google
+        # token to any process in any sandbox, on any googleapis API:
+        # Storage, IAM, Secret Manager (#130).
+        for host in SWAP_HOSTS:
+            with self.subTest(host=host):
+                self.assertNotRegex(host, r'[*?\[\]]')
+                self.assertTrue(host.endswith('.googleapis.com'))
 
-    def test_global_scope(self) -> None:
-        self.assertIn('-g', set_custom_argv())
+    def test_the_hosts_are_the_ones_agy_authenticates_to(self) -> None:
+        self.assertEqual(SWAP_HOSTS, (
+            'aiplatform.googleapis.com',
+            'aiplatform.us.rep.googleapis.com',
+            'aiplatform.eu.rep.googleapis.com',
+            'cloudcode-pa.googleapis.com',
+            'www.googleapis.com',
+        ))
+
+    def test_no_sensitive_google_api_is_a_target(self) -> None:
+        for api in ('storage', 'iam', 'secretmanager', 'cloudkms',
+                    'compute', 'iamcredentials', 'sts', 'oauth2'):
+            with self.subTest(api=api):
+                self.assertNotIn(f'{api}.googleapis.com', SWAP_HOSTS)
+
+    def test_no_deprecated_global_flag(self) -> None:
+        # Global is sbx's default; v0.46.0 deprecates -g with a warning.
+        argv = set_custom_argv()
+        self.assertNotIn('-g', argv)
+        self.assertNotIn('--global', argv)
+        self.assertNotIn('--sandbox', argv)
 
     def test_empty_hosts_rejected(self) -> None:
         with self.assertRaises(ValueError):

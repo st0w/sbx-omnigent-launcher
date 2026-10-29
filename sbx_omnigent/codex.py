@@ -6,8 +6,8 @@ here touches an agy or Claude code path.
 
 WHY THIS IS SO MUCH SMALLER THAN :mod:`sbx_omnigent.agy`
 --------------------------------------------------------
-agy needed a placeholder token, an sbx proxy header-swap on
-``**.googleapis.com``, a trusted auth box, and a refresh loop every ~30
+agy needed a placeholder token, an sbx proxy header-swap on Google's
+API hosts, a trusted auth box, and a refresh loop every ~30
 minutes. Codex needs none of it: it reads its credentials from a plain
 ``auth.json``, so the file is injected directly and there is no wire
 interception at all.
