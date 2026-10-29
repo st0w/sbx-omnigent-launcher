@@ -131,6 +131,15 @@ class TestRateLimitDetection(unittest.TestCase):
         self.assertIsNotNone(note)
         self.assertIn('rate limit', note.lower())
 
+    def test_turn_note_names_no_single_provider(self) -> None:
+        # It said "check your Claude plan usage" for every harness,
+        # and the swarm CLI does not know the agent's harness (#35).
+        note = _turn_note(
+            SwarmTurnResult('failed', 'rate_limit_error'), '', None
+        ) or ''
+        self.assertIn('plan or provider', note)
+        self.assertNotIn('Claude', note)
+
     def test_turn_note_flags_failed_without_limit(self) -> None:
         note = _turn_note(SwarmTurnResult('failed', 'boom'), 'partial', None)
         self.assertIsNotNone(note)

@@ -254,9 +254,10 @@ def _turn_note(
         return (
             'This turn shows signs of an LLM usage/rate limit, not a code '
             'bug — the model may have been throttled and the turn cut '
-            'short. Check your Claude plan usage; the swarm is left '
-            'registered so you can resume or dispose it, and you can retry '
-            'the turn once capacity returns.'
+            "short. Check the usage of the plan or provider this agent's "
+            'harness runs on; the swarm is left registered so you can '
+            'resume or dispose it, and you can retry the turn once '
+            'capacity returns.'
         )
     if not result.ok:
         return (
