@@ -42,7 +42,7 @@ from typing import ClassVar, TypedDict, Unpack
 import click
 
 from sbx_omnigent import sbx_cli
-from sbx_omnigent._compat import AGY_BRIDGE_MODULES
+from sbx_omnigent._compat import AGY_BRIDGE_MODULE
 from sbx_omnigent.defaults import DEFAULT_HOST_IMAGE
 
 #: Default name of the trusted auth-agy sandbox (Stage 0).
@@ -770,12 +770,18 @@ def build_update_script() -> str:
 #: when omnigent is absent or a literal changed; always prints the
 #: marker.
 #:
-#: Newer Omnigent host images do both jobs natively — their isolated
-#: ``--gemini_dir`` seeder writes ``enterpriseOnboardingComplete:
-#: true`` and copies ``settings.json`` across on its own — so on such
-#: an image this correctly finds nothing to change and reports ``0``.
-#: Kept, not deleted, because the image tag is pinned independently
-#: of the server and may still be an older build.
+#: Every supported host image (v0.13.0 and later) does both jobs
+#: itself: its isolated ``--gemini_dir`` seeder copies the onboarding
+#: marker the launcher seeds (or writes one with
+#: ``enterpriseOnboardingComplete: true``), and copies ``settings.json``
+#: across in a step of its own. The two edits still apply there, and
+#: the script still counts them: the ``False`` literal survives in a
+#: deprecated function nothing calls, and ``_AGY_SEED_FILES`` still
+#: omits ``settings.json``. So a v0.13.0 or v0.20.0 image reports ``3``
+#: (both edits plus the paste fix), never ``0``. Both edits are
+#: redundant rather than harmful. They are removed once a live agy run
+#: with them disabled gets through onboarding with the seeded GCP
+#: settings (#56).
 _BRIDGE_PATCH_SCRIPT = r"""
 import importlib, os, sys
 _target = os.environ.get('AGY_BRIDGE_PATCH_TARGET')
@@ -787,23 +793,15 @@ if _target:
     _path = _target
     _seed_files = ()
 else:
-    # The bridge module moved when Omnigent regrouped its top-level
-    # modules into subpackages, and this script runs inside the VM
-    # against the HOST IMAGE's omnigent — which may sit on either
-    # side of that move, and which the launcher cannot probe from
-    # out here. So try each known path, newest first. Still a broad
-    # catch: an import failure inside the VM must degrade to a
+    # Runs inside the VM against the HOST IMAGE's omnigent, which the
+    # launcher cannot probe from out here. A broad catch: an image
+    # older than v0.13.0 (the bridge sat elsewhere before the module
+    # regroup) or any other import failure must degrade to a
     # skip-with-reason, never take the launch down with it.
-    _b = None
-    _why = 'ModuleNotFoundError'
-    for _name in {bridge_modules}:
-        try:
-            _b = importlib.import_module(_name)
-            break
-        except Exception as exc:
-            _why = type(exc).__name__
-    if _b is None:
-        print('AGY_BRIDGE_PATCHED', 'skip', _why)
+    try:
+        _b = importlib.import_module({bridge_module})
+    except Exception as exc:
+        print('AGY_BRIDGE_PATCHED', 'skip', type(exc).__name__)
         sys.exit(0)
     _path = _b.__file__
     _seed_files = getattr(_b, '_AGY_SEED_FILES', ())
@@ -934,7 +932,7 @@ def build_bridge_patch_script(
         enterprise=bool(enterprise),
         seed_settings=bool(seed_settings),
         paste_placeholder=bool(paste_placeholder),
-        bridge_modules=repr(AGY_BRIDGE_MODULES),
+        bridge_module=repr(AGY_BRIDGE_MODULE),
     )
 
 

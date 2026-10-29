@@ -1,22 +1,16 @@
-"""Names whose Omnigent import path depends on the release installed.
+"""Omnigent names that have moved, imported from one place.
 
 Omnigent's ``refactor: group top-level omnigent modules into
 subpackages (140 -> 45)`` moved three modules this package imports,
-and left NO alias at the old paths -- the package's lazy re-exports
-cover public names, not submodules, so ``import
-omnigent.reasoning_effort`` is a hard ``ModuleNotFoundError`` on the
-new layout. A plain import therefore pins this launcher to one side
-of that refactor.
+and left no alias at the old paths. This module once resolved each
+against whichever layout was installed. The oldest release the
+launcher supports, v0.13.0, is past that regroup, so they are now
+plain imports from their one home (#56); a future move is fixed here,
+and the call sites do not change.
 
-Every straddled name is resolved here instead, against whichever
-layout is installed, so one launcher build serves both and an
-Omnigent rollback needs no rollback here. Two of the three failures
-would otherwise be loud at import (taking ``omni-sbx server`` with
-them); the third is swallowed by an ``except ImportError`` and would
-go silent, which is worse.
-
-When the supported floor rises past the regroup, drop the old path
-from each tuple below -- the call sites do not change. See
+``RepoWorkspace`` still straddles: v0.13.0 keeps it in
+``omnigent.server.managed_hosts``, later releases in the sandbox types
+module, so :func:`repo_workspace` still tries both. See
 ``docs/OMNIGENT-COMPATIBILITY.md``.
 """
 
@@ -27,8 +21,13 @@ from collections.abc import Callable
 from types import ModuleType
 from typing import Protocol, runtime_checkable
 
+from omnigent.models.model_override import model_family_mismatch
+from omnigent.util.reasoning_effort import (
+    CODEX_EFFORTS as _OMNIGENT_CODEX_EFFORTS,
+)
+
 __all__ = [
-    'AGY_BRIDGE_MODULES',
+    'AGY_BRIDGE_MODULE',
     'CODEX_EFFORTS',
     'RepoWorkspaceLike',
     'agy_bridge_module_name',
@@ -37,24 +36,9 @@ __all__ = [
     'repo_workspace',
 ]
 
-#: ``model_family_mismatch`` -- new path first, legacy second.
-_MODEL_OVERRIDE_MODULES = (
-    'omnigent.models.model_override',
-    'omnigent.model_override',
-)
-
-#: The reasoning-effort ladders.
-_REASONING_EFFORT_MODULES = (
-    'omnigent.util.reasoning_effort',
-    'omnigent.reasoning_effort',
-)
-
-#: The agy (Antigravity) native bridge. Public because callers probe
-#: which name is live -- the in-VM patch script needs both spellings.
-AGY_BRIDGE_MODULES = (
-    'omnigent.harnesses.antigravity_native.bridge',
-    'omnigent.antigravity_native_bridge',
-)
+#: The agy (Antigravity) native bridge. Public because the in-VM patch
+#: script imports it by name, inside a VM this process cannot probe.
+AGY_BRIDGE_MODULE = 'omnigent.harnesses.antigravity_native.bridge'
 
 #: ``RepoWorkspace`` -- the per-repo record Omnigent's newer
 #: ``start_host`` takes a sequence of. It moved OUT of the server
@@ -97,7 +81,7 @@ def _resolve(
 
     Each loader imports one fixed module path. A candidate that does
     not import, or imports without defining *name*, is skipped: on
-    either Omnigent layout one of them is genuinely absent.
+    each supported Omnigent release one of them is genuinely absent.
 
     :param name: The attribute to resolve.
     :param described_as: Human phrase for the failure message.
@@ -155,12 +139,11 @@ def repo_workspace(
     """
     Build this Omnigent's ``RepoWorkspace`` record for one repository.
 
-    Resolved on call, not at import: on the pre-regroup layout the
-    only source is ``omnigent.server.managed_hosts``, and pulling the
-    server package into every ``_compat`` consumer (the standalone
-    pipeline and swarm CLIs included) to satisfy a path taken only
-    when a legacy caller meets a current Omnigent would be a poor
-    trade.
+    Resolved on call, not at import: on v0.13.0 the only source is
+    ``omnigent.server.managed_hosts``, and pulling the server package
+    into every ``_compat`` consumer (the standalone pipeline and swarm
+    CLIs included) to satisfy a path taken only when a legacy caller
+    meets a current Omnigent would be a poor trade.
 
     :param url: Clone URL with any ``#<branch>`` fragment stripped.
     :param branch: Branch to clone, or ``None`` for the default.
@@ -189,20 +172,14 @@ def repo_workspace(
 
 def load_agy_bridge() -> ModuleType | None:
     """
-    Import the agy native-bridge module, wherever it now lives.
+    Import the agy native-bridge module.
 
     :returns: The bridge module, or ``None`` when this Omnigent has
         no agy bridge at all (it is an optional harness, so absence
         is not an error).
     """
     try:
-        return importlib.import_module(
-            'omnigent.harnesses.antigravity_native.bridge'
-        )
-    except ImportError:
-        pass
-    try:
-        return importlib.import_module('omnigent.antigravity_native_bridge')
+        return importlib.import_module(AGY_BRIDGE_MODULE)
     except ImportError:
         return None
 
@@ -211,73 +188,20 @@ def agy_bridge_module_name() -> str | None:
     """
     The importable module path of the agy bridge on this install.
 
-    :returns: The live path from :data:`AGY_BRIDGE_MODULES`, or
-        ``None`` when neither imports.
+    :returns: :data:`AGY_BRIDGE_MODULE` when it imports, else ``None``.
     """
     module = load_agy_bridge()
     return None if module is None else module.__name__
 
 
-
-def _model_family_mismatch() -> Callable[[str, str], str | None]:
-    """
-    Omnigent's check that a model's family can run on a harness.
-
-    :returns: The check, which returns a rejection reason or ``None``.
-    :raises ImportError: When neither layout provides it.
-    :raises TypeError: When what it provides is not callable.
-    """
-    found = _resolve(
-        'model_family_mismatch',
-        'the model-family guard',
-        _MODEL_OVERRIDE_MODULES,
-        (
-            lambda: importlib.import_module('omnigent.models.model_override'),
-            lambda: importlib.import_module('omnigent.model_override'),
-        ),
-    )
-    if not callable(found):
-        raise TypeError(f'model_family_mismatch is not callable: {found!r}')
-    return found
-
-
-def _codex_efforts() -> frozenset[str]:
-    """
-    Omnigent's codex reasoning-effort ladder.
-
-    :returns: The effort names.
-    :raises ImportError: When neither layout provides it.
-    :raises TypeError: When what it provides is not a set of strings.
-    """
-    found = _resolve(
-        'CODEX_EFFORTS',
-        'the codex effort ladder',
-        _REASONING_EFFORT_MODULES,
-        (
-            lambda: importlib.import_module('omnigent.util.reasoning_effort'),
-            lambda: importlib.import_module('omnigent.reasoning_effort'),
-        ),
-    )
-    if not isinstance(found, (set, frozenset)) or not all(
-        isinstance(effort, str) for effort in found
-    ):
-        raise TypeError(f'CODEX_EFFORTS is not a set of names: {found!r}')
-    return frozenset(found)
-
-
-#: Rejection reason when a model's family cannot run on a harness, or
-#: ``None`` when the pairing is fine. Used by the pipeline's
-#: model-pinning guard.
-model_family_mismatch = _model_family_mismatch()
-
 #: Reasoning-effort levels codex accepts, used to gate what may be
 #: interpolated into a ``-c model_reasoning_effort=...`` expression.
 #:
-#: Deliberately the SDK/Responses ladder on BOTH layouts, even though
-#: newer Omnigent also publishes a wider ``CODEX_NATIVE_EFFORTS``
-#: (reaching ``max``/``ultra``) for the native CLI this launcher
-#: actually drives. Widening the gate is a live behaviour change in
-#: the harness layer — the one place this project has repeatedly lost
-#: days to (see docs/HARNESS-VERSIONS.md) — so it is a decision of its
-#: own, not a side effect of an import move.
-CODEX_EFFORTS = _codex_efforts()
+#: Deliberately the SDK/Responses ladder, even though newer Omnigent
+#: also publishes a wider ``CODEX_NATIVE_EFFORTS`` (reaching
+#: ``max``/``ultra``) for the native CLI this launcher actually drives.
+#: Widening the gate is a live behaviour change in the harness layer —
+#: the one place this project has repeatedly lost days to (see
+#: docs/HARNESS-VERSIONS.md) — so it is a decision of its own, not a
+#: side effect of an import move.
+CODEX_EFFORTS = frozenset(_OMNIGENT_CODEX_EFFORTS)

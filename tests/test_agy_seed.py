@@ -153,38 +153,24 @@ class TestSettingsAndBridge(unittest.TestCase):
         self.assertIn('_do_settings = True', patch)
         self.assertIn(agy.BRIDGE_PATCH_OK_MARKER, patch)
 
-    def test_bridge_patch_tries_every_known_bridge_path(self) -> None:
-        # The host image's Omnigent may sit on either side of the
-        # subpackage regroup, and the script runs INSIDE the VM where
-        # this process cannot probe which. So it tries them all.
-        patch = agy.build_bridge_patch_script(
-            enterprise=True, seed_settings=True
-        )
-        for module_path in _compat.AGY_BRIDGE_MODULES:
-            self.assertIn(module_path, patch)
+    def test_bridge_patch_module_is_not_a_second_copy(self) -> None:
+        # One source of truth: a future move edits _compat only, and
+        # the script follows it.
+        moved = 'omnigent.moved_again.bridge'
+        with mock.patch.object(agy, 'AGY_BRIDGE_MODULE', moved):
+            patch = agy.build_bridge_patch_script(
+                enterprise=True, seed_settings=True
+            )
+        self.assertIn(repr(moved), patch)
+        self.assertNotIn(_compat.AGY_BRIDGE_MODULE, patch)
 
-    def test_bridge_patch_module_list_is_not_a_second_copy(self) -> None:
-        # One source of truth: a future move edits _compat only.
+    def test_bridge_patch_never_tries_the_pre_regroup_path(self) -> None:
+        # Every supported host image (v0.13.0 or later) has the bridge
+        # at the harnesses path only (#56).
         patch = agy.build_bridge_patch_script(
             enterprise=True, seed_settings=True
         )
-        self.assertIn(repr(_compat.AGY_BRIDGE_MODULES), patch)
-
-    def test_bridge_patch_prefers_the_current_path(self) -> None:
-        patch = agy.build_bridge_patch_script(
-            enterprise=True, seed_settings=True
-        )
-        first, second = _compat.AGY_BRIDGE_MODULES[:2]
-        self.assertLess(patch.index(first), patch.index(second))
-
-    def test_bridge_patch_still_reports_a_skip_reason(self) -> None:
-        # A VM whose omnigent has no bridge at all must still print
-        # the marker — the launcher greps for it — and say why.
-        patch = agy.build_bridge_patch_script(
-            enterprise=True, seed_settings=True
-        )
-        self.assertIn("'skip'", patch)
-        self.assertIn('_why', patch)
+        self.assertNotIn('omnigent.antigravity_native_bridge', patch)
 
     def test_bridge_patch_flags_reflect_args(self) -> None:
         patch = agy.build_bridge_patch_script(
@@ -479,8 +465,11 @@ class TestBridgePastePatch(unittest.TestCase):
             env={**os.environ, 'PYTHONPATH': ''}, cwd=tempfile.gettempdir(),
         )
         self.assertEqual(proc.returncode, 0)
-        self.assertIn(agy.BRIDGE_PATCH_OK_MARKER, proc.stdout)
-        self.assertIn('skip', proc.stdout)  # took the import-failed branch
+        # The launcher greps for the marker, and the reason says why.
+        self.assertEqual(
+            proc.stdout.split(),
+            [agy.BRIDGE_PATCH_OK_MARKER, 'skip', 'ModuleNotFoundError'],
+        )
 
     def test_script_can_be_targeted_without_importing_omnigent(self) -> None:
         # Regression guard: the rendered script MUST honor an explicit

@@ -1,33 +1,38 @@
 """Unit tests for :mod:`sbx_omnigent._compat`.
 
-The shim exists to survive Omnigent's 140->45 subpackage regroup,
-which moved three modules this package imports and left no aliases
-behind. These tests pin the contract: each name resolves against
-whichever layout is installed, and a name that is absent from BOTH
-fails loud, naming both paths.
+The oldest Omnigent this launcher supports, v0.13.0, is past the
+140->45 subpackage regroup, so three of the four names that move
+straddled come from their one current home (#56). ``RepoWorkspace``
+still sits at a different path in v0.13.0 than in later releases, so
+it is still resolved against whichever is installed, and a name absent
+from BOTH fails loud, naming both paths.
 
     .venv/bin/python -m unittest discover -s tests
 """
 
 from __future__ import annotations
 
-import importlib
 import inspect
 import sys
 import types
 import unittest
 from unittest import mock
 
+from omnigent.models import model_override
 from omnigent.onboarding.sandboxes.base import ExecModelHostLauncher
+from omnigent.util import reasoning_effort
 
 from sbx_omnigent import _compat, launcher
 
 
 class TestResolvesAgainstInstalledOmnigent(unittest.TestCase):
-    """Every straddled name resolves on the Omnigent that is here."""
+    """Every name resolves on the Omnigent that is here."""
 
-    def test_model_family_mismatch_is_callable(self) -> None:
-        self.assertTrue(callable(_compat.model_family_mismatch))
+    def test_model_family_mismatch_is_omnigents_own(self) -> None:
+        self.assertIs(
+            _compat.model_family_mismatch,
+            model_override.model_family_mismatch,
+        )
 
     def test_model_family_mismatch_still_rejects_a_mismatch(self) -> None:
         # Contract, not identity: a Claude model on the codex harness
@@ -36,28 +41,29 @@ class TestResolvesAgainstInstalledOmnigent(unittest.TestCase):
             _compat.model_family_mismatch('codex', 'claude-opus-5')
         )
 
+    def test_codex_efforts_is_omnigents_ladder(self) -> None:
+        self.assertEqual(
+            _compat.CODEX_EFFORTS, frozenset(reasoning_effort.CODEX_EFFORTS)
+        )
+
     def test_codex_efforts_is_a_nonempty_ladder(self) -> None:
         self.assertTrue(_compat.CODEX_EFFORTS)
         # Every ladder Omnigent ships carries the middle rungs.
         self.assertIn('high', _compat.CODEX_EFFORTS)
         self.assertIn('medium', _compat.CODEX_EFFORTS)
 
-    def test_codex_efforts_stays_the_sdk_ladder_on_both_layouts(
-        self,
-    ) -> None:
+    def test_codex_efforts_stays_the_sdk_ladder(self) -> None:
         # Pinned on purpose: widening the gate to the native ladder
         # would change what reaches the codex CLI, and that decision
-        # is not this shim's to make silently.
+        # is not this module's to make silently.
         self.assertNotIn('max', _compat.CODEX_EFFORTS)
         self.assertNotIn('ultra', _compat.CODEX_EFFORTS)
 
     def test_agy_bridge_module_name_matches_the_install(self) -> None:
-        # Either real path, or None when neither is importable — but
-        # never a wrong-looking name.
-        name = _compat.agy_bridge_module_name()
+        # The one real path, or None when it is not importable.
         self.assertIn(
-            name,
-            (*_compat.AGY_BRIDGE_MODULES, None),
+            _compat.agy_bridge_module_name(),
+            (_compat.AGY_BRIDGE_MODULE, None),
         )
 
     def test_load_agy_bridge_agrees_with_the_name_probe(self) -> None:
@@ -78,102 +84,36 @@ def _module(name: str, **attrs: object) -> types.ModuleType:
     return module
 
 
-class TestImportTimeFallbacks(unittest.TestCase):
-    """The two names resolved at import fall back to the legacy path.
+#: Where the agy bridge lived before the regroup (Omnigent v0.12.0 and
+#: earlier), which no supported release has.
+_PRE_REGROUP_BRIDGE = 'omnigent.antigravity_native_bridge'
 
-    `_compat` is re-executed with the new path made unimportable and a
-    stand-in at the legacy one, then restored.
-    """
 
-    def tearDown(self) -> None:
-        importlib.reload(_compat)
+class TestTheAgyBridge(unittest.TestCase):
+    """The bridge has one path on every supported release (#56)."""
 
-    def _reload_with(self, modules: dict[str, object]) -> None:
-        with mock.patch.dict(sys.modules, modules):
-            importlib.reload(_compat)
-
-    def test_model_family_mismatch_falls_back(self) -> None:
-        def legacy_guard(harness: str, model: str) -> str | None:
-            return f'legacy: {harness} {model}'
-
-        legacy = _module('omnigent.model_override',
-                         model_family_mismatch=legacy_guard)
-        self._reload_with({
-            'omnigent.models.model_override': None,
-            'omnigent.model_override': legacy,
-        })
+    def test_it_is_the_harnesses_subpackage(self) -> None:
         self.assertEqual(
-            _compat.model_family_mismatch('h', 'm'), 'legacy: h m'
+            _compat.AGY_BRIDGE_MODULE,
+            'omnigent.harnesses.antigravity_native.bridge',
         )
 
-    def test_a_guard_that_is_not_callable_is_refused(self) -> None:
-        legacy = _module('omnigent.model_override',
-                         model_family_mismatch='not a function')
-        with self.assertRaises(TypeError):
-            self._reload_with({
-                'omnigent.models.model_override': None,
-                'omnigent.model_override': legacy,
-            })
+    def test_it_is_loaded_from_there(self) -> None:
+        name = _compat.AGY_BRIDGE_MODULE
+        with mock.patch.dict(sys.modules, {name: _module(name)}):
+            module = _compat.load_agy_bridge()
+        self.assertIsNotNone(module)
+        self.assertEqual(getattr(module, '__name__', None), name)
 
-    def test_an_effort_ladder_that_is_not_names_is_refused(self) -> None:
-        legacy = _module('omnigent.reasoning_effort', CODEX_EFFORTS=[1, 2])
-        with self.assertRaises(TypeError):
-            self._reload_with({
-                'omnigent.util.reasoning_effort': None,
-                'omnigent.reasoning_effort': legacy,
-            })
-
-    def test_codex_efforts_falls_back(self) -> None:
-        legacy = _module('omnigent.reasoning_effort',
-                         CODEX_EFFORTS=frozenset({'high'}))
-        self._reload_with({
-            'omnigent.util.reasoning_effort': None,
-            'omnigent.reasoning_effort': legacy,
-        })
-        self.assertEqual(_compat.CODEX_EFFORTS, frozenset({'high'}))
-
-    def test_neither_path_fails_naming_both(self) -> None:
-        for new, old in (
-            ('omnigent.models.model_override', 'omnigent.model_override'),
-            ('omnigent.util.reasoning_effort', 'omnigent.reasoning_effort'),
-        ):
-            with self.subTest(new=new):
-                with self.assertRaises(ImportError) as caught:
-                    self._reload_with({new: None, old: None})
-                self.assertIn(new, str(caught.exception))
-                self.assertIn(old, str(caught.exception))
-
-
-class TestAgyBridgeFallback(unittest.TestCase):
-    """The bridge is tried in `AGY_BRIDGE_MODULES` order.
-
-    The in-VM patch script reads that tuple, so the order it names and
-    the order `load_agy_bridge` tries must be the same.
-    """
-
-    def _loaded_name(self) -> str:
-        module = _compat.load_agy_bridge()
-        if module is None:
-            self.fail('no agy bridge was loaded')
-        return module.__name__
-
-    def test_the_first_path_wins(self) -> None:
-        first, second = _compat.AGY_BRIDGE_MODULES
+    def test_the_pre_regroup_path_is_never_tried(self) -> None:
         with mock.patch.dict(sys.modules, {
-            first: _module(first), second: _module(second),
+            _compat.AGY_BRIDGE_MODULE: None,
+            _PRE_REGROUP_BRIDGE: _module(_PRE_REGROUP_BRIDGE),
         }):
-            self.assertEqual(self._loaded_name(), first)
+            self.assertIsNone(_compat.load_agy_bridge())
 
-    def test_the_second_path_is_the_fallback(self) -> None:
-        first, second = _compat.AGY_BRIDGE_MODULES
-        with mock.patch.dict(sys.modules, {
-            first: None, second: _module(second),
-        }):
-            self.assertEqual(self._loaded_name(), second)
-
-    def test_neither_is_none_not_an_error(self) -> None:
-        first, second = _compat.AGY_BRIDGE_MODULES
-        with mock.patch.dict(sys.modules, {first: None, second: None}):
+    def test_absent_is_none_not_an_error(self) -> None:
+        with mock.patch.dict(sys.modules, {_compat.AGY_BRIDGE_MODULE: None}):
             self.assertIsNone(_compat.load_agy_bridge())
 
 
@@ -243,7 +183,7 @@ class TestStartHostShapeProbe(unittest.TestCase):
 class TestRepoWorkspace(unittest.TestCase):
     """The record Omnigent's newer ``start_host`` takes a list of."""
 
-    def test_carries_the_three_fields_both_layouts_share(self) -> None:
+    def test_carries_the_three_fields_both_paths_share(self) -> None:
         repo = _compat.repo_workspace(
             'https://github.com/org/repo', 'main', 'repo'
         )

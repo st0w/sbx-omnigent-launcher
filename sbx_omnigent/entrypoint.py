@@ -450,8 +450,8 @@ def install_agy_enterprise_onboarding_patch() -> None:
     mirroring :func:`install_sbx_provider`), reflecting that the
     account's enterprise onboarding is genuinely already done.
 
-    Best-effort and increasingly redundant: Omnigent releases after
-    the subpackage regroup seed the marker themselves (the isolated
+    Best-effort and redundant on every supported release (v0.13.0 and
+    later), which seeds the marker itself (the isolated
     ``--gemini_dir`` seeder writes ``enterpriseOnboardingComplete:
     true`` in its synthetic fallback, and prefers the real-home
     marker this launcher already writes with the account's true

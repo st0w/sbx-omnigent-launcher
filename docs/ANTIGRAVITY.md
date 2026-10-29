@@ -164,11 +164,16 @@ each is now handled automatically by the launcher/swarm code.
   reach of our server-side monkeypatch — and one of the `false` literals is a
   **function-local inline dict** (not a patchable module constant), so an
   in-memory monkeypatch can't reach it either.
-- **Fix:** the launcher edits the **installed** `antigravity_native_bridge.py`
-  *inside the ephemeral VM*, **before the runner imports it**, flipping both
-  `"enterpriseOnboardingComplete": False` occurrences to `True`
-  (`agy.build_bridge_patch_script`, best-effort, gated on `agy_enterprise`). See
-  §5 for why this is an in-VM file edit and not a wrapper monkeypatch.
+- **Fix:** the launcher edits the **installed** bridge module
+  (`omnigent/harnesses/antigravity_native/bridge.py`) *inside the ephemeral VM*,
+  **before the runner imports it**, flipping `"enterpriseOnboardingComplete":
+  False` to `True` (`agy.build_bridge_patch_script`, best-effort, gated on
+  `agy_enterprise`). See §5 for why this is an in-VM file edit and not a wrapper
+  monkeypatch.
+- **Now redundant:** Omnigent v0.13.0 and later copy the onboarding marker the
+  launcher seeds into the bridge dir, or write one with the flag `true`. The
+  remaining `False` literal is in a function nothing calls. The edit is removed
+  once a live run with it disabled confirms that (#56).
 
 ### Fix 4 — GCP project id + a version-skew gotcha
 
@@ -244,8 +249,7 @@ independent reasons:
 
 So any fix must run **inside the VM**. The chosen mechanism (a deliberate
 decision) is: the launcher runs an in-VM `python3 -c` script that **edits the
-installed `/build/omnigent/antigravity_native_bridge.py` in place, before the
-runner imports it.** Properties: runtime, per-VM, config-gated, best-effort
+installed bridge module in place, before the runner imports it.** Properties: runtime, per-VM, config-gated, best-effort
 (a no-op if the literal moved), and it dies with the disposed sandbox. It is
 **not** a change to this repo's source or to your Omnigent install — it mutates
 only the throwaway VM's copy. (The considered alternative — an in-VM
