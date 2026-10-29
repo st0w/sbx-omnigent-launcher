@@ -551,6 +551,16 @@ credential. A harness with a dead credential otherwise fails as one that never
 started, with no pane to read. Such a turn is never retried, since a fresh VM
 would fail the same way.
 
+**A usage or rate limit is named too.** When a failed turn's error, or the
+session's last error, reads like a usage or rate limit (a 429, "usage limit",
+"quota" and the like), the error says so and names where that agent's limit
+lives: the ChatGPT account for Codex, the Google account or `agy_gcp_project` for
+agy (Gemini 4 Argon has its own weekly quota), the Claude plan for Claude. Then
+`--resume` the run once the limit has reset. The agent's reply and screen aren't
+checked, since they contain the task itself, where those words can be the subject.
+Like any turn that failed with an error, it isn't retried: the limit would still
+be spent 90 seconds later.
+
 **A run that does not finish keeps its directory.** Teardown always disposes the
 microVMs — they are expensive and useless once the process ends — but the run
 directory holds the hub clone with every node branch, plus `state.json`, and

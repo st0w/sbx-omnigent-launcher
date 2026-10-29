@@ -144,3 +144,29 @@ def relogin_hint(harness: str) -> str:
             'sbx secret that carries it (README, Credentials)'
         )
     return 'renew the credential this harness uses, then retry'
+
+
+def usage_limit_hint(harness: str) -> str:
+    """
+    Where the usage limit a harness ran into lives (#35).
+
+    :param harness: The agent's harness id, e.g. ``"codex-native"``.
+    :returns: The account or quota to check, naming its provider.
+    """
+    if harness in codex.CODEX_HARNESSES:
+        return (
+            'check the Codex usage of the ChatGPT account this host is '
+            'logged in with; a usage window resets on its own'
+        )
+    if harness in agy.AGY_HARNESSES:
+        return (
+            'check the Gemini quota of the Google account the trusted '
+            'box is logged in with (Gemini 4 Argon has a separate weekly '
+            'quota) or of agy_gcp_project'
+        )
+    if harness in claude.CLAUDE_NATIVE_HARNESSES:
+        return (
+            'check the usage of the Claude plan behind the token this '
+            'agent runs on'
+        )
+    return 'check the usage limits of the account this harness runs on'

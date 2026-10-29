@@ -76,6 +76,7 @@ from sbx_omnigent.swarm_session import (
     SwarmSessionClient,
     SwarmSessionError,
     SwarmTurnTimeout,
+    looks_like_rate_limit,
 )
 from sbx_omnigent.worktrees import (
     WorktreeManager,
@@ -9287,6 +9288,12 @@ class PipelineRunner:
                 result.error
             )
             auth = self._auth_failure_note(session, result.error, snap)
+            # A rejected credential is the more specific reading, so a
+            # rate-limit note is only added when there is none.
+            limit = '' if auth else self._rate_limit_note(
+                session, result.error, snap
+            )
+            note += limit
             pane_path = self._capture_turn(
                 session,
                 f'the turn failed: {result.error}{note}{auth}',
@@ -9368,6 +9375,39 @@ class PipelineRunner:
             f' ({where} shows an authentication failure, "{phrase}": '
             f'the credential this agent runs on was rejected. To renew '
             f'it, {guest_log.relogin_hint(harness)})'
+        )
+
+    def _rate_limit_note(
+        self, session: str, error: str | None, snap: dict | None
+    ) -> str:
+        """
+        Say so when a failed turn reads like a usage or rate limit.
+
+        Only the swarm CLI used to check, so a throttled pipeline turn
+        read exactly like a failed one, and nothing said which account's
+        limit it was (#35). Reads the turn's error and the session's
+        ``last_task_error`` only: the agent's reply and its pane hold
+        the task itself, where "quota" or "capacity" can be the subject.
+        A hint, not a verdict: a turn with error text is already treated
+        as the agent's failure and not retried.
+
+        :param session: The session whose turn just failed.
+        :param error: The failed turn's error, if any.
+        :param snap: The session snapshot, or ``None`` if unreadable.
+        :returns: A parenthesised note for the failure message, or
+            ``''``.
+        """
+        reported = (snap or {}).get('last_task_error')
+        if not looks_like_rate_limit(
+            error, reported if isinstance(reported, str) else None
+        ):
+            return ''
+        agent = self._session_agent.get(session)
+        harness = agent.harness if agent is not None else ''
+        return (
+            f' (this reads like a usage or rate limit, not a defect in '
+            f'the work: {guest_log.usage_limit_hint(harness)}, then '
+            f'resume the run with --resume)'
         )
 
     def _no_pane_note(self, session: str) -> str:

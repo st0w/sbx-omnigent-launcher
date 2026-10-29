@@ -160,5 +160,34 @@ class TestTheRemedy(unittest.TestCase):
         self.assertTrue(guest_log.relogin_hint('pi-native'))
 
 
+class TestTheUsageLimitHint(unittest.TestCase):
+    """Where a harness's usage limit lives, per harness (#35).
+
+    The swarm CLI told every throttled agent to "check your Claude plan
+    usage", including Codex and agy ones."""
+
+    def test_each_harness_names_its_own_provider(self) -> None:
+        for harness, want, never in (
+            ('codex-native', 'ChatGPT', 'Claude'),
+            ('antigravity-native', 'Google', 'Claude'),
+            ('claude-native', 'Claude', 'ChatGPT'),
+        ):
+            with self.subTest(harness=harness):
+                hint = guest_log.usage_limit_hint(harness)
+                self.assertIn(want, hint)
+                self.assertNotIn(never, hint)
+
+    def test_agy_mentions_the_separate_argon_quota(self) -> None:
+        self.assertIn(
+            'Argon', guest_log.usage_limit_hint('antigravity-native')
+        )
+
+    def test_an_unknown_harness_names_no_provider(self) -> None:
+        hint = guest_log.usage_limit_hint('pi-native')
+        self.assertTrue(hint)
+        for provider in ('Claude', 'ChatGPT', 'Google'):
+            self.assertNotIn(provider, hint)
+
+
 if __name__ == '__main__':
     unittest.main()

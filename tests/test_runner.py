@@ -13346,6 +13346,83 @@ class TestAClaudeAuthFailureIsNamed(_Base):
         )
 
 
+class TestARateLimitedTurnIsNamed(_Base):
+    """A throttled pipeline turn read exactly like a failed one: only
+    the swarm CLI checked for a usage or rate limit (#35)."""
+
+    _CODEX_LIMIT = (
+        "You've hit your usage limit. Upgrade to Pro or try again at "
+        '3:42 PM.'
+    )
+
+    def _failing(
+        self, text: str, outcome: str, status: dict | None = None
+    ) -> tuple[R.PipelineRunError, FakeSC]:
+        sc = FakeSC({'tests': 'wrote tests'})
+        sc.turn_outcomes['build'] = [outcome]
+        if status is not None:
+            sc.status_for_label['build'] = status
+        with mock.patch.object(R.pane, 'capture_pane', return_value=None):
+            with self.assertRaises(R.PipelineRunError) as caught:
+                self._run(text, {}, sc=sc)
+        return caught.exception, sc
+
+    def test_the_turns_error_is_recognised(self) -> None:
+        exc, _sc = self._failing(
+            _CODEX_ONLY, f'error:{self._CODEX_LIMIT}'
+        )
+        self.assertIn('usage or rate limit', str(exc))
+
+    def test_the_sessions_last_error_is_recognised(self) -> None:
+        exc, _sc = self._failing(
+            _CODEX_ONLY, 'lost',
+            status={'last_task_error': 'HTTP 429 Too Many Requests'},
+        )
+        self.assertIn('usage or rate limit', str(exc))
+
+    def test_it_names_the_agents_own_provider(self) -> None:
+        for text, want, never in (
+            (_CODEX_ONLY, 'ChatGPT', 'Claude plan'),
+            (_TDD, 'Claude', 'ChatGPT'),
+        ):
+            with self.subTest(want=want):
+                exc, _sc = self._failing(
+                    text, f'error:{self._CODEX_LIMIT}'
+                )
+                self.assertIn(want, str(exc))
+                self.assertNotIn(never, str(exc))
+
+    def test_the_real_error_is_kept(self) -> None:
+        exc, _sc = self._failing(
+            _CODEX_ONLY, f'error:{self._CODEX_LIMIT}'
+        )
+        self.assertIn(self._CODEX_LIMIT, str(exc))
+
+    def test_an_ordinary_failure_gets_no_such_note(self) -> None:
+        exc, _sc = self._failing(_CODEX_ONLY, 'error:the model refused')
+        self.assertNotIn('usage or rate limit', str(exc))
+
+    def test_an_auth_failure_is_not_called_a_rate_limit(self) -> None:
+        # Both can say "401"/"limit"-ish things; the credential note is
+        # the more specific one and wins.
+        exc, _sc = self._failing(
+            _TDD,
+            'error:Failed to authenticate. API Error: 401 OAuth access '
+            'token is invalid. Try again later.',
+        )
+        self.assertIn('authentication failure', str(exc))
+        self.assertNotIn('usage or rate limit', str(exc))
+
+    def test_it_is_not_retried(self) -> None:
+        # The window will still be spent on a fresh VM 90 s later.
+        _exc, sc = self._failing(
+            _CODEX_ONLY, f'error:{self._CODEX_LIMIT}'
+        )
+        self.assertEqual(
+            sum(1 for lb in sc._label.values() if lb == 'build'), 1
+        )
+
+
 class TestAnApiErrorReplyFailsTheTurn(_Base):
     """Claude Code's "API Error: 400 ... version 2.1.280 or newer is
     required" came back as the turn's REPLY, before the server's failed
