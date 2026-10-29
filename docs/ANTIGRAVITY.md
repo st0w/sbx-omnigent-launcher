@@ -50,7 +50,7 @@ Three planes, so the durable refresh credential never touches an untrusted agent
    │  • driven via `sbx exec` │        │    verbatim on the wire        │
    └───────────┬─────────────┘        └───────────────┬──────────────┘
                │ harvester reads the fresh             │ outbound HTTPS to
-               │ access token off the box              │ **.googleapis.com
+               │ access token off the box              │ Vertex/CodeAssist API
                ▼                                       ▼
    ┌─────────────────────────┐        ┌──────────────────────────────┐
    │  omni-sbx-agy harvest    │  sets  │  sbx host-side proxy (MITM)   │
@@ -261,11 +261,20 @@ the inline case — is cleaner in principle but needs more moving parts, incl.
   swap secret, googleapis is `forward-bypass` (tunneled, not decrypted, not
   swapped). Adding the secret flips the host to `forward`. `agy` does **not**
   cert-pin, so the MITM is accepted. (`sbx policy log` shows the mode.)
-- **Use `**.googleapis.com`, not `*.googleapis.com`.** Enterprise/GCP accounts
-  route the model call to the **3-label** Vertex regional host
-  `aiplatform.us.rep.googleapis.com`. A single-`*` wildcard (one label) misses
-  it → `UNAUTHENTICATED (401)`. The swap secret is scoped to `**.googleapis.com`
-  + `*.googleapis.com` + the explicit Vertex/CloudCode hosts.
+- **The swap secret names exact hosts, never a wildcard.** It's global, and sbx
+  puts its placeholder in **every** sandbox's environment, so each target is a
+  Google API any process in any sandbox can call with the real token. It used to
+  be `**.googleapis.com`, which reached Storage, IAM and Secret Manager. Now it's
+  Vertex AI (`aiplatform.googleapis.com` for agy 1.4.x, `aiplatform.us.rep` and
+  `aiplatform.eu.rep` for the multi-region locations agy 1.1.16 calls), Code Assist
+  (`cloudcode-pa`) and userinfo (`www`). Enterprise/GCP accounts call the 3-label
+  `aiplatform.us.rep.googleapis.com`, which a single-`*` wildcard misses; naming
+  it exactly avoids that too. A regional location (`<region>-aiplatform`) needs
+  `omni-sbx-agy harvest` run with a `--host` for every host, since `--host`
+  replaces the default list. Re-running `set-custom` with the same placeholder
+  replaces the host list, so a changed list takes effect on the next refresh.
+  `sbx policy log <sandbox>` shows each listed host as `forward` and every other
+  Google host as `forward-bypass`.
 - **Trusted-box refresh mechanics:** the poke is `agy models` (the lightest
   authenticated action, no inference). Force a deterministic refresh by setting
   the on-disk token's `expiry` to the past, then running `agy models`; agy
