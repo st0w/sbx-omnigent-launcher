@@ -1259,6 +1259,13 @@ Output is ANSI-stripped, scrubbed of secret-shaped fragments (a connection proof
 prints connection strings), tail-capped per step with an explicit truncation
 note, and fenced with a fence long enough to survive backticks in the payload.
 
+**Nothing the pipeline writes to GitHub notifies anyone.** Agent text reaches PR
+titles and bodies and the issues findings are filed as, and GitHub notifies whoever
+is named after an `@`. A reviewer writing about the npm package `@types/node` would
+notify the account `types`. So every title and body is sent with each mention in a
+code span: it reads the same, and GitHub ignores mentions inside code. Code blocks,
+inline code, HTML comments, email addresses and URLs are left as they are.
+
 None of this makes an agent honest — it makes dishonesty **detectable at the
 stage that produced it**, instead of three gates later.
 
