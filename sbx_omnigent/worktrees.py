@@ -251,6 +251,87 @@ def looks_like_auth_failure(text: str) -> bool:
     return any(marker in lowered for marker in _AUTH_FAILURE_MARKERS)
 
 
+#: A GitHub mention: ``@`` and a user or ``org/team`` handle, not
+#: preceded by a character that makes it part of something else (an
+#: email address, a URL path, an already-quoted name).
+_MENTION_RE = re.compile(
+    r'(?<![A-Za-z0-9_.@/`\\])'
+    r'@[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?'
+    r'(?<![.-])'
+)
+
+#: A line opening (or closing) a fenced code block: up to three spaces,
+#: then three or more backticks or tildes.
+_FENCE_RE = re.compile(r'^ {0,3}(`{3,}|~{3,})')
+
+#: Spans inside a paragraph GitHub never reads mentions in: an HTML
+#: comment, and an inline code span (a backtick run closed by a run of
+#: the same length).
+_PROTECTED_INLINE_RE = re.compile(
+    r'<!--.*?-->|(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)', re.DOTALL
+)
+
+
+def _neutralize_prose(text: str) -> str:
+    """Code-span every mention in text outside code and comments."""
+    out: list[str] = []
+    pos = 0
+    for match in _PROTECTED_INLINE_RE.finditer(text):
+        out.append(_MENTION_RE.sub(lambda m: f'`{m.group(0)}`',
+                                   text[pos:match.start()]))
+        out.append(match.group(0))
+        pos = match.end()
+    out.append(_MENTION_RE.sub(lambda m: f'`{m.group(0)}`', text[pos:]))
+    return ''.join(out)
+
+
+def neutralize_mentions(text: str) -> str:
+    """
+    Put every GitHub mention in *text* inside a code span (#124).
+
+    Reviewer and verifier text reaches GitHub unchanged, and GitHub
+    notifies whoever is named after an ``@``: a reviewer writing about
+    the npm package ``@types/node`` notified the account ``types``.
+    Nothing the pipeline writes to GitHub is meant to notify anyone, and
+    GitHub reads no mentions inside code, so each one is sent wrapped in
+    backticks: the same text, rendered as code.
+
+    Left alone: fenced code blocks (an unclosed fence runs to the end),
+    inline code spans, HTML comments (where the finding-id marker
+    lives), email addresses and URLs. An indented code block is not
+    detected; a mention in one gains visible backticks but stays
+    harmless.
+
+    :param text: Markdown about to be sent as a title or body.
+    :returns: The same markdown with its mentions neutralized. Running
+        it again changes nothing.
+    """
+    out: list[str] = []
+    prose: list[str] = []
+    fence: str | None = None
+    for line in text.splitlines(keepends=True):
+        match = _FENCE_RE.match(line)
+        if fence is None:
+            if match is None:
+                prose.append(line)
+                continue
+            out.append(_neutralize_prose(''.join(prose)))
+            prose = []
+            fence = match.group(1)
+            out.append(line)
+            continue
+        out.append(line)
+        if (
+            match is not None
+            and match.group(1)[0] == fence[0]
+            and len(match.group(1)) >= len(fence)
+            and not line.strip()[len(match.group(1)):].strip()
+        ):
+            fence = None
+    out.append(_neutralize_prose(''.join(prose)))
+    return ''.join(out)
+
+
 def pr_number(pr_url: str, slug: str) -> int | None:
     """
     The number of a pull request on *slug*, from its URL.
@@ -331,9 +412,9 @@ def _pr_create_command(
         '--head',
         head,
         '--title',
-        title,
+        neutralize_mentions(title),
         '--body',
-        body,
+        neutralize_mentions(body),
     ]
     if draft:
         cmd.append('--draft')
@@ -452,7 +533,8 @@ class WorktreeManager:
         """
         slug = github_slug(repo_url)
         base = ['gh', 'issue', 'create', '-R', slug,
-                '--title', title, '--body', body]
+                '--title', neutralize_mentions(title),
+                '--body', neutralize_mentions(body)]
         try:
             return self._run_publish(
                 base + (['--label', label] if label else [])
@@ -2255,7 +2337,8 @@ class WorktreeManager:
                 f'{pr_url.strip()!r} is not a pull request of {slug}'
             )
         self._run_publish(
-            ['gh', 'pr', 'edit', str(number), '-R', slug, '--body', body]
+            ['gh', 'pr', 'edit', str(number), '-R', slug,
+             '--body', neutralize_mentions(body)]
         )
 
     def _remove_under_root(self, path: str) -> None:
