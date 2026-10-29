@@ -882,6 +882,22 @@ decision and the reasoning in the reply, or label it `DISPUTED` and stop.
 The **planner is deliberately excluded**: its interactive approval gate is the
 design, and it is the one stage with a human genuinely attending.
 
+**A dispute stops the run.** A dispute is a line that *starts* with `DISPUTED:`
+followed by the claim; the word anywhere else is the instruction echoed back.
+Which stages it stops depends on the kind:
+- **A writer:** the run stops after its work is committed.
+- **A reader other than the planner:** the run stops before any later stage runs,
+  so a read-only check of the tests or the plan can stop the writers building on
+  a contract it disputes. The stage isn't recorded as complete, so `--resume`
+  runs it again once the contract is settled.
+- **A reviewer:** only when it also blocks. A dispute beside an approval is an
+  observation.
+
+Re-driving a writer can't fix a contract it isn't allowed to change, so carrying
+on would only spend the run's rounds. The disputing stage's full reply is saved
+under `turns/`. A dispute in the wrong shape, such as the marker in a heading,
+can't be read, so the run continues and prints a `[dispute]` warning instead.
+
 Belt and braces, a turn that opens a prompt anyway is now **detected and failed
 fast** rather than waiting out the turn budget — the runner reads the session's
 pending elicitations, which it checks *before* status, because a session reads
