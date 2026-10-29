@@ -15,32 +15,43 @@ not theoretical — it has cost this project four separate days:
 
 ## Known-good set
 
-Recorded on **2026-10-25**: image `ghcr.io/omnigent-ai/omnigent-host:v0.19.1`
-with no `sbx.claude_version` pin, read by a pipeline run from each agent's VM
-after its first turn. Each CLI got there differently:
+Recorded on **2026-10-28**: Omnigent v0.20.0 with image
+`ghcr.io/omnigent-ai/omnigent-host:v0.20.0`, no `sbx.claude_version` pin, and
+`sbx.agy_update: true`, read by a pipeline run from each agent's VM after its first
+turn. Each CLI got there differently:
 
-- **claude:** the image carries Claude Code 2.1.307. Without a pin, Claude Code's
-  own updater runs in every VM, and the writer's VM had moved to **2.1.310**
+- **claude:** the image carries Claude Code 2.1.311. Without a pin, Claude Code's
+  own updater runs in every VM, and the writer's VM had moved to **2.1.312**
   before its first turn. Expect this one to drift from run to run.
 - **codex:** the image's version, unchanged in the VM.
-- **agy:** the image's pinned version, also unchanged. agy updates itself only
-  when the VM can reach its updater host (see below), and the current global sbx
-  rules do not allow it. `sbx.agy_update` updates it on purpose; see
-  [Updating agy](#updating-agy-sbxagy_update).
+- **agy:** the image still pins **1.1.16**. `sbx.agy_update` moved it to **1.4.9**,
+  the newest release that day; see [Updating agy](#updating-agy-sbxagy_update).
+  Without `agy_update`, agy stays on 1.1.16: it updates itself only when the VM can
+  reach its updater host, and the current global sbx rules don't allow it. Run that
+  way and every agy session warns against this set.
 
 | CLI | Version |
 | --- | --- |
-| `@anthropic-ai/claude-code` | 2.1.310 |
-| `@openai/codex` | 0.163.0 |
-| `agy` (Antigravity CLI) | 1.1.16 |
+| `@anthropic-ai/claude-code` | 2.1.312 |
+| `@openai/codex` | 0.164.0 |
+| `agy` (Antigravity CLI) | 1.4.9 |
 
 Models confirmed on that image, each through a real pipeline turn:
 
 | Harness | Model | Effort | How | Recorded |
 | --- | --- | --- | --- | --- |
+| `claude-native` | `claude-opus-5-5` | default | a writer turn completed the task, and the verify gate passed on its branch | 2026-10-28 |
+| `codex-native` | `gpt-6-astra` | default | a reviewer turn returned `VERDICT: APPROVED` | 2026-10-28 |
+| `antigravity-native` | `gemini-4-argon-high` | in the model id | with `agy_update` on: the pane read `Gemini 4 Argon (High)`, agy called Vertex AI, and the reviewer turn returned `VERDICT: APPROVED` | 2026-10-28 |
+
+Earlier rows, on `v0.19.1`:
+
+| Harness | Model | Effort | How | Recorded |
+| --- | --- | --- | --- | --- |
 | `claude-native` | `claude-opus-5-5` | default | a writer turn completed the task, and the verify gate passed on its branch | 2026-10-25 |
 | `codex-native` | `gpt-6-astra` | default | a reviewer turn returned `VERDICT: APPROVED` | 2026-10-25 |
-| `antigravity-native` | `gemini-3.8-flash-high` | in the model id | a reviewer turn returned `VERDICT: APPROVED` | 2026-10-25 |
+| `antigravity-native` | `gemini-3.8-flash-high` | in the model id | a reviewer turn returned `VERDICT: APPROVED`, on the image's agy 1.1.16 | 2026-10-25 |
+| `antigravity-native` | `gemini-4-argon-high` | in the model id | with `agy_update` on (agy 1.4.8): the pane read `Gemini 4 Argon (High)` and the reviewer turn returned `VERDICT: APPROVED` | 2026-10-27 |
 
 Earlier rows, on `v0.13.0`:
 
@@ -92,6 +103,7 @@ rows is what a run that wedges right after an upgrade gets compared against.
 
 | Recorded | Image | claude | codex | agy |
 | --- | --- | --- | --- | --- |
+| 2026-10-28 | `omnigent-host:v0.20.0`, no Claude pin, `agy_update` on; Claude updated itself from the image's 2.1.311, agy updated from 1.1.16 | 2.1.312 | 0.164.0 | 1.4.9 |
 | 2026-10-25 | `omnigent-host:v0.19.1`, no Claude pin; Claude updated itself in the VM from the image's 2.1.307 | 2.1.310 | 0.163.0 | 1.1.16 |
 | 2026-09-23 | `omnigent-host:v0.13.0` + `claude_version: 2.1.280`; agy updated itself in the VM | 2.1.280 | 0.153.4 | 1.2.9 |
 | 2026-09-23 | `omnigent-host:v0.13.0` + `claude_version: 2.1.280` | 2.1.280 | 0.153.4 | 1.1.16 |
@@ -188,7 +200,9 @@ before; the trusted box, the harvester and the swap secret are unchanged.
   `agy_gcp_project`, so `agy_update` needs it and is refused without it.
 - Proven on 2026-10-25 outside Omnigent: agy 1.4.7 signed in this way and served
   `gemini-4-argon` (`models/gemini-4-argon:streamGenerateContent`, read from agy's
-  own log).
+  own log). Then through pipeline reviewer turns on Omnigent v0.19.1 (agy 1.4.8,
+  2026-10-27) and v0.20.0 (agy 1.4.9, 2026-10-28): each pane read
+  `Gemini 4 Argon (High)` and each review returned a verdict.
 
 - **It's off by default for a reason.** Omnigent pins agy because its bridge drives
   agy's screen, and a newer agy can draw it differently. Run a small pipeline with

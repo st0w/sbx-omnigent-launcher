@@ -84,7 +84,7 @@ verify:                    # optional — the mechanical gate run before publish
     cargo test --workspace
     cargo llvm-cov --workspace --fail-under-lines {coverage_min}
   demo: ./scripts/demo.sh  #   optional — its output becomes the PR's proof
-  image: ghcr.io/omnigent-ai/omnigent-host:v0.19.1  # optional — pin the gate's VM
+  image: ghcr.io/omnigent-ai/omnigent-host:v0.20.0  # optional — pin the gate's VM
                            #   to the image your agents use (default: `:latest`)
 # task/acceptance/context each accept a *_file variant (task_file:, acceptance_file:,
 # context_file:) that reads the text from a path relative to this yaml — pick ONE
