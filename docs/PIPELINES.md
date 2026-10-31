@@ -457,9 +457,10 @@ against the unmodified tree.
   contradicts the brief or the acceptance contract, or a brief that contradicts
   itself. It never sends work back to the tests stage: asked to resolve a
   conflict, that stage tends to weaken a test.
-- **Recorded, run continues** (`FINDINGS:`): a test that already passes before
-  anything is built, a test that checks source text or file layout instead of
-  behaviour, and a requirement no test covers. The count is printed as `[check]`.
+- **Recorded, run continues** (`FINDINGS:`): a test the tests stage added that
+  already passes before anything is built, a test that checks source text or file
+  layout instead of behaviour, and a requirement no test covers. The count is
+  printed as `[check]`.
 
 Its reply is recorded beside the reviewers' reports, so its findings go where
 theirs do: the reviews record and the findings ledger on the published branch,
@@ -481,6 +482,40 @@ one that:
 - runs more than one agent;
 - also sets `write`, `gate`, `on_block`, `selects` or `verifies`;
 - or isn't in any writer's `needs`, which would let it run beside the writers.
+
+### Two checkers from different providers
+
+One model's blind spot is often another's catch, so a pipeline that has to find
+every contract that can't be met can run two checkers on different harnesses.
+Put them in one `parallel:` block, and list both in each writer's `needs`:
+
+```yaml
+agents:
+  checker_claude: {template: contract-checker, model: claude-fable-5-1, effort: max}
+  checker_codex:
+    template: contract-checker
+    harness: codex-native
+    model: gpt-6-astra
+    effort: xhigh
+stages:
+  - { id: tests, run: tdd, write: true, needs: [plan] }
+  - id: checks
+    parallel:
+      - { id: check-claude, run: checker_claude, checks: tests, needs: [tests] }
+      - { id: check-codex,  run: checker_codex,  checks: tests, needs: [tests] }
+  - id: implement
+    parallel:
+      - { id: impl-a, run: impl_a, write: true, from: tests, needs: [plan, check-claude, check-codex] }
+      - { id: impl-b, run: impl_b, write: true, from: tests, needs: [plan, check-claude, check-codex] }
+```
+
+The `parallel:` block matters. Both checkers run at once, and the run waits for
+both before it stops. When both dispute, the error carries one checker's claims
+and the console prints the other's (`[parallel] checks: … also failed`), so
+neither is lost. A checker that didn't dispute still has its findings recorded.
+Listed one after the other instead, a dispute from the first would stop the run
+before the second had looked. On `--resume`, only a checker that disputed runs
+again.
 
 ## Campaigns — build in sequence, one chunk at a time
 

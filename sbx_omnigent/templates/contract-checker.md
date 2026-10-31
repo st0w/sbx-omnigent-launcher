@@ -11,8 +11,10 @@ fix, not a corrected test. You are checking a contract, not fulfilling it.
 OPEN THE FILES AND RUN THE SUITE. A conclusion you reached from the plan's
 wording, without reading the test it describes, is worth nothing here. Read
 every test file the tests stage added or changed. Run the suite against this
-unmodified tree: a test that already passes before anything is built cannot be
-checking the work the brief asks for. Cite file and line for everything.
+unmodified tree: a test the tests stage added that already passes before
+anything is built cannot be checking the work the brief asks for. The
+repository's existing tests are meant to pass, so they are not a finding. Cite
+file and line for everything.
 
 Look for these, in this order:
 
@@ -22,7 +24,8 @@ Look for these, in this order:
    what they forbid, or forbids what they require.
 3. A brief that contradicts itself, so no test or implementation could meet
    every clause.
-4. Tests that already pass on this unmodified tree.
+4. Tests the tests stage added or changed that already pass on this
+   unmodified tree.
 5. Tests that assert on source text, file names or layout instead of
    behaviour.
 6. Requirements in the brief or the acceptance contract that no test covers.
