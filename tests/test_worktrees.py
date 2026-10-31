@@ -165,6 +165,17 @@ class TestWorktreeLifecycle(unittest.TestCase):
         self.assertIn('add app', log)
         self.assertEqual(_git(wt, 'status', '--porcelain').strip(), '')
 
+    def test_commit_worktree_leaves_out_git_s_probe_folder(self) -> None:
+        # The swarm CLI's worktrees are mounted into VMs the same way.
+        wt = self.mgr.create_swarm_worktree('swarm-e', self.up)
+        probe = os.path.join(wt, 'mtime-test-THhvhu', 'new-dir')
+        os.makedirs(probe)
+        with open(os.path.join(probe, 'new'), 'w', encoding='utf-8'):
+            pass
+        self.assertFalse(
+            self.mgr.commit_worktree('swarm-e', message='nothing')
+        )
+
     def test_commit_worktree_clean_tree_is_noop(self) -> None:
         self.mgr.create_swarm_worktree('swarm-d', self.up)
         self.assertFalse(

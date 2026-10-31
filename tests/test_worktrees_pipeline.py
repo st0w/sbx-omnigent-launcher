@@ -47,6 +47,19 @@ def _init_repo(path: Path) -> None:
     _git(path, 'commit', '-m', 'init')
 
 
+def _leave_git_probe(worktree: str | Path) -> None:
+    """What a failed ``git update-index --test-untracked-cache`` leaves.
+
+    Omnigent's runner runs that probe in the agent's repository, and on
+    an sbx mount it fails and leaves its scratch folder (seen live as
+    ``mtime-test-BqTsi1/newfile`` and ``new-dir/new``).
+    """
+    probe = Path(worktree) / 'mtime-test-BqTsi1'
+    (probe / 'new-dir').mkdir(parents=True)
+    (probe / 'newfile').write_text('data', encoding='utf-8')
+    (probe / 'new-dir' / 'new').write_text('', encoding='utf-8')
+
+
 def _files(path: str | Path) -> list[str]:
     return sorted(
         p.name for p in Path(path).iterdir() if p.name != '.git'
@@ -149,6 +162,59 @@ class TestPipelineWorktrees(unittest.TestCase):
     def test_an_unknown_branch_has_no_hub_tip(self) -> None:
         self.mgr.create_run('run1', self.repo)
         self.assertIsNone(self.mgr.hub_branch_tip('run1', 'never-ran'))
+
+    def test_git_s_probe_folder_is_never_committed(self) -> None:
+        self.mgr.create_run('run1', self.repo)
+        wt = self.mgr.create_node_worktree('run1', 'build')
+        _leave_git_probe(wt)
+        (Path(wt) / 'net.py').write_text('code\n', encoding='utf-8')
+        self.assertTrue(self.mgr.commit_node('run1', 'build', message='m'))
+        tracked = _git(Path(wt), 'ls-files').split()
+        self.assertIn('net.py', tracked)
+        self.assertFalse(
+            [t for t in tracked if t.startswith('mtime-test-')], tracked
+        )
+
+    def test_git_s_probe_folder_alone_is_not_a_change(self) -> None:
+        # The settle-wait reads `git status`: the leftover must not look
+        # like the agent's first write.
+        self.mgr.create_run('run1', self.repo)
+        wt = self.mgr.create_node_worktree('run1', 'build')
+        _leave_git_probe(wt)
+        self.assertEqual(
+            _git(Path(wt), 'status', '--porcelain').strip(), ''
+        )
+        self.assertFalse(self.mgr.commit_node('run1', 'build', message='m'))
+
+    def test_only_git_s_probe_name_is_excluded(self) -> None:
+        # A project folder that merely starts alike is still committed,
+        # and so is a nested one: git makes its probe at the top only.
+        self.mgr.create_run('run1', self.repo)
+        wt = Path(self.mgr.create_node_worktree('run1', 'build'))
+        (wt / 'mtime-tests').mkdir()
+        (wt / 'mtime-tests' / 'a.py').write_text('x\n', encoding='utf-8')
+        (wt / 'src' / 'mtime-test-abc').mkdir(parents=True)
+        (wt / 'src' / 'mtime-test-abc' / 'b.py').write_text(
+            'y\n', encoding='utf-8'
+        )
+        self.assertTrue(self.mgr.commit_node('run1', 'build', message='m'))
+        tracked = _git(wt, 'ls-files').split()
+        self.assertIn('mtime-tests/a.py', tracked)
+        self.assertIn('src/mtime-test-abc/b.py', tracked)
+
+    def test_the_exclude_entry_is_written_once(self) -> None:
+        # A replaced node is re-cloned; a staged task file appends to
+        # the same list.
+        self.mgr.create_run('run1', self.repo)
+        wt = self.mgr.create_node_worktree('run1', 'build')
+        self.mgr.write_ignored_file(wt, 'OMNI_TASK.md', 'do it')
+        wt = self.mgr.create_node_worktree('run1', 'build', replace=True)
+        self.mgr.write_ignored_file(wt, 'OMNI_TASK.md', 'again')
+        exclude = (Path(wt) / '.git' / 'info' / 'exclude').read_text(
+            encoding='utf-8'
+        ).split()
+        self.assertEqual(exclude.count('/mtime-test-*/'), 1)
+        self.assertEqual(exclude.count('OMNI_TASK.md'), 1)
 
     def test_write_ignored_file_hidden_from_git_and_commit(self) -> None:
         # A staged agy task file is readable by the agent but invisible

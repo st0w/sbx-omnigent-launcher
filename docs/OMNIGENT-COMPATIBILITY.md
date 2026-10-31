@@ -105,6 +105,24 @@ reinstall undoes it. To check whether a release contains the commit (expect
 gh api repos/omnigent-ai/omnigent/compare/<tag>...b9e80e9d3 --jq .status
 ```
 
+## Git's untracked-cache test leaves a folder in agent repositories
+
+Omnigent's runner, inside each VM, runs `git update-index
+--test-untracked-cache` in the agent's repository
+(`omnigent/runtime/filesystem_registry.py`, in every supported release). It's
+checking whether it can turn on a git speed-up. On an `sbx` mount git's test
+fails, because editing a file changes its folder's timestamp. When the test
+fails, git leaves its scratch folder at the top of the repository: a
+`mtime-test-XXXXXX` folder holding `newfile`, `new-dir/new`, or both.
+
+The orchestrator commits a writer's work with `git add -A`. Seen live, that put
+the folder into a tests stage's branch, the tests-only check then failed the
+stage for changing non-test files, and the agent sent to remove them ran git
+itself. So every clone an agent works in now lists `/mtime-test-*/` in its
+local `.git/info/exclude`, which is never committed. The folder is still
+created; it's just never committed, and `git status` doesn't count it as the
+agent's work.
+
 ## Two things this does NOT paper over
 
 **The host image is pinned separately.** `sandbox.sbx.image` in the
