@@ -775,6 +775,161 @@ class TestLoadPipeline(_Base):
         self.assertEqual(cfg.stages[1].selects, 'branch')
 
 
+_CHECK_AGENTS = """\
+name: contract
+repo: ./proj
+publish: none
+task: |
+  build parse_ports
+agents:
+  plan: {template: planner, model: claude-sonnet-5}
+  tdd: {template: tdd-writer, model: claude-sonnet-5}
+  checker: {template: bug-reviewer, model: claude-sonnet-5}
+  other: {template: bug-reviewer, model: claude-sonnet-5}
+  impl: {template: coder, model: claude-sonnet-5}
+stages:
+"""
+
+#: The shape #50 asks for: the check between the tests and the writers.
+_CHECK_STAGES = """\
+  - {id: plan, run: plan}
+  - {id: tests, run: tdd, write: true, needs: [plan]}
+  - {id: check, run: checker, checks: tests, needs: [tests]}
+  - id: implement
+    parallel:
+      - {id: impl-a, run: impl, write: true, from: tests, needs: [plan, check]}
+      - {id: impl-b, run: impl, write: true, from: tests, needs: [plan, check]}
+"""
+
+
+class TestAContractCheckStage(_Base):
+    """`checks:` declares a read-only check of a tests stage (#50).
+
+    It is only worth running between the tests and the writers, so every
+    placement that would make it check nothing in time is refused when
+    the pipeline loads, not discovered in a run.
+    """
+
+    def _refused(self, stages: str) -> str:
+        with self.assertRaises(P.PipelineError) as caught:
+            self._load(_CHECK_AGENTS + stages)
+        return str(caught.exception)
+
+    def _check_line(self, line: str) -> str:
+        return _CHECK_STAGES.replace(
+            '  - {id: check, run: checker, checks: tests, needs: [tests]}',
+            line,
+        )
+
+    def test_the_shape_from_the_issue_loads(self) -> None:
+        cfg = self._load(_CHECK_AGENTS + _CHECK_STAGES)
+        check = next(s for s in cfg.stages if s.id == 'check')
+        self.assertEqual(check.checks, 'tests')
+
+    def test_no_checks_key_means_none(self) -> None:
+        cfg = self._load(_FULL)
+        self.assertTrue(all(s.checks is None for s in cfg.stages))
+
+    def test_a_tests_only_writer_is_a_tests_stage_too(self) -> None:
+        # Declared per stage, for a test writer on another template.
+        stages = _CHECK_STAGES.replace(
+            '{id: tests, run: tdd, write: true, needs: [plan]}',
+            '{id: tests, run: impl, write: true, tests_only: true, '
+            'needs: [plan]}',
+        )
+        cfg = self._load(_CHECK_AGENTS + stages)
+        self.assertIn('check', [s.id for s in cfg.stages])
+
+    def test_an_unknown_target_is_refused(self) -> None:
+        message = self._refused(self._check_line(
+            '  - {id: check, run: checker, checks: tset, needs: [tests]}'
+        ))
+        self.assertIn("'check'", message)
+        self.assertIn("'tset'", message)
+
+    def test_a_target_that_is_not_a_tests_stage_is_refused(self) -> None:
+        message = self._refused(self._check_line(
+            '  - {id: check, run: checker, checks: plan, '
+            'needs: [tests, plan]}'
+        ))
+        self.assertIn("checks 'plan'", message)
+        self.assertIn('tdd-writer', message)
+        self.assertIn('tests_only', message)
+
+    def test_a_check_that_does_not_need_its_target_is_refused(self) -> None:
+        message = self._refused(self._check_line(
+            '  - {id: check, run: checker, checks: tests, needs: [plan]}'
+        ))
+        self.assertIn('needs', message)
+        self.assertIn("'tests'", message)
+
+    def test_a_check_no_writer_waits_for_is_refused(self) -> None:
+        # It would run beside the writers and check nothing in time.
+        stages = _CHECK_STAGES.replace('needs: [plan, check]', 'needs: [plan]')
+        message = self._refused(stages)
+        self.assertIn("'check'", message)
+        self.assertIn('no writer', message)
+
+    def test_more_than_one_agent_is_refused(self) -> None:
+        message = self._refused(self._check_line(
+            '  - {id: check, run: [checker, other], checks: tests, '
+            'needs: [tests]}'
+        ))
+        self.assertIn('one agent', message)
+
+    def test_another_kind_s_key_is_refused(self) -> None:
+        for extra in (
+            'write: true', 'gate: consensus', 'on_block: tests',
+            'selects: branch', 'verifies: findings',
+        ):
+            with self.subTest(extra=extra):
+                message = self._refused(self._check_line(
+                    '  - {id: check, run: checker, checks: tests, '
+                    f'needs: [tests], {extra}}}'
+                ))
+                self.assertIn(extra.split(':')[0], message)
+                self.assertIn('checks', message)
+
+    def test_a_non_string_target_is_refused(self) -> None:
+        self._refused(self._check_line(
+            '  - {id: check, run: checker, checks: [tests], needs: [tests]}'
+        ))
+
+
+class TestTheShippedContractCheck(unittest.TestCase):
+    """The template and the example that show `checks:` (#50)."""
+
+    _EXAMPLE = (
+        Path(__file__).resolve().parent.parent
+        / 'examples' / 'full-cadre' / 'pipeline.yaml'
+    )
+
+    def test_the_template_ships(self) -> None:
+        self.assertIn('contract-checker', P.available_templates())
+
+    def test_the_template_names_both_outcomes(self) -> None:
+        prompt = P.template_prompt('contract-checker')
+        self.assertIn('`DISPUTED:`', prompt)
+        self.assertIn('FINDINGS:', prompt)
+
+    def test_the_template_never_starts_a_line_with_the_marker(self) -> None:
+        # A checker quoting its role prompt back must not stop the run.
+        for line in P.template_prompt('contract-checker').splitlines():
+            with self.subTest(line=line):
+                self.assertFalse(line.lstrip().startswith('DISPUTED'))
+
+    def test_the_full_cadre_example_checks_its_tests(self) -> None:
+        cfg = P.load_pipeline(self._EXAMPLE)
+        stages = {s.id: s for s in P._iter_stages(cfg.stages)}
+        self.assertEqual(stages['check'].checks, 'tests')
+        self.assertEqual(
+            cfg.agents[stages['check'].run[0]].template, 'contract-checker'
+        )
+        for writer in ('impl-a', 'impl-b'):
+            with self.subTest(writer=writer):
+                self.assertIn('check', stages[writer].needs)
+
+
 class TestAClaudeAgentMustFitItsLaunchCommand(_Base):
     """A claude-native agent's instructions ride its launch command.
 

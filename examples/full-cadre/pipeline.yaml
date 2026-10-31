@@ -1,13 +1,17 @@
 # Full-cadre pipeline — the whole swarm in one file.
 #
-# Planning + TDD + two COMPETING coders (Claude vs agy), each vetted by a
-# security + bug reviewer consensus gate; a judge picks the winner, a refactor
-# agent polishes it, and one final review ships it. Every role the launcher
-# ships, working together:
+# Planning + TDD + a contract check + two COMPETING coders (Claude vs agy), each
+# vetted by a security + bug reviewer consensus gate; a judge picks the winner, a
+# refactor agent polishes it, and one final review ships it. Every role the
+# launcher ships, working together:
 #
-#   plan ─▶ tests ─┬─▶ impl-a (Claude) ─▶ review-a [sec+bugs] ─┐
-#    (agy)  (TDD)  └─▶ impl-b (agy)    ─▶ review-b [sec+bugs] ─┴─▶ pick ─▶ refactor ─▶ review-r ─▶ publish
-#                       each review loops findings back to its OWN impl on a block   (winner)   [sec+bugs]
+#   plan ─▶ tests ─▶ check ─┬─▶ impl-a (Claude) ─▶ review-a [sec+bugs] ─┐
+#    (agy)  (TDD)   (ro)    └─▶ impl-b (agy)    ─▶ review-b [sec+bugs] ─┴─▶ pick ─▶ refactor ─▶ review-r ─▶ publish
+#                                each review loops findings back to its OWN impl on a block   (winner)   [sec+bugs]
+#
+# The check reads the frozen suite beside the brief and the plan before either
+# coder starts. A contract no implementation could satisfy stops the run there
+# (`DISPUTED:`), before two full implement stages are spent on it.
 #
 # The competing impls are vetted BEFORE the judge — a review gate loops a block
 # back to its specific writer, so both candidates are clean before the judge
@@ -16,8 +20,8 @@
 # judge publishes its winner as its own branch, so the refactor writer can seed
 # `from: pick`.
 #
-# This is the heaviest example — up to ~12 microVMs (plan + tests + 2 impls +
-# 4 impl-reviewers + judge + refactor + 2 refactor-reviewers). Uses three
+# This is the heaviest example — up to ~13 microVMs (plan + tests + check +
+# 2 impls + 4 impl-reviewers + judge + refactor + 2 refactor-reviewers). Uses three
 # Antigravity (agy) agents; see Setup in README.md. To run with NO agy at all,
 # swap the antigravity-native agents below for claude-native (give impl_agy a
 # different model/effort so the two coders still differ) and drop agy_enabled
@@ -52,6 +56,9 @@ agents:
     template: tdd-writer
     model: claude-sonnet-5
     effort: high
+  checker:                      # reads the suite + brief + plan; stops the run on DISPUTED:
+    template: contract-checker
+    model: claude-sonnet-5
   impl_claude:                  # competing coder A — own isolated branch off the tests
     template: coder
     model: claude-sonnet-5
@@ -78,10 +85,11 @@ agents:
 stages:
   - { id: plan,  run: plan }                                    # design (interactive)
   - { id: tests, run: tdd, write: true, needs: [plan] }         # tests only, own branch
+  - { id: check, run: checker, checks: tests, needs: [tests] }  # can the contract be met?
   - id: implement                                               # two ISOLATED writers
     parallel:
-      - { id: impl-a, run: impl_claude, write: true, from: tests, needs: [plan] }
-      - { id: impl-b, run: impl_agy,    write: true, from: tests, needs: [plan] }
+      - { id: impl-a, run: impl_claude, write: true, from: tests, needs: [plan, check] }
+      - { id: impl-b, run: impl_agy,    write: true, from: tests, needs: [plan, check] }
   - id: review-a                                                # vet impl-a
     run: [sec, bugs]
     needs: [impl-a]
