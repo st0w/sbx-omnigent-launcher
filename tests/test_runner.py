@@ -1445,6 +1445,14 @@ class TestAContractCheck(_Base):
         self.assertIn('FINDINGS:', message)
         self.assertIn('already pass', message)
 
+    def test_only_tests_it_added_count_as_already_passing(self) -> None:
+        # Live, one checker listed the repository's existing tests as
+        # "already pass", when the contract requires them to.
+        _r, sc, _wt = self._go()
+        message = sc.message_for_label('check')
+        self.assertIn('A test the tests stage added or changed', message)
+        self.assertIn('existing tests are meant to', message)
+
     def test_its_own_turn_text_would_not_halt_the_run(self) -> None:
         # A checker that quotes its instructions back must not stop the
         # run, so no line of them starts with the marker.
@@ -1646,6 +1654,98 @@ class TestAContractCheck(_Base):
         # A halted check is never recorded as complete.
         _result, sc = self._resumed(['plan', 'tests'])
         self.assertNotEqual(sc.message_for_label('check'), '')
+
+
+#: Two contract checks side by side, from different providers in a real
+#: pipeline, so one model's blind spot is the other's catch.
+_TWO_CHECKS = """\
+name: checked2
+repo: ./proj
+publish: none
+task: |
+  build parse_ports
+acceptance: |
+  ranges are inclusive
+agents:
+  plan: {template: planner, model: claude-sonnet-5}
+  tw: {template: tdd-writer, model: claude-sonnet-5}
+  checker_a: {template: contract-checker, model: claude-sonnet-5}
+  checker_b: {template: contract-checker, model: claude-sonnet-5}
+  build: {template: coder, model: claude-sonnet-5}
+stages:
+  - {id: plan, run: plan}
+  - {id: tests, run: tw, write: true, needs: [plan]}
+  - id: checks
+    parallel:
+      - {id: check-a, run: checker_a, checks: tests, needs: [tests]}
+      - {id: check-b, run: checker_b, checks: tests, needs: [tests]}
+  - id: build
+    run: build
+    write: true
+    from: tests
+    needs: [plan, check-a, check-b]
+"""
+
+_TWO_CHECKS_REPLIES = {
+    'plan': 'THE PLAN', 'tests': 't',
+    'check-a': 'The contract holds.', 'check-b': 'The contract holds.',
+    'build': 'b',
+}
+
+
+class TestTwoContractChecks(_Base):
+    """
+    Two checkers in a `parallel:` block both finish before the run
+    stops, so neither one's view is lost to the other's dispute.
+
+    Listed one after the other, a dispute from the first would stop the
+    run before the second had looked.
+    """
+
+    _CLAIM_A = 'DISPUTED: tests/test_ports.py:12 excludes the upper bound.'
+    _CLAIM_B = 'DISPUTED: tests/test_ports.py:20 and :31 cannot both pass.'
+
+    def _wt(self) -> FakeWT:
+        wt = FakeWT()
+        wt.diff_files['tests'] = ['tests/test_ports.py']
+        return wt
+
+    def _halted(self, **replies: str):
+        sc = FakeSC({**_TWO_CHECKS_REPLIES, **replies})
+        wt = self._wt()
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            with self.assertRaises(R.PipelineRunError) as caught:
+                self._run(_TWO_CHECKS, {}, sc=sc, wt=wt)
+        printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
+        return str(caught.exception), printed, sc, wt
+
+    def test_both_run_before_the_writer(self) -> None:
+        result, sc, _wt = self._run(
+            _TWO_CHECKS, dict(_TWO_CHECKS_REPLIES), wt=self._wt()
+        )
+        self.assertEqual(result.status, 'completed')
+        order = [sc._label[session] for session, _m in sc.sent]
+        for check in ('check-a', 'check-b'):
+            with self.subTest(check=check):
+                self.assertLess(order.index(check), order.index('build'))
+
+    def test_one_dispute_stops_the_run_but_not_the_other_check(
+        self,
+    ) -> None:
+        message, _printed, sc, wt = self._halted(**{'check-a': self._CLAIM_A})
+        self.assertIn('excludes the upper bound', message)
+        self.assertEqual(sc.message_for_label('build'), '')
+        # check-b still ran, and its report was kept.
+        self.assertNotEqual(sc.message_for_label('check-b'), '')
+        self.assertIn('reviews/check-b-checker_b-r1.md', wt.artifacts)
+
+    def test_two_disputes_both_reach_the_human(self) -> None:
+        message, printed, _sc, _wt = self._halted(
+            **{'check-a': self._CLAIM_A, 'check-b': self._CLAIM_B}
+        )
+        both = message + ' ' + printed
+        self.assertIn('excludes the upper bound', both)
+        self.assertIn('cannot both pass', both)
 
 
 _CAMPAIGN_CHECKED = """\
