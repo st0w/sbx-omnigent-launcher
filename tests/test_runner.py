@@ -1321,6 +1321,367 @@ class TestAReaderDisputeHaltsTheRun(_Base):
         self.assertEqual(result.status, 'completed')
 
 
+#: A contract check declared as its own kind, between the tests stage
+#: and the writer that builds against it (#50).
+_CHECKS_TESTS = """\
+name: checked
+repo: ./proj
+publish: none
+task: |
+  build parse_ports
+acceptance: |
+  ranges are inclusive
+setup: |
+  install the toolchain
+agents:
+  plan: {template: planner, model: claude-sonnet-5}
+  tw: {template: tdd-writer, model: claude-sonnet-5}
+  checker: {template: bug-reviewer, model: claude-sonnet-5}
+  build: {template: coder, model: claude-sonnet-5}
+stages:
+  - {id: plan, run: plan}
+  - {id: tests, run: tw, write: true, needs: [plan]}
+  - {id: check, run: checker, checks: tests, needs: [tests]}
+  - {id: build, run: build, write: true, from: tests, needs: [plan, check]}
+"""
+
+_CHECKS_TESTS_REPLIES = {
+    'plan': 'THE PLAN', 'tests': 't',
+    'check': 'checker-report: the contract holds', 'build': 'b',
+}
+
+
+class TestAContractCheck(_Base):
+    """
+    A `checks:` stage reads the frozen suite beside the brief and the
+    plan, once, before any writer builds against them (#50).
+
+    Observed downstream: reviewers found six contract defects after both
+    writers had finished, four of which reading the brief and the suite
+    together would have found first.
+    """
+
+    _DISPUTE = (
+        'DISPUTED: tests/test_ports.py:12 excludes the upper bound the '
+        'acceptance contract includes.'
+    )
+
+    @staticmethod
+    def _wt() -> FakeWT:
+        wt = FakeWT()
+        wt.diff_files['tests'] = ['tests/test_ports.py']
+        return wt
+
+    def _go(self, check: str | None = None, *, wt=None, sc=None):
+        replies = dict(_CHECKS_TESTS_REPLIES)
+        if check is not None:
+            replies['check'] = check
+        return self._run(
+            _CHECKS_TESTS, replies, wt=wt or self._wt(), sc=sc
+        )
+
+    def _halted(self) -> tuple[R.PipelineRunError, FakeSC]:
+        sc = FakeSC({**_CHECKS_TESTS_REPLIES, 'check': self._DISPUTE})
+        with self.assertRaises(R.PipelineRunError) as caught:
+            self._go(wt=self._wt(), sc=sc)
+        return caught.exception, sc
+
+    # ── where it runs ─────────────────────────────────────────────
+
+    def test_it_runs_after_the_tests_and_before_the_writer(self) -> None:
+        _r, sc, _wt = self._go()
+        order = [sc._label[session] for session, _m in sc.sent]
+        self.assertLess(order.index('tests'), order.index('check'))
+        self.assertLess(order.index('check'), order.index('build'))
+
+    def test_it_reads_the_tests_branch(self) -> None:
+        _r, _sc, wt = self._go()
+        self.assertEqual(wt.node_from['check'], 'tests')
+
+    def test_a_clean_check_runs_on(self) -> None:
+        result, _sc, _wt = self._go()
+        self.assertEqual(result.status, 'completed')
+
+    # ── its turn ──────────────────────────────────────────────────
+
+    def test_its_turn_carries_the_whole_contract(self) -> None:
+        _r, sc, _wt = self._go()
+        message = sc.message_for_label('check')
+        for part in (
+            'build parse_ports',       # the brief
+            'ranges are inclusive',    # the acceptance contract
+            'THE PLAN',                # what the tests were written from
+            'tests/test_ports.py',     # what the tests stage changed
+            'install the toolchain',   # setup, to run the suite
+        ):
+            with self.subTest(part=part):
+                self.assertIn(part, message)
+
+    def test_its_turn_says_the_mount_is_read_only(self) -> None:
+        _r, sc, _wt = self._go()
+        self.assertIn(R._REVIEW_MOUNT, sc.message_for_label('check'))
+
+    def test_its_turn_carries_the_unattended_rules(self) -> None:
+        _r, sc, _wt = self._go()
+        self.assertIn(R._UNATTENDED, sc.message_for_label('check'))
+
+    def test_its_turn_is_not_a_build_order(self) -> None:
+        # A plain reader is handed "Task: <the feature>", which reads as
+        # an instruction to build it.
+        _r, sc, _wt = self._go()
+        message = sc.message_for_label('check')
+        self.assertNotIn('Task:', message)
+        self.assertIn('Do NOT implement', message)
+
+    def test_its_turn_says_what_stops_the_run(self) -> None:
+        _r, sc, _wt = self._go()
+        message = sc.message_for_label('check')
+        self.assertIn('`DISPUTED:`', message)
+        self.assertIn('file:line', message)
+
+    def test_its_turn_says_what_is_only_recorded(self) -> None:
+        _r, sc, _wt = self._go()
+        message = sc.message_for_label('check')
+        self.assertIn('FINDINGS:', message)
+        self.assertIn('already pass', message)
+
+    def test_its_own_turn_text_would_not_halt_the_run(self) -> None:
+        # A checker that quotes its instructions back must not stop the
+        # run, so no line of them starts with the marker.
+        _r, sc, _wt = self._go()
+        self.assertEqual(
+            R.parse_disputes(sc.message_for_label('check')), ()
+        )
+
+    # ── a dispute ─────────────────────────────────────────────────
+
+    def test_a_dispute_halts_before_any_writer_gets_a_turn(self) -> None:
+        _exc, sc = self._halted()
+        self.assertEqual(sc.message_for_label('build'), '')
+
+    def test_the_halt_names_the_check_and_the_claim(self) -> None:
+        exc, _sc = self._halted()
+        message = str(exc)
+        self.assertTrue(message.startswith('check: '), message)
+        self.assertIn('excludes the upper bound', message)
+        self.assertIn('contract check', message)
+
+    # ── its report ────────────────────────────────────────────────
+
+    _WITH_FINDINGS = (
+        'The contract holds.\n\nFINDINGS:\n'
+        '- test_parse_empty already passes on the unmodified tree\n'
+        '- requirement 4 has no test\n'
+    )
+
+    def test_its_report_is_kept_with_the_review_records(self) -> None:
+        # A completed run deletes its run directory, so `turns/` alone
+        # lost every finding of a check that let the writers go on.
+        _r, _sc, wt = self._go(self._WITH_FINDINGS)
+        self.assertIn(
+            'requirement 4 has no test',
+            wt.artifacts['reviews/check-checker-r1.md'],
+        )
+
+    def test_its_record_says_it_was_not_a_vote(self) -> None:
+        # The record's header says every reviewer approved the branch,
+        # which the check did not do.
+        _r, _sc, wt = self._go(self._WITH_FINDINGS)
+        record = wt.artifacts['reviews/check-checker-r1.md']
+        self.assertIn('contract check', record)
+        self.assertIn('not a vote', record)
+
+    def test_a_record_of_votes_only_says_nothing_of_checks(self) -> None:
+        rec = R.ReviewRecord(
+            chunk=None, stage='review', reviewer='sec', round_no=1,
+            verdict='APPROVED',
+        )
+        self.assertNotIn(
+            'contract check', R.render_review_records([rec], title='T')
+        )
+
+    def test_its_record_says_there_was_no_dispute(self) -> None:
+        _r, _sc, wt = self._go(self._WITH_FINDINGS)
+        record = wt.artifacts['reviews/check-checker-r1.md']
+        self.assertIn('NO DISPUTE', record)
+
+    def test_its_findings_reach_the_ledger_when_the_run_publishes(
+        self,
+    ) -> None:
+        local = _CHECKS_TESTS.replace('publish: none', 'publish: local')
+        _r, _sc, wt = self._run(
+            local,
+            {**_CHECKS_TESTS_REPLIES, 'check': self._WITH_FINDINGS},
+            wt=self._wt(),
+        )
+        ledger = next(
+            (c for _t, rel, c in wt.tracked_files
+             if rel.endswith('-findings.md')),
+            '',
+        )
+        self.assertIn('requirement 4 has no test', ledger)
+
+    def test_it_is_not_listed_as_a_vote_on_the_branch(self) -> None:
+        # The pull request's roster says every reviewer approved the
+        # branch; the check read the contract, not the branch.
+        reviewed = _CHECKS_TESTS.replace(
+            'publish: none', 'publish: local'
+        ).replace(
+            '  build: {template: coder, model: claude-sonnet-5}\n',
+            '  build: {template: coder, model: claude-sonnet-5}\n'
+            '  sec: {template: security-reviewer, model: claude-sonnet-5}\n',
+        ) + (
+            '  - {id: review, run: [sec], needs: [build], gate: consensus,'
+            ' on_block: build}\n'
+        )
+        _r, _sc, wt = self._run(
+            reviewed,
+            {
+                **_CHECKS_TESTS_REPLIES,
+                'check': self._WITH_FINDINGS,
+                'review-sec': 'Ran the suite.\nVERDICT: APPROVED',
+            },
+            wt=self._wt(),
+        )
+        body = wt.pr_bodies[-1]
+        self.assertIn('`review-sec`', body)
+        self.assertNotIn('check-checker', body)
+
+    def test_findings_are_reported_not_halted_on(self) -> None:
+        reply = (
+            'The contract holds.\n\nFINDINGS:\n'
+            '- test_parse_empty already passes on the unmodified tree\n'
+            '- requirement 4 has no test\n'
+        )
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            result, _sc, _wt = self._go(reply)
+        self.assertEqual(result.status, 'completed')
+        printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
+        self.assertIn('[check] check:', printed)
+        self.assertIn('2 finding(s)', printed)
+        self.assertNotIn('turns/check.md', printed)
+
+    def test_the_writer_never_sees_its_report(self) -> None:
+        _r, sc, _wt = self._go()
+        self.assertNotIn('checker-report', sc.message_for_label('build'))
+
+    # ── its VM ────────────────────────────────────────────────────
+
+    def test_its_vm_is_freed_before_the_writer_runs(self) -> None:
+        # Teardown frees every VM once at the end anyway, so the test is
+        # WHEN: what had been sent by the time the checker's VM went.
+        sc = FakeSC(dict(_CHECKS_TESTS_REPLIES))
+        sent_when_freed: list[str] = []
+        dispose = sc.dispose
+
+        def recording_dispose(session: str) -> None:
+            if sc._label.get(session) == 'check':
+                sent_when_freed.extend(sc._label[s] for s, _m in sc.sent)
+            dispose(session)
+
+        with mock.patch.object(sc, 'dispose', side_effect=recording_dispose):
+            self._go(sc=sc)
+        self.assertIn('check', sent_when_freed)
+        self.assertNotIn('build', sent_when_freed)
+
+    def test_the_vm_estimate_counts_it_as_freed(self) -> None:
+        without = _CHECKS_TESTS.replace(
+            '  - {id: check, run: checker, checks: tests, needs: [tests]}\n',
+            '',
+        ).replace('needs: [plan, check]', 'needs: [plan]')
+        self.assertEqual(
+            R.max_concurrent_vms(self._cfg(_CHECKS_TESTS)),
+            R.max_concurrent_vms(self._cfg(without)),
+        )
+
+    def test_provision_only_binds_it_read_only(self) -> None:
+        no_task = _CHECKS_TESTS.replace('task: |\n  build parse_ports\n', '')
+        result, _sc, wt = self._run(no_task, {})
+        by_node = {b['node']: b for b in result.bindings}
+        self.assertEqual(by_node['check']['mode'], 'ro')
+        self.assertEqual(result.nodes['check'].kind, 'check')
+        self.assertEqual(wt.node_from['check'], 'tests')
+
+    # ── resume ────────────────────────────────────────────────────
+
+    def _resumed(self, completed: list[str]):
+        cfg = self._cfg(_CHECKS_TESTS)
+        kinds = {'plan': 'reader', 'tests': 'writer', 'check': 'check'}
+        wt = self._wt()
+        wt.state_to_load = {
+            'version': R.RUN_STATE_VERSION,
+            'completed': completed,
+            'completed_chunks': [],
+            'plan_of_record': 'THE PLAN',
+            'published': [],
+            'last_branch_node': None,
+            'subtasks': [],
+            'nodes': {
+                n: {
+                    'kind': kinds[n],
+                    'branch': f'pl/r1/{n}' if n == 'tests' else None,
+                    'worktree': f'/wt/r1/nodes/{n}',
+                    'output': _CHECKS_TESTS_REPLIES[n],
+                    'verdict': None,
+                    'selected': None,
+                }
+                for n in completed
+            },
+        }
+        sc = FakeSC(dict(_CHECKS_TESTS_REPLIES))
+        runner = R.PipelineRunner(
+            cfg, session_client=sc, worktree_manager=wt, run_id='r1',
+            agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0, resume=True,
+        )
+        return runner.run(), sc
+
+    def test_a_resume_skips_a_completed_check(self) -> None:
+        result, sc = self._resumed(['plan', 'tests', 'check'])
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(sc.message_for_label('check'), '')
+        self.assertNotEqual(sc.message_for_label('build'), '')
+
+    def test_a_resume_runs_a_halted_check_again(self) -> None:
+        # A halted check is never recorded as complete.
+        _result, sc = self._resumed(['plan', 'tests'])
+        self.assertNotEqual(sc.message_for_label('check'), '')
+
+
+_CAMPAIGN_CHECKED = """\
+name: camp
+repo: ./proj
+publish: local
+task: |
+  build the whole thing
+acceptance: |
+  it works
+agents:
+  plan: {template: planner, model: claude-sonnet-5}
+  tw: {template: tdd-writer, model: claude-sonnet-5}
+  checker: {template: bug-reviewer, model: claude-sonnet-5}
+  build: {template: coder, model: claude-sonnet-5}
+stages:
+  - {id: plan, run: plan}
+  - {id: tests, run: tw, write: true, needs: [plan]}
+  - {id: check, run: checker, checks: tests, needs: [tests]}
+  - {id: build, run: build, write: true, from: tests, needs: [plan, check]}
+"""
+
+
+class TestAContractCheckInACampaign(_Base):
+    """Each module's check reads THAT module's tests branch."""
+
+    def test_each_module_checks_its_own_tests(self) -> None:
+        _r, _sc, wt = self._run(
+            _CAMPAIGN_CHECKED,
+            {'plan': _plan_with_subtasks('m0', 'm1')},
+            interactive_plan=False,
+        )
+        self.assertEqual(wt.node_from['m0-check'], 'm0-tests')
+        self.assertEqual(wt.node_from['m1-check'], 'm1-tests')
+
+
 class TestADisputeHaltsInsteadOfReDriving(_Base):
     """
     A stage saying its CONTRACT is impossible stops the run.

@@ -333,6 +333,10 @@ class PipelineStage:
         reviewers raised and checks each against the code, so a finding
         that does not reproduce, or that the codebase already records,
         never becomes an issue somebody has to triage by hand.
+    :param checks: When set, the stage's agent is a CONTRACT CHECKER:
+        it reads the named tests stage's frozen suite beside the brief
+        and the plan, before any writer builds against them, and stops
+        the run when they cannot all be satisfied (#50).
     :param parallel: Concurrent sub-stages (each a full PipelineStage),
         for competing isolated writers.
     """
@@ -346,6 +350,7 @@ class PipelineStage:
     on_block: str | None = None
     selects: str | None = None
     verifies: str | None = None
+    checks: str | None = None
     #: Hold this writer to TEST code only — every path it changes must
     #: match ``test_paths`` (or ``generated``). Declared per stage
     #: rather than inferred from the template: a pipeline may run the
@@ -609,6 +614,7 @@ def _parse_stage(raw: object, *, index: int) -> PipelineStage:
         verifies=_opt_str(
             entry.get('verifies'), f'stage {sid!r} verifies'
         ),
+        checks=_opt_str(entry.get('checks'), f'stage {sid!r} checks'),
     )
 
 
@@ -701,6 +707,7 @@ def _validate(config: PipelineConfig) -> None:
     """
     seen_ids = _validate_stage_ids(config)
     _validate_stage_refs(config, seen_ids)
+    _validate_contract_checks(config)
     _validate_model_families(config)
     _validate_codex_efforts(config)
     _validate_agy_efforts(config)
@@ -751,6 +758,7 @@ def _validate_stage_refs(
             *[(n, 'needs') for n in stage.needs],
             *([(stage.on_block, 'on_block')] if stage.on_block else []),
             *([(stage.from_branch, 'from')] if stage.from_branch else []),
+            *([(stage.checks, 'checks')] if stage.checks else []),
         ):
             if ref not in seen_ids:
                 raise PipelineError(
@@ -876,6 +884,82 @@ def _validate_launch_sizes(config: PipelineConfig) -> None:
             f'material from `context:` into `task:`, which is sent as a '
             f'turn instead.'
         )
+
+
+#: The keys that declare a stage kind other than a contract check.
+_OTHER_KIND_KEYS = ('write', 'gate', 'on_block', 'selects', 'verifies')
+
+
+def _is_tests_stage(config: PipelineConfig, stage: PipelineStage) -> bool:
+    """
+    Whether *stage* writes the frozen suite: a test-writer writer.
+
+    :param config: The assembled config.
+    :param stage: The stage to classify.
+    :returns: ``True`` for a writer that sets ``tests_only`` or whose
+        agent uses the ``tdd-writer`` template.
+    """
+    if not stage.write or len(stage.run) != 1:
+        return False
+    agent = config.agents.get(stage.run[0])
+    return stage.tests_only or (
+        agent is not None and agent.template == 'tdd-writer'
+    )
+
+
+def _validate_contract_checks(config: PipelineConfig) -> None:
+    """
+    Refuse a ``checks:`` stage that could not check anything in time.
+
+    A contract check is only worth its turn between the tests stage and
+    the writers that build against it (#50). Each refusal names the
+    fix, so a misplaced check is found when the pipeline loads rather
+    than after a run has spent the writers' turns anyway.
+
+    :param config: The assembled config, its references already
+        checked by :func:`_validate_stage_refs`.
+    :raises PipelineError: On a check combined with another kind's
+        key, run by more than one agent, aimed at something that is not
+        a tests stage, not after its target, or that no writer waits
+        for.
+    """
+    stages = _iter_stages(config.stages)
+    by_id = {stage.id: stage for stage in stages}
+    for stage in stages:
+        if stage.checks is None:
+            continue
+        sid, target = stage.id, stage.checks
+        other = [key for key in _OTHER_KIND_KEYS if getattr(stage, key)]
+        if other:
+            raise PipelineError(
+                f'stage {sid!r}: checks cannot be combined with '
+                f'{", ".join(other)}. A contract check is its own kind '
+                f'of stage: read-only, driven once.'
+            )
+        if len(stage.run) != 1:
+            raise PipelineError(
+                f'stage {sid!r}: a contract check runs one agent, not '
+                f'{len(stage.run)}.'
+            )
+        if not _is_tests_stage(config, by_id[target]):
+            raise PipelineError(
+                f'stage {sid!r} checks {target!r}, which is not a tests '
+                f'stage. It must name a writer whose agent uses the '
+                f'tdd-writer template, or that sets tests_only: true.'
+            )
+        if target not in stage.needs:
+            raise PipelineError(
+                f'stage {sid!r} checks {target!r} but does not list it '
+                f'in needs, so it could run before {target!r} has '
+                f'written anything. Add {target!r} to its needs.'
+            )
+        if not any(s.write and sid in s.needs for s in stages):
+            raise PipelineError(
+                f'stage {sid!r}: no writer lists it in needs, so it would '
+                f'run beside the writers and check nothing before they '
+                f'build. Add {sid!r} to the needs of each writer that '
+                f'builds against {target!r}.'
+            )
 
 
 def _iter_stages(

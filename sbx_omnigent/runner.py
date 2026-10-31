@@ -1083,6 +1083,33 @@ _REVIEW_DISPUTE = (
     'would change.'
 )
 
+#: What a contract check stops the run for, and what it only records
+#: (#50). The marker is kept mid-sentence for the same reason as in
+#: :data:`_REVIEW_DISPUTE`: a checker quoting this back must not halt.
+_CHECK_RULES = (
+    '\n\nWHAT STOPS THE RUN. The contract cannot be met when two tests '
+    'cannot both pass, a test contradicts the brief or the acceptance '
+    'contract, or the brief contradicts itself. For each, write a line '
+    'of its own that begins with the marker `DISPUTED:` followed by a '
+    'one-line claim, which stops the run for a human before any writer '
+    'starts. Below it, name BOTH conflicting artifacts with file:line, '
+    'quote the requirement from each, say which one is wrong, and say '
+    'what an implementation would have to do to satisfy both, or that '
+    'nothing could. If you cannot do all four, it is not a dispute.'
+    '\n\nWHAT IS ONLY RECORDED. A test that would already pass on '
+    'this unmodified tree, a test asserting on source text or file '
+    'layout instead of behaviour, and a requirement in the brief that '
+    'no test covers make the suite weaker, but a writer can still meet '
+    'it. List each under a line reading exactly `FINDINGS:`, one `- ` '
+    'item per line, naming the test or requirement. The run continues '
+    'and a human reads them. If you find nothing of either kind, say '
+    'that plainly and how you checked.'
+)
+
+#: What a contract check's record says when it let the writers go on:
+#: it read the contract, so it neither approved nor blocked a branch.
+_CHECK_VERDICT = 'NO DISPUTE'
+
 _REVIEW_NOT_THE_GATE = (
     '\n\nRUN THE TESTS, NOT THE COVERAGE GATE. Execute the suite '
     'covering what you are reviewing — that is what stops an empty '
@@ -2809,6 +2836,17 @@ def render_review_records(
         '',
         'Messages only — no tool calls and no tool output.',
         '',
+    ]
+    if any(rec.verdict == _CHECK_VERDICT for rec in records):
+        parts += [
+            f'A row marked {_CHECK_VERDICT} is a contract check, not a '
+            f'vote on this branch: it read the frozen tests beside the '
+            f'brief and the plan before any writer started, and would '
+            f'have stopped the run had they been impossible to meet. '
+            f'Its findings are kept and filed like any reviewer finding.',
+            '',
+        ]
+    parts += [
         '| Reviewer | Round | Verdict |',
         '| --- | --- | --- |',
     ]
@@ -4329,12 +4367,13 @@ class PipelineRunner:
         :param stage: The stage that just completed.
         :param kind: Its :meth:`_stage_kind`.
         """
-        # A verifier belongs with the reader and the judge: it is
-        # driven once, inside its own stage, and nothing loops back to
-        # it. Left out of this tuple it would hold a full guest through
-        # publish — the exact waste described above.
+        # A verifier and a contract check belong with the reader and
+        # the judge: each is driven once, inside its own stage, and
+        # nothing loops back to it. Left out of this tuple either would
+        # hold a full guest through publish — the exact waste described
+        # above.
         if self._keep or kind not in (
-            'reader', 'judge', 'writer', 'verify'
+            'reader', 'judge', 'writer', 'verify', 'check'
         ):
             return
         if kind == 'writer':
@@ -4611,6 +4650,7 @@ class PipelineRunner:
             needs=tuple(ns(n) for n in stage.needs),
             from_branch=new_from,
             on_block=ns(stage.on_block) if stage.on_block else None,
+            checks=ns(stage.checks) if stage.checks else None,
         )
 
     def _resolve_campaign_winner(self, chunk_id: str) -> str:
@@ -4858,7 +4898,7 @@ class PipelineRunner:
             series_note=series_note,
             task=task,
             review_doc=review_doc,
-            reviews=self._chunk_reviews(),
+            reviews=self._chunk_votes(),
             picks=self._chunk_picks(),
             pick_doc=pick_doc,
             findings=list(self._filed_findings),
@@ -5156,6 +5196,24 @@ class PipelineRunner:
         """:returns: The votes belonging to the publishing chunk."""
         chunk = self._active_subtask.id if self._active_subtask else None
         return [r for r in self._reviews if r.chunk == chunk]
+
+    def _chunk_votes(self) -> list[ReviewRecord]:
+        """
+        The publishing chunk's records that voted on its branch.
+
+        A contract check is recorded beside the reviewers so its
+        findings are kept, but it read the contract, not the branch, so
+        the pull request's roster of approvals leaves it out.
+
+        :returns: The chunk's review records, contract checks excluded.
+        """
+        return [
+            r for r in self._chunk_reviews()
+            if not (
+                (stage := self._stage_by_id.get(r.stage)) is not None
+                and stage.checks
+            )
+        ]
 
     def _commit_review_records(
         self, winner: str, plan_path: str
@@ -6614,6 +6672,8 @@ class PipelineRunner:
                 self._run_judge(stage)
             elif kind == 'verify':
                 self._run_verify(stage)
+            elif kind == 'check':
+                self._run_check(stage)
             elif kind == 'review':
                 self._run_review(stage)
             else:
@@ -6641,6 +6701,8 @@ class PipelineRunner:
             return 'judge'
         if stage.verifies:
             return 'verify'
+        if stage.checks:
+            return 'check'
         if stage.gate or stage.on_block:
             return 'review'
         return 'reader'
@@ -6684,6 +6746,8 @@ class PipelineRunner:
             self._provision_node(stage, 'writer', 'rw')
         elif kind == 'reader':
             self._provision_node(stage, 'reader', 'ro')
+        elif kind == 'check':
+            self._provision_node(stage, 'check', 'ro')
         elif kind == 'review':
             target_wt = self._nodes[self._review_target(stage)].worktree
             assert target_wt is not None
@@ -7095,6 +7159,50 @@ class PipelineRunner:
                 # beyond its own module is the decisions it settled that
                 # bind later ones.
                 self._record_decisions(node.output)
+
+    def _run_check(self, stage: pipeline.PipelineStage) -> None:
+        """
+        Read the frozen contract once, before any writer builds on it.
+
+        A ``checks:`` stage reads the tests stage's suite beside the
+        brief and the plan (#50). A contract that cannot be satisfied is
+        a dispute, and the run stops here, before two writers spend a
+        full stage each on it. Weaker-but-satisfiable problems (a test
+        that already passes, one asserting on source text, a requirement
+        with no test) are recorded in its ``FINDINGS:`` block, and the
+        run goes on.
+
+        A check that lets the writers go on is recorded beside the
+        reviewers' reports, so its findings reach the findings ledger
+        and the verifier like theirs. ``turns/`` alone would lose them:
+        a completed run deletes its run directory. It never reaches the
+        writers as design context — :meth:`_reader_context` passes on
+        readers only — and it is not counted as a vote on the branch.
+
+        :param stage: The stage declaring ``checks:``.
+        :raises PipelineRunError: When the check raised a dispute.
+        """
+        assert stage.checks is not None
+        wt = self._wt.create_node_worktree(
+            self._run_id, stage.id, from_node=stage.checks,
+            replace=self._resume,
+        )
+        session = self._create_session(stage.run[0], wt, 'ro', stage.id)
+        out = self._drive(session, self._check_instruction(stage))
+        self._nodes[stage.id] = NodeResult(
+            stage.id, 'check', worktree=wt, session=session, output=out
+        )
+        self._halt_on_reader_dispute(stage)
+        self._record_review(
+            stage.id, stage.run[0], self._next_review_round(stage.id),
+            _CHECK_VERDICT, session, out,
+        )
+        findings = parse_findings(out)
+        click.echo(
+            f'[check] {stage.id}: no dispute, so the writers go ahead; '
+            f'{len(findings)} finding(s) recorded with the review '
+            f'reports.'
+        )
 
     def _await_plan_approval(self, session: str, first_reply: str) -> str:
         """
@@ -8383,8 +8491,9 @@ class PipelineRunner:
         if not claims:
             return
         listed = '\n'.join(f'  {claim}' for claim in claims)
+        role = 'contract check' if stage.checks else 'reader'
         raise PipelineRunError(
-            f'{stage.id}: the reader raised {len(claims)} dispute(s) — it '
+            f'{stage.id}: the {role} raised {len(claims)} dispute(s) — it '
             f'says the contract the stages after it would build on cannot '
             f'be satisfied:\n\n{listed}\n\nNothing after {stage.id} has '
             f'run. Its full reply is in the run directory under turns/; '
@@ -9657,6 +9766,55 @@ class PipelineRunner:
         ctx = self._reader_context(stage)
         return self._task_block() + (f'\n\n{ctx}' if ctx else '')
 
+    def _check_instruction(self, stage: pipeline.PipelineStage) -> str:
+        """
+        Frame a contract check's turn: check it, and build nothing.
+
+        Carries everything the tests stage worked from and what it
+        wrote, so the check reads the same contract the writers will
+        get. The halting rules are in the turn rather than only in the
+        template, so a pipeline that gives the checker its own prompt
+        still stops on a contract that cannot be met.
+
+        :param stage: The stage declaring ``checks:``.
+        :returns: The turn text.
+        """
+        assert stage.checks is not None
+        target = self._stage_by_id[stage.checks]
+        try:
+            changed = self._wt.node_diff_files(
+                self._run_id, target.id, against=self._seed_ref(target)
+            )
+        except click.ClickException:
+            changed = []
+        files = (
+            '\n'.join(f'  - {path}' for path in sorted(changed))
+            or '  (none could be listed; read the branch history)'
+        )
+        design = self._reader_context(target)
+        acceptance = (
+            f'\n\nAcceptance contract:\n{self._config.acceptance}'
+            if self._config.acceptance
+            else ''
+        )
+        return (
+            f'{self._chunk_preamble()}CHECK THE CONTRACT before anyone '
+            f'builds against it. Do NOT implement anything and do not '
+            f'change the tests: your mount is read-only, and the writers '
+            f'start only after you reply. Stage {target.id!r} wrote a '
+            f'frozen test suite for the brief below; two writers will '
+            f'each build against it. Read the brief, the acceptance '
+            f'contract, the plan and the suite together, run the suite '
+            f'against this unmodified tree, and decide whether any '
+            f'implementation could satisfy all of them.\n\n'
+            f'Brief:\n{self._config.task}{acceptance}'
+            + (f'\n\n{design}' if design else '')
+            + f'\n\nFiles {target.id!r} added or changed:\n{files}'
+            f'{_CHECK_RULES}{_REVIEW_MOUNT}'
+            f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}'
+            + self._setup_block()
+        )
+
     def _module_table(self, sub: pipeline.Subtask) -> str:
         """
         The full ordered module list, with the active one marked.
@@ -10503,9 +10661,10 @@ Only WRITERS now sum. Everything else is freed before the peak:
       counts. ``parallel:`` does not change that — it means isolated
       BRANCHES, not concurrent execution; :meth:`_exec_stage` walks a
       group's children one at a time.
-    - A reader or a judge is freed the moment its stage completes (see
-      :meth:`PipelineRunner._release_completed_session`): neither is
-      ever driven again, so holding one to publish was pure waste.
+    - A reader, a judge or a contract check is freed the moment its
+      stage completes (see
+      :meth:`PipelineRunner._release_completed_session`): none is ever
+      driven again, so holding one to publish was pure waste.
     - A writer nothing can loop back to is freed the same way (see
       :func:`writer_is_terminal`). Only writers a review gate or the
       verification gate can re-drive keep their VMs to publish.
@@ -10527,7 +10686,7 @@ Only WRITERS now sum. Everything else is freed before the peak:
             else:
                 total += len(stage.run)
         elif reclaim and (
-            kind in ('reader', 'judge')
+            kind in ('reader', 'judge', 'check')
             or (kind == 'writer' and writer_is_terminal(config, stage.id))
         ):
             continue  # freed at stage completion, never re-driven

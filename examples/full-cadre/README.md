@@ -1,27 +1,40 @@
 # Full cadre — the whole swarm in one pipeline
 
 Every role the launcher ships, working together on one task: a **planner**, a
-dedicated **TDD** author, **two competing coders** (Claude vs Antigravity) each
+dedicated **TDD** author, a **contract check** of its suite, **two competing
+coders** (Claude vs Antigravity) each
 on its own isolated branch, a **security** reviewer and a **bug** reviewer gating
 *each* candidate, a **judge** that picks the winner, a **refactor** agent that
 polishes it, and one final review before publish.
 
 ```
-plan ─▶ tests ─┬─▶ impl-a (Claude) ─▶ review-a [sec+bugs] ─┐
- (agy)  (TDD)  └─▶ impl-b (agy)    ─▶ review-b [sec+bugs] ─┴─▶ pick ─▶ refactor ─▶ review-r ─▶ publish
-                    each review loops findings back to its OWN impl on a block   (winner)   [sec+bugs]
+plan ─▶ tests ─▶ check ─┬─▶ impl-a (Claude) ─▶ review-a [sec+bugs] ─┐
+ (agy)  (TDD)   (ro)    └─▶ impl-b (agy)    ─▶ review-b [sec+bugs] ─┴─▶ pick ─▶ refactor ─▶ review-r ─▶ publish
+                             each review loops findings back to its OWN impl on a block   (winner)   [sec+bugs]
 ```
 
 | Node | Template | Harness | Model | Role |
 | --- | --- | --- | --- | --- |
 | `plan` | planner | antigravity-native | Gemini 3.8 Flash, high | read-only design (interactive) |
 | `tests` | tdd-writer | claude-native | Claude Sonnet 5, high | writes a failing test suite |
+| `check` | contract-checker | claude-native | Claude Sonnet 5 | checks the suite, brief and plan can all be met (`:ro`) |
 | `impl-a` | coder | claude-native | Claude Sonnet 5, high | competing coder, own branch |
 | `impl-b` | coder | antigravity-native | Gemini 3.8 Flash, high | competing coder, own branch |
 | `sec` | security-reviewer | claude-native | Claude Sonnet 5 | security audit (`:ro`) |
 | `bugs` | bug-reviewer | antigravity-native | Gemini 3.8 Flash, high | correctness audit (`:ro`) |
 | `judge` | judge | claude-native | Claude Opus 4.8 | picks the winning branch |
 | `refactor` | refactoring | claude-native | Claude Sonnet 5, high | cleans up the winner (behavior-preserving) |
+
+## The contract check before the coders
+
+`check` reads the frozen suite beside the brief and the plan before either coder
+starts. If two tests can't both pass, a test contradicts the brief, or the brief
+contradicts itself, it writes `DISPUTED:` and the run stops there, before two
+implement stages are spent on a contract nobody can meet. Weaker problems, such
+as a test that already passes or a requirement with no test, go in its
+`FINDINGS:` list, and the run goes on. Those land in the findings ledger beside
+the reviewers' findings. Both coders list
+`check` in `needs`, which is what makes them wait for it.
 
 ## The review-before-judge, refactor-after-judge shape
 
@@ -54,8 +67,9 @@ Antigravity:
    Use the [`mixed-models`](../mixed-models/) example's
    [`config.sample.yaml`](../mixed-models/config.sample.yaml) as your server
    `sandbox:` block (it sets `agy_enabled: true`).
-3. **Resources**: this pipeline can hold **~12 microVMs** over its life (plan +
-   tests + 2 impls + 4 impl-reviewers + judge + refactor + 2 refactor-reviewers).
+3. **Resources**: this pipeline can hold **~13 microVMs** over its life (plan +
+   tests + check + 2 impls + 4 impl-reviewers + judge + refactor +
+   2 refactor-reviewers).
    Make sure `sbx.worktree_root` is set and your host can spare the memory. Prefer
    `sbx.provision_stagger_s` at its default so the near-simultaneous VM launches
    don't race the sbx proxy injector.

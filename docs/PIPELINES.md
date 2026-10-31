@@ -143,6 +143,7 @@ inferred from its keys:
 | **writer** | `write: true` | isolated `rw` worktree + branch | Implements; its committed branch is the artifact. |
 | **review** | `gate:` / `on_block:` | `:ro` on the target writer's branch | One or more reviewers vote via a `VERDICT:` line; a block loops findings back to `on_block`. |
 | **judge** | `selects:` | `:ro` compare tree | Reads competing writer branches side by side and picks a winner via a `SELECT:` line. |
+| **check** | `checks: <tests stage>` | `:ro` on the tests branch | Reads the frozen suite beside the brief and plan before the writers start; a `DISPUTED:` line stops the run. See [A contract check before the writers](#a-contract-check-before-the-writers). |
 
 Stage keys:
 
@@ -431,6 +432,55 @@ can carry file contents, environment, or command output from inside the VM, and
 this file goes into your repository; what the human and the planner said to each
 other is the design record, the rest is machinery. Best-effort throughout: an
 unreadable session or a git error skips the file rather than failing a publish.
+
+## A contract check before the writers
+
+The tests stage writes the contract both writers build against. Until a reviewer
+reads the brief and the suite side by side, after both writers have finished,
+nothing checks it can be met. A `checks:` stage does that first:
+
+```yaml
+- { id: tests, run: tdd, write: true, needs: [plan] }
+- { id: check, run: checker, checks: tests, needs: [tests] }
+- id: implement
+  parallel:
+    - { id: impl-a, run: impl_a, write: true, from: tests, needs: [plan, check] }
+    - { id: impl-b, run: impl_b, write: true, from: tests, needs: [plan, check] }
+```
+
+Its agent (the `contract-checker` template) gets the brief, the acceptance
+contract, the plan the tests were written from, and the list of files the tests
+stage changed. It runs once, read-only, on the tests branch, and runs the suite
+against the unmodified tree.
+
+- **Stops the run** (`DISPUTED:`): two tests that can't both pass, a test that
+  contradicts the brief or the acceptance contract, or a brief that contradicts
+  itself. It never sends work back to the tests stage: asked to resolve a
+  conflict, that stage tends to weaken a test.
+- **Recorded, run continues** (`FINDINGS:`): a test that already passes before
+  anything is built, a test that checks source text or file layout instead of
+  behaviour, and a requirement no test covers. The count is printed as `[check]`.
+
+Its reply is recorded beside the reviewers' reports, so its findings go where
+theirs do: the reviews record and the findings ledger on the published branch,
+and the `verifies:` stage if the pipeline has one. When it disputes, the run
+stops, and its reply is in the run directory under `turns/`. In the pull
+request's list of reviewers it isn't counted as a vote, since it read the
+contract rather than the branch.
+
+Its report never reaches the writers as design context, and its VM is freed when
+the stage completes. The halting rules are in its turn as well as in the
+template, so a checker given its own `prompt` still stops on a contract that
+can't be met.
+
+Loading the pipeline refuses a check that couldn't do its job in time. That's
+one that:
+- names anything other than a tests stage (a writer on the `tdd-writer`
+  template, or one that sets `tests_only: true`);
+- doesn't list that stage in `needs`;
+- runs more than one agent;
+- also sets `write`, `gate`, `on_block`, `selects` or `verifies`;
+- or isn't in any writer's `needs`, which would let it run beside the writers.
 
 ## Campaigns — build in sequence, one chunk at a time
 
@@ -886,10 +936,10 @@ design, and it is the one stage with a human genuinely attending.
 followed by the claim; the word anywhere else is the instruction echoed back.
 Which stages it stops depends on the kind:
 - **A writer:** the run stops after its work is committed.
-- **A reader other than the planner:** the run stops before any later stage runs,
-  so a read-only check of the tests or the plan can stop the writers building on
-  a contract it disputes. The stage isn't recorded as complete, so `--resume`
-  runs it again once the contract is settled.
+- **A contract check, or a reader other than the planner:** the run stops before
+  any later stage runs, so the writers never build on a contract it disputes.
+  The stage isn't recorded as complete, so `--resume` runs it again once the
+  contract is settled.
 - **A reviewer:** only when it also blocks. A dispute beside an approval is an
   observation.
 
@@ -1334,6 +1384,7 @@ commits/merges):
 | `coder` | Implements to the acceptance contract; makes upstream tests pass. |
 | `security-reviewer` | Read-only security audit; ends with `VERDICT:`. |
 | `bug-reviewer` | Read-only correctness audit; ends with `VERDICT:`. |
+| `contract-checker` | Read-only check that the frozen suite, brief and plan can all be met; for a `checks:` stage. |
 | `judge` | Compares competing candidate branches; ends with `SELECT: <id>`. |
 | `refactoring` | Behavior-preserving cleanup of working code; keeps all tests green. |
 
