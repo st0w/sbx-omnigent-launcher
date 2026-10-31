@@ -50,6 +50,16 @@ _SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9._-]+$')
 #: A reviewer's seed token (see ``seed_review_scratch``).
 _SEED_TOKEN_RE = re.compile(r'[0-9a-f]{12}')
 
+#: The folder ``git update-index --test-untracked-cache`` leaves behind
+#: when its test fails, excluded in every clone an agent writes in.
+#: Omnigent's runner runs that test in the agent's repository, and on an
+#: sbx mount it fails: editing a file changes its folder's timestamp,
+#: which git's test does not allow. Git then leaves its scratch folder
+#: (``newfile``, ``new-dir/new``) at the top of the repository, where a
+#: ``git add -A`` committed it into a writer's branch and a tests-only
+#: stage was failed for it. Anchored to the top, where git makes it.
+GIT_PROBE_EXCLUDE = '/mtime-test-*/'
+
 
 def _run_default(
     cmd: list[str],
@@ -754,6 +764,7 @@ class WorktreeManager:
                 f'origin/{base}',
             ]
         )
+        self._exclude(worktree, GIT_PROBE_EXCLUDE)
         return worktree
 
     def commit_worktree(
@@ -1356,6 +1367,7 @@ class WorktreeManager:
         # its own real .git so git works inside the mounted VM.
         self._run(['git', 'clone', '--no-checkout', repo, path])
         self._run(['git', '-C', path, 'checkout', '-B', branch, start])
+        self._exclude(path, GIT_PROBE_EXCLUDE)
         # Register the branch on the hub so downstream inheritance,
         # judge comparison, and publish can see it before any commit.
         # A replaced node force-pushes: it is re-cutting a branch only
@@ -1611,21 +1623,34 @@ class WorktreeManager:
             raise click.ClickException(
                 f'ignored-file name must be a bare filename: {name!r}'
             )
+        self._exclude(worktree_path, name)
+        with open(
+            os.path.join(worktree_path, name), 'w', encoding='utf-8'
+        ) as fh:
+            fh.write(content)
+
+    @staticmethod
+    def _exclude(worktree_path: str, pattern: str) -> None:
+        """
+        Add *pattern* to a clone's ``.git/info/exclude``, once.
+
+        The local exclude list is never committed, so nothing it hides
+        reaches the repository's own ``.gitignore``.
+
+        :param worktree_path: The clone directory.
+        :param pattern: One gitignore pattern.
+        """
         exclude = os.path.join(worktree_path, '.git', 'info', 'exclude')
         os.makedirs(os.path.dirname(exclude), exist_ok=True)
         existing = ''
         if os.path.exists(exclude):
             with open(exclude, encoding='utf-8') as fh:
                 existing = fh.read()
-        if name not in existing.split():
+        if pattern not in existing.split():
             with open(exclude, 'a', encoding='utf-8') as fh:
                 if existing and not existing.endswith('\n'):
                     fh.write('\n')
-                fh.write(f'{name}\n')
-        with open(
-            os.path.join(worktree_path, name), 'w', encoding='utf-8'
-        ) as fh:
-            fh.write(content)
+                fh.write(f'{pattern}\n')
 
     def write_tracked_file(
         self, worktree_path: str, relpath: str, content: str
