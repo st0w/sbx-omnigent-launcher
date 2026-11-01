@@ -377,6 +377,13 @@ class FakeSC:
         #: The phrase each approval is sent with, in order; past the end
         #: of the list every approval is plain ``APPROVED`` (#49).
         self.approval_phrases: list[str] = []
+        #: Notices posted to a session, as ``(label, text)``.
+        self.notices: list[tuple[str, str]] = []
+        #: Each notice's headline, which is all a collapsed card shows.
+        self.headlines: list[tuple[str, str]] = []
+        #: Turns and notices in the order they happened, as
+        #: ``('send' | 'notice', label, text)``.
+        self.timeline: list[tuple[str, str, str]] = []
         #: node labels already provisioned when approval began (proves
         #: writers were pre-warmed before the human approved).
         self.labels_at_approval: list[str] = []
@@ -561,8 +568,19 @@ class FakeSC:
         self.events.append(('create', self._label[sid]))
         return sid
 
+    def post_notice(self, session, headline, details='') -> bool:
+        label = self._label.get(session, '')
+        text = f'{headline}\n\n{details}' if details else headline
+        self.notices.append((label, text))
+        self.headlines.append((label, headline))
+        self.timeline.append(('notice', label, text))
+        return True
+
     def send_and_wait(self, session, message, *, timeout=1800.0, **kw):
         self.sent.append((session, message))
+        self.timeline.append(
+            ('send', self._label.get(session, ''), message)
+        )
         if self._label.get(session, '') in self.interrupt_labels:
             raise KeyboardInterrupt
         if self._label.get(session, '') in self.raise_labels:
@@ -1784,6 +1802,19 @@ stages:
 """
 
 
+class TestThePlanGateWithoutACheck(_Base):
+    """The approval notice is shown with or without a plan check."""
+
+    def test_the_human_is_told_how_to_approve(self) -> None:
+        _r, sc, _wt = self._run(
+            _TDD_FULL, {'plan': 'THE PLAN', 'tests': 't', 'build': 'b'}
+        )
+        notices = [t for lb, t in sc.notices if lb == 'plan']
+        self.assertIn('exactly: APPROVED', notices[0])
+        self.assertNotIn('check', notices[0].lower())
+        self.assertIn('The plan is final', notices[-1])
+
+
 class TestThePlanCheckTurn(_Base):
     """What a plan checker is asked to do (#49)."""
 
@@ -1951,6 +1982,115 @@ class TestThePlanCheckInsideApproval(_Base):
             phrases=['APPROVED AS IS', 'APPROVED'],
         )
         self.assertEqual(len(_messages_for(sc, 'plan-check')), 2)
+
+    # ── what the human is told, in the session ────────────────────
+
+    @staticmethod
+    def _notices(sc: FakeSC) -> list[str]:
+        return [text for label, text in sc.notices if label == 'plan']
+
+    def test_the_human_is_told_how_to_approve(self) -> None:
+        _r, sc, _wt, _p = self._go([self._CLEAN])
+        first = self._notices(sc)[0]
+        self.assertIn('exactly: APPROVED', first)
+        self.assertIn('plan-check', first)
+        self.assertIn('a few minutes', first)
+
+    def test_they_are_told_after_the_plan_appears(self) -> None:
+        _r, sc, _wt, _p = self._go([self._CLEAN])
+        kinds = [(k, lb) for k, lb, _t in sc.timeline if lb == 'plan']
+        self.assertEqual(kinds[0], ('send', 'plan'))
+        self.assertEqual(kinds[1], ('notice', 'plan'))
+
+    def test_they_see_each_step_while_it_runs(self) -> None:
+        _r, sc, _wt, _p = self._go([self._CLEAN])
+        notices = '\n'.join(self._notices(sc))
+        for step in (
+            'consolidating the final plan',   # after APPROVED
+            'Checking the plan',              # before the check
+            'the plan is final',              # after a clean check
+        ):
+            with self.subTest(step=step):
+                self.assertIn(step, notices)
+
+    def test_the_check_notice_comes_before_the_check_runs(self) -> None:
+        _r, sc, _wt, _p = self._go([self._CLEAN])
+        timeline = [
+            (k, lb, t) for k, lb, t in sc.timeline
+            if (k, lb) == ('send', 'plan-check')
+            or (k == 'notice' and 'Checking the plan' in t)
+        ]
+        self.assertEqual(timeline[0][0], 'notice')
+
+    def test_a_dispute_says_what_happens_next(self) -> None:
+        _r, sc, _wt, _p = self._go([self._DISPUTE, self._CLEAN])
+        notices = '\n'.join(self._notices(sc))
+        self.assertIn('found 1 problem', notices)
+        self.assertIn('the planner will propose', notices)
+
+    def test_after_the_planner_answers_it_is_the_human_s_move(self) -> None:
+        # The reprompt has to come AFTER the planner's reply to the
+        # report, or it scrolls away above it.
+        _r, sc, _wt, _p = self._go([self._DISPUTE, self._CLEAN])
+        plan_events = [
+            (k, t) for k, lb, t in sc.timeline if lb == 'plan'
+        ]
+        report = next(
+            i for i, (k, t) in enumerate(plan_events)
+            if k == 'send' and '64 characters' in t
+        )
+        kind, text = plan_events[report + 1]
+        self.assertEqual(kind, 'notice')
+        self.assertIn('Your move', text)
+        self.assertIn('APPROVED AS IS', text)
+        self.assertIn('checked again', text)
+        self.assertIn('no further check', text)
+
+    def test_the_report_says_it_is_from_the_pipeline(self) -> None:
+        # It is posted as a message to the planner, which shows in the
+        # human's own lane; without this it reads as if they wrote it.
+        _r, sc, _wt, _p = self._go([self._DISPUTE, self._CLEAN])
+        report = next(
+            m for m in _messages_for(sc, 'plan') if '64 characters' in m
+        )
+        self.assertTrue(report.startswith('From the pipeline'), report[:60])
+
+    def test_accepting_as_is_is_confirmed(self) -> None:
+        _r, sc, _wt, _p = self._go(
+            [self._DISPUTE, self._DISPUTE],
+            phrases=['APPROVED', 'APPROVED AS IS'],
+        )
+        self.assertIn('Accepted as is', self._notices(sc)[-1])
+
+    def test_every_headline_fits_on_a_collapsed_card(self) -> None:
+        # The web UI shows a notice collapsed, its headline on one
+        # truncated line; past about 80 characters the end is cut off.
+        for phrases in ([], ['APPROVED', 'APPROVED AS IS']):
+            with self.subTest(phrases=phrases):
+                _r, sc, _wt, _p = self._go(
+                    [self._DISPUTE, self._CLEAN], phrases=phrases
+                )
+                for _label, headline in sc.headlines:
+                    self.assertLessEqual(len(headline), 80, headline)
+
+    def test_the_headlines_that_ask_for_a_reply_name_it(self) -> None:
+        _r, sc, _wt, _p = self._go([self._DISPUTE, self._CLEAN])
+        asks = [h for _lb, h in sc.headlines if h.startswith('Your move')]
+        self.assertEqual(len(asks), 2)
+        self.assertIn('exactly APPROVED', asks[0])
+        self.assertIn('APPROVED AS IS', asks[1])
+
+    def test_the_wait_is_in_the_check_s_headline(self) -> None:
+        _r, sc, _wt, _p = self._go([self._CLEAN])
+        checking = [
+            h for _lb, h in sc.headlines if h.startswith('Checking the plan')
+        ]
+        self.assertIn('a few minutes', checking[0])
+        self.assertIn('nothing to do', checking[0])
+
+    def test_unattended_nobody_is_told_anything(self) -> None:
+        _r, sc, _wt, _p = self._go([self._CLEAN], interactive=False)
+        self.assertEqual(sc.notices, [])
 
     # ── no human ──────────────────────────────────────────────────
 

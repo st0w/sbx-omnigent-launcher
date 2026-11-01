@@ -23,6 +23,7 @@ import unittest
 import urllib.error
 import warnings
 from collections.abc import Callable, Iterator
+from typing import Any
 from unittest import mock
 
 import click
@@ -752,6 +753,61 @@ class TestLifecycle(unittest.TestCase):
         client = SwarmSessionClient('http://x:6767', transport=t)
         client.dispose('conv_gone')  # must not raise
         self.assertIn(('DELETE', '/v1/sessions/conv_gone'), t.calls)
+
+
+class TestANoticeInTheSession(unittest.TestCase):
+    """The runner tells the human in the planning session what is
+    happening and what to do next (#49). The console is not where they
+    are."""
+
+    @staticmethod
+    def _sent(t: FakeTransport) -> dict[str, Any]:
+        body = t.bodies['POST /v1/sessions/conv_1/events']
+        if not isinstance(body, dict):
+            raise AssertionError(f'no JSON object was posted: {body!r}')
+        return body
+
+    def test_it_is_an_info_card_the_agent_never_reads(self) -> None:
+        # An `error` item at level `info` renders as a neutral notice,
+        # and is transcript metadata the next agent turn does not see,
+        # so the planner never answers it.
+        t = FakeTransport({'POST /v1/sessions/conv_1/events': (202, {})})
+        client = SwarmSessionClient('http://x:6767', transport=t)
+        self.assertTrue(client.post_notice('conv_1', 'Checking the plan.'))
+        body = self._sent(t)
+        self.assertEqual(body['type'], 'external_conversation_item')
+        self.assertEqual(body['data']['item_type'], 'error')
+        self.assertEqual(body['data']['item_data']['level'], 'info')
+
+    def test_the_headline_is_what_a_collapsed_card_shows(self) -> None:
+        # The web UI shows a card collapsed, headline only, so the
+        # headline has to carry the instruction (v0.20.0 and later).
+        t = FakeTransport({'POST /v1/sessions/conv_1/events': (202, {})})
+        client = SwarmSessionClient('http://x:6767', transport=t)
+        client.post_notice('conv_1', 'Reply exactly APPROVED', 'Details.')
+        item = self._sent(t)['data']['item_data']
+        self.assertEqual(item['title'], 'Reply exactly APPROVED')
+
+    def test_the_body_repeats_the_headline_before_the_details(self) -> None:
+        # v0.13.0 has no headline field and shows "Notice" instead, so
+        # the body must stand on its own once expanded.
+        t = FakeTransport({'POST /v1/sessions/conv_1/events': (202, {})})
+        client = SwarmSessionClient('http://x:6767', transport=t)
+        client.post_notice('conv_1', 'Reply exactly APPROVED', 'Details.')
+        item = self._sent(t)['data']['item_data']
+        self.assertEqual(item['message'], 'Reply exactly APPROVED\n\nDetails.')
+
+    def test_a_headline_alone_is_the_whole_body(self) -> None:
+        t = FakeTransport({'POST /v1/sessions/conv_1/events': (202, {})})
+        client = SwarmSessionClient('http://x:6767', transport=t)
+        client.post_notice('conv_1', 'The plan is final')
+        item = self._sent(t)['data']['item_data']
+        self.assertEqual(item['message'], 'The plan is final')
+
+    def test_a_failed_notice_never_fails_the_run(self) -> None:
+        t = FakeTransport({'POST /v1/sessions/conv_1/events': (500, {})})
+        client = SwarmSessionClient('http://x:6767', transport=t)
+        self.assertFalse(client.post_notice('conv_1', 'x'))
 
 
 class TestPlanApprovalWait(unittest.TestCase):

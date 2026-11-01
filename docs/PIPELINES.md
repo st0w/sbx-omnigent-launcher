@@ -311,6 +311,14 @@ If a pipeline has a **`planner`**-templated agent, the plan stage is
    consolidated final plan**, which becomes the *plan of record* shared with
    every builder and committed to the repo (below).
 
+The session itself tells you where things stand. The runner posts a notice card
+(a neutral info card, which the planner never sees or answers) when the plan is
+ready for your review, and again when you've approved and when the plan is
+final. A card shows collapsed, so its one-line headline carries the point, such
+as "Your move: reply exactly APPROVED when the plan is right"; open it for the
+details. Omnigent v0.13.0 has no card headline and shows "Notice" instead, with
+the same text inside.
+
 So drive a planner pipeline **live** — don't fire it and walk away. To run
 unattended instead, pass **`--no-interactive-plan`**: the planner's single-turn
 output is used as-is with no human gate (useful for CI / automation).
@@ -544,13 +552,17 @@ command and its output. It also reads the plan's sections against each other.
 Whether the design is right isn't its call.
 
 **It runs inside the approval, not after it.** When you reply `APPROVED`, the
-plan is consolidated and then checked:
+plan is consolidated and then checked. A notice card in the session says so
+while the check runs, which takes a few minutes:
 
 - **No dispute:** the plan is final. Every claim that held is listed in the
   check's record under `CLAIMS CHECKED:`, so the approval isn't taken on trust.
-- **A false claim, or two sections that contradict each other:** the checker's
-  report goes into the planning session, and the console prints the claims.
-  Approval reopens. Settle each dispute with the planner, then reply:
+- **A false claim, or two sections that contradict each other:** a notice says
+  how many problems were found, then the checker's report goes to the planner,
+  marked as coming from the pipeline, and the planner proposes fixes. Once the
+  planner has replied, a "Your move" notice gives the two replies and what each
+  does. The console prints the claims too. Approval reopens. Settle each dispute
+  with the planner, then reply:
   - **`APPROVED`:** the plan is consolidated and checked again.
   - **`APPROVED AS IS`:** the plan is accepted without another check. Use it when
     the checker is wrong. The disputed round stays in the reviews record.

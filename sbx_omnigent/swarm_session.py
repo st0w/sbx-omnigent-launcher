@@ -1855,6 +1855,57 @@ class SwarmSessionClient:
         msgs = _assistant_reply_items(items)
         return msgs[-1][1] if msgs else ''
 
+    def post_notice(
+        self, session_id: str, headline: str, details: str = ''
+    ) -> bool:
+        """
+        Show the human a notice in a session, without starting a turn.
+
+        Posted as an ``error`` item at level ``info``, which Omnigent's
+        web UI renders as a neutral card, and which is transcript
+        metadata the agent's next turn never receives. So the planner
+        does not answer it, and it can never be read as the plan being
+        approved.
+
+        The web UI shows the card COLLAPSED, its ``title`` on one line,
+        and nothing in the data can open it. So *headline* is the title
+        and has to carry the instruction on its own. v0.13.0's card has
+        no title field and ignores it, showing "Notice", so the body
+        repeats the headline before the details.
+
+        Best-effort: a notice that does not arrive must never fail the
+        run it describes.
+
+        :param session_id: The session to post into.
+        :param headline: One short line, all a collapsed card shows.
+        :param details: More, shown when the card is opened.
+        :returns: ``True`` when the server accepted it.
+        """
+        try:
+            self._json(
+                'POST',
+                f'/v1/sessions/{session_id}/events',
+                {
+                    'type': 'external_conversation_item',
+                    'data': {
+                        'item_type': 'error',
+                        'item_data': {
+                            'source': 'execution',
+                            'code': 'pipeline_status',
+                            'message': (
+                                f'{headline}\n\n{details}'
+                                if details else headline
+                            ),
+                            'level': 'info',
+                            'title': headline,
+                        },
+                    },
+                },
+            )
+        except SwarmSessionError:
+            return False
+        return True
+
     def _post_message(
         self, session_id: str, message: str, *, timeout: float | None = None
     ) -> None:
