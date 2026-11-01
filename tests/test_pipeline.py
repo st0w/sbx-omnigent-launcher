@@ -989,6 +989,13 @@ class TestTheShippedContractCheck(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertFalse(line.lstrip().startswith('DISPUTED'))
 
+    def test_both_checker_templates_ask_the_check_to_finish(self) -> None:
+        for name in ('contract-checker', 'plan-checker'):
+            with self.subTest(template=name):
+                prompt = P.template_prompt(name)
+                self.assertIn('CHECK COMPLETE', prompt)
+                self.assertIn('still running', prompt)
+
     def test_the_plan_checker_template_ships(self) -> None:
         prompt = P.template_prompt('plan-checker')
         self.assertIn('`DISPUTED:`', prompt)
