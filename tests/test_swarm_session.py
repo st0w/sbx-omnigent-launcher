@@ -37,6 +37,7 @@ from sbx_omnigent.swarm_session import (
     SwarmSessionError,
     SwarmTurnTimeout,
     UrllibTransport,
+    _approval_turn,
     _approved_plan_text,
     _assistant_reply_items,
     _elicitation_ids,
@@ -57,6 +58,43 @@ def _msg(role: str, text: str) -> dict[str, object]:
         'role': role,
         'content': [{'type': 'text', 'text': text}],
     }
+
+
+class TestWhichApprovalWasSent(unittest.TestCase):
+    """The plan check reopens approval, and `APPROVED AS IS` accepts
+    the plan without another check (#49), so the runner needs to know
+    which phrase released the gate."""
+
+    _BOTH = ('APPROVED', 'APPROVED AS IS')
+
+    def test_the_phrase_comes_back_with_the_plan(self) -> None:
+        items = [_msg('assistant', 'PLAN v2'), _msg('user', 'approved as is')]
+        self.assertEqual(
+            _approval_turn(items, self._BOTH), ('PLAN v2', 'APPROVED AS IS')
+        )
+
+    def test_plain_approval_is_reported_as_such(self) -> None:
+        items = [_msg('assistant', 'PLAN v2'), _msg('user', '**APPROVED**')]
+        self.assertEqual(
+            _approval_turn(items, self._BOTH), ('PLAN v2', 'APPROVED')
+        )
+
+    def test_the_latest_approval_wins(self) -> None:
+        items = [
+            _msg('assistant', 'PLAN v1'), _msg('user', 'APPROVED'),
+            _msg('assistant', 'PLAN v2'), _msg('user', 'APPROVED AS IS'),
+        ]
+        self.assertEqual(
+            _approval_turn(items, self._BOTH), ('PLAN v2', 'APPROVED AS IS')
+        )
+
+    def test_a_phrase_not_offered_does_not_release(self) -> None:
+        items = [_msg('assistant', 'PLAN'), _msg('user', 'APPROVED AS IS')]
+        self.assertIsNone(_approval_turn(items, _APPROVE))
+
+    def test_the_old_helper_still_returns_only_the_plan(self) -> None:
+        items = [_msg('assistant', 'PLAN v2'), _msg('user', 'APPROVED')]
+        self.assertEqual(_approved_plan_text(items, _APPROVE), 'PLAN v2')
 
 
 class TestApprovedPlanText(unittest.TestCase):
@@ -788,6 +826,24 @@ class TestPlanApprovalWait(unittest.TestCase):
                 'conv_1', poll=10.0, idle_timeout=100.0
             )
         self.assertEqual(plan, 'PLAN v1')
+
+    def test_the_decision_names_the_phrase(self) -> None:
+        client = self._client()
+        clock = {'t': 0.0}
+
+        def read_items(session_id, *, tail=None):
+            items = [self._item('a1', 'assistant', 'PLAN v1')]
+            if clock['t'] >= 20:
+                items.append(self._item('ok', 'user', 'APPROVED AS IS'))
+            return items
+
+        with self._driving(client, read_items, clock):
+            decision = client.wait_for_plan_decision(
+                'conv_1', approval_phrases=('APPROVED', 'APPROVED AS IS'),
+                poll=10.0, idle_timeout=100.0,
+            )
+        self.assertEqual(decision.plan, 'PLAN v1')
+        self.assertEqual(decision.phrase, 'APPROVED AS IS')
 
     def test_the_cap_restarts_at_the_last_turn_not_the_first(self) -> None:
         # Active to t=200, then silent. The wait must end ~100s after

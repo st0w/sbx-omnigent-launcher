@@ -333,10 +333,12 @@ class PipelineStage:
         reviewers raised and checks each against the code, so a finding
         that does not reproduce, or that the codebase already records,
         never becomes an issue somebody has to triage by hand.
-    :param checks: When set, the stage's agent is a CONTRACT CHECKER:
-        it reads the named tests stage's frozen suite beside the brief
-        and the plan, before any writer builds against them, and stops
-        the run when they cannot all be satisfied (#50).
+    :param checks: When set, the stage's agent is a CHECKER. Naming a
+        tests stage, it reads the frozen suite beside the brief and the
+        plan before any writer builds against them, and stops the run
+        when they cannot all be satisfied (#50). Naming a planner stage,
+        it checks the plan's claims about existing code inside that
+        stage's approval loop, before the plan is final (#49).
     :param parallel: Concurrent sub-stages (each a full PipelineStage),
         for competing isolated writers.
     """
@@ -907,21 +909,37 @@ def _is_tests_stage(config: PipelineConfig, stage: PipelineStage) -> bool:
     )
 
 
+def is_plan_stage(config: PipelineConfig, stage: PipelineStage) -> bool:
+    """
+    Whether *stage* is a planner: a reader on the ``planner`` template.
+
+    :param config: The assembled config.
+    :param stage: The stage to classify.
+    :returns: ``True`` for a single-agent, non-writing planner stage.
+    """
+    if stage.write or len(stage.run) != 1:
+        return False
+    agent = config.agents.get(stage.run[0])
+    return agent is not None and agent.template == 'planner'
+
+
 def _validate_contract_checks(config: PipelineConfig) -> None:
     """
     Refuse a ``checks:`` stage that could not check anything in time.
 
-    A contract check is only worth its turn between the tests stage and
-    the writers that build against it (#50). Each refusal names the
-    fix, so a misplaced check is found when the pipeline loads rather
-    than after a run has spent the writers' turns anyway.
+    A tests check is only worth its turn between the tests stage and the
+    writers that build against it (#50). A plan check runs inside the
+    plan stage's approval loop (#49), so nothing has to wait for it.
+    Each refusal names the fix, so a misplaced check is found when the
+    pipeline loads rather than after a run has spent the writers' turns
+    anyway.
 
     :param config: The assembled config, its references already
         checked by :func:`_validate_stage_refs`.
     :raises PipelineError: On a check combined with another kind's
-        key, run by more than one agent, aimed at something that is not
-        a tests stage, not after its target, or that no writer waits
-        for.
+        key, run by more than one agent, aimed at something that is
+        neither a tests stage nor a planner, not after its target, or a
+        tests check that no writer waits for.
     """
     stages = _iter_stages(config.stages)
     by_id = {stage.id: stage for stage in stages}
@@ -941,11 +959,14 @@ def _validate_contract_checks(config: PipelineConfig) -> None:
                 f'stage {sid!r}: a contract check runs one agent, not '
                 f'{len(stage.run)}.'
             )
-        if not _is_tests_stage(config, by_id[target]):
+        plan = is_plan_stage(config, by_id[target])
+        if not plan and not _is_tests_stage(config, by_id[target]):
             raise PipelineError(
-                f'stage {sid!r} checks {target!r}, which is not a tests '
-                f'stage. It must name a writer whose agent uses the '
-                f'tdd-writer template, or that sets tests_only: true.'
+                f'stage {sid!r} checks {target!r}, which is neither a '
+                f'tests stage nor a plan. It must name a writer whose '
+                f'agent uses the tdd-writer template or that sets '
+                f'tests_only: true, or a stage whose agent uses the '
+                f'planner template.'
             )
         if target not in stage.needs:
             raise PipelineError(
@@ -953,7 +974,7 @@ def _validate_contract_checks(config: PipelineConfig) -> None:
                 f'in needs, so it could run before {target!r} has '
                 f'written anything. Add {target!r} to its needs.'
             )
-        if not any(s.write and sid in s.needs for s in stages):
+        if not plan and not any(s.write and sid in s.needs for s in stages):
             raise PipelineError(
                 f'stage {sid!r}: no writer lists it in needs, so it would '
                 f'run beside the writers and check nothing before they '

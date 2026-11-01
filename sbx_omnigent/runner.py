@@ -1108,9 +1108,48 @@ _CHECK_RULES = (
     'that plainly and how you checked.'
 )
 
+#: What a plan check is asked to do (#49). Kept in the turn, not only
+#: in the template, so a checker given its own prompt still knows what
+#: stops the plan. The marker is mid-sentence, as in
+#: :data:`_CHECK_RULES`.
+_PLAN_CHECK_RULES = (
+    '\n\nWHAT TO CHECK. For every claim the plan makes about existing '
+    'code (a signature, a unit, which values are comparable, a limit, '
+    'what a file already does), run a command that checks it against '
+    'this tree, and report the claim, the command you ran and its '
+    'output. Also read the sections against each other: two that '
+    'contradict each other cannot both be built. Whether the design is '
+    'right is not your call; the human has made it.'
+    '\n\nWHAT STOPS THE PLAN. A claim the tree shows is false, or two '
+    'sections that contradict each other. For each, write a line of its '
+    'own that begins with the marker `DISPUTED:` followed by a one-line '
+    'claim. Below it, quote the plan (naming the section), give the '
+    'command and its output or both sections quoted, and say what is '
+    'actually true. The human sees this in the planning session before '
+    'the plan is final. A dispute you cannot back with output is a '
+    'finding, not a dispute.'
+    '\n\nWHAT IS RECORDED. List every claim that held under a line '
+    'reading exactly `CLAIMS CHECKED:`, each with the command that '
+    'showed it, and anything you could not check under a line reading '
+    'exactly `FINDINGS:`, one `- ` item per line.'
+)
+
 #: What a contract check's record says when it let the writers go on:
 #: it read the contract, so it neither approved nor blocked a branch.
 _CHECK_VERDICT = 'NO DISPUTE'
+
+#: What a plan check's record says when it found a false claim or a
+#: contradiction. Only a plan check is recorded on a dispute: the run
+#: goes on, because the human settles it in the planning session (#49).
+_CHECK_DISPUTED = 'DISPUTE RAISED'
+
+#: The reply that accepts a plan over its check's disputes, without
+#: another check (#49). A plain ``APPROVED`` re-consolidates and
+#: re-checks.
+_APPROVED_AS_IS = 'APPROVED AS IS'
+
+#: The phrases that release the plan gate when the plan has a check.
+_PLAN_DECISION_PHRASES = ('APPROVED', _APPROVED_AS_IS)
 
 _REVIEW_NOT_THE_GATE = (
     '\n\nRUN THE TESTS, NOT THE COVERAGE GATE. Execute the suite '
@@ -2839,13 +2878,18 @@ def render_review_records(
         'Messages only — no tool calls and no tool output.',
         '',
     ]
-    if any(rec.verdict == _CHECK_VERDICT for rec in records):
+    if any(
+        rec.verdict in (_CHECK_VERDICT, _CHECK_DISPUTED) for rec in records
+    ):
         parts += [
-            f'A row marked {_CHECK_VERDICT} is a contract check, not a '
-            f'vote on this branch: it read the frozen tests beside the '
-            f'brief and the plan before any writer started, and would '
-            f'have stopped the run had they been impossible to meet. '
-            f'Its findings are kept and filed like any reviewer finding.',
+            f'A row marked {_CHECK_VERDICT} or {_CHECK_DISPUTED} is a '
+            f'contract check or a plan check, not a vote on this branch. '
+            f'A contract check read the frozen tests beside the brief and '
+            f'the plan before any writer started. A plan check ran the '
+            f'claims a plan makes about existing code before it was '
+            f'final; a {_CHECK_DISPUTED} round went back to the human, '
+            f'who settled it before the plan was accepted. Their findings '
+            f'are kept and filed like any reviewer finding.',
             '',
         ]
     parts += [
@@ -6646,7 +6690,7 @@ class PipelineRunner:
                     raise
             return
         if stage.id in self._completed:
-            click.echo(f'[resume] skipping {stage.id} (already complete)')
+            self._note_skipped(stage)
             return
         kind = self._stage_kind(stage)
         # The cap counts nodes being DRIVEN, so it is charged to
@@ -6694,6 +6738,20 @@ class PipelineRunner:
         # Checkpoint AS the run advances: a crash then costs only the
         # node that failed, not the approved plan behind it.
         self._save_state()
+
+    def _note_skipped(self, stage: pipeline.PipelineStage) -> None:
+        """
+        Say why a completed stage is skipped, unless it ran in a plan.
+
+        A plan check is completed inside the plan stage's approval
+        (#49), so reaching it afterwards is not a resume and says
+        nothing.
+
+        :param stage: The completed stage being skipped.
+        """
+        target = self._stage_by_id.get(stage.checks) if stage.checks else None
+        if target is None or not self._is_planner(target):
+            click.echo(f'[resume] skipping {stage.id} (already complete)')
 
     @staticmethod
     def _stage_kind(stage: pipeline.PipelineStage) -> str:
@@ -7131,7 +7189,9 @@ class PipelineRunner:
                 # just awaits approval.
                 if not in_module and self._config.prewarm:
                     self._prewarm_writers()
-                node.output = self._await_plan_approval(session, out)
+                node.output = self._await_plan_approval(
+                    session, out, stage
+                )
             else:
                 # Unattended: an agy planner's reply lags its single
                 # turn, so _drive can return empty under load — leaving
@@ -7140,6 +7200,11 @@ class PipelineRunner:
                 # the interactive consolidation turn uses).
                 self._sc.wait_for_session_idle(session)
                 node.output = self._sc.read_latest_reply(session) or out
+                # Nobody is in the session to settle a dispute, so one
+                # can only stop the run.
+                self._halt_on_plan_disputes(
+                    stage, self._run_plan_checks(stage, node.output)
+                )
             if not in_module:
                 # Flat/single-pass: the up-front planner's final output
                 # is THE plan of record (shared with builders, committed
@@ -7185,6 +7250,20 @@ class PipelineRunner:
         :raises PipelineRunError: When the check raised a dispute.
         """
         assert stage.checks is not None
+        target = self._stage_by_id[stage.checks]
+        if self._is_planner(target):
+            # Reached only when the plan finished in an earlier attempt:
+            # a live plan stage runs its checks inside its approval.
+            node = self._nodes.get(target.id)
+            plan = node.output if node is not None else ''
+            self._halt_on_plan_disputes(
+                target,
+                [
+                    (stage.id, claim)
+                    for claim in self._run_plan_check(stage, plan)
+                ],
+            )
+            return
         wt = self._wt.create_node_worktree(
             self._run_id, stage.id, from_node=stage.checks,
             replace=self._resume,
@@ -7206,7 +7285,12 @@ class PipelineRunner:
             f'reports.'
         )
 
-    def _await_plan_approval(self, session: str, first_reply: str) -> str:
+    def _await_plan_approval(
+        self,
+        session: str,
+        first_reply: str,
+        stage: pipeline.PipelineStage | None = None,
+    ) -> str:
         """
         Block the pipeline until a human approves the plan in the UI.
 
@@ -7224,16 +7308,73 @@ class PipelineRunner:
         message. So it waits for the session to settle around the turn
         and reads the final assistant message. Falls back to the
         approval text, then the first reply, if nothing was captured.
+
+        When a ``checks:`` stage names this plan (#49), every approval
+        is followed by that check, before the plan is final. A dispute
+        goes back to this session and approval reopens: the human
+        settles it with the planner, and approves again, which
+        re-consolidates and re-checks. :data:`_APPROVED_AS_IS` accepts
+        the plan over the last check's disputes without another check.
+
+        :param session: The planner session.
+        :param first_reply: The planner's first reply, used last.
+        :param stage: The plan stage, to find the checks that name it.
+        :returns: The plan of record.
         """
+        checks = self._plan_checks(stage) if stage is not None else []
         click.echo(
             f'[plan] Planner is awaiting your review in the Omnigent UI '
             f'(session {session}). Answer its questions there, then send '
             f'a message whose ENTIRE text is "APPROVED" — a turn that '
             f'says anything else will not release the gate, deliberately. '
             f'The pipeline is blocked until you do.'
+            + (
+                f' The plan is then checked by '
+                f'{", ".join(c.id for c in checks)} before it is final.'
+                if checks else ''
+            )
         )
+        disputed = False
+        while True:
+            approved, phrase = self._wait_for_approval(session, checks)
+            plan = self._consolidate_plan(session, approved, first_reply)
+            if not checks:
+                return plan
+            assert stage is not None
+            if disputed and phrase == _APPROVED_AS_IS:
+                click.echo(
+                    f'[plan] {stage.id}: accepted AS IS over the '
+                    f'disputes the last check raised, without another '
+                    f'check. The disputed round is in the reviews record.'
+                )
+                return plan
+            disputes = self._run_plan_checks(stage, plan)
+            if not disputes:
+                click.echo(
+                    f'[plan] {stage.id}: the plan check found no false '
+                    f'claim or contradiction; the plan is final.'
+                )
+                return plan
+            disputed = True
+            self._report_plan_disputes(session, stage, disputes)
+
+    def _wait_for_approval(
+        self, session: str, checks: list[pipeline.PipelineStage]
+    ) -> tuple[str, str]:
+        """
+        Wait for the human's approval, capturing the session on loss.
+
+        :param session: The planner session.
+        :param checks: The checks naming this plan; with any, the
+            override phrase is accepted too.
+        :returns: ``(approved plan text, phrase sent)``.
+        """
+        phrases = _PLAN_DECISION_PHRASES if checks else ('APPROVED',)
         try:
-            approved = self._sc.wait_for_plan_approval(session)
+            decision = self._sc.wait_for_plan_decision(
+                session, approval_phrases=phrases
+            )
+            approved = decision.plan
             click.echo(
                 f'[plan] approval received from the session '
                 f'({len(approved or "")} chars of approved plan); '
@@ -7257,6 +7398,19 @@ class PipelineRunner:
                 session, 'timed out awaiting plan approval'
             )
             raise
+        return approved, decision.phrase
+
+    def _consolidate_plan(
+        self, session: str, approved: str, first_reply: str
+    ) -> str:
+        """
+        Drive the consolidation turn and choose the plan of record.
+
+        :param session: The planner session.
+        :param approved: The plan text the human approved.
+        :param first_reply: The planner's first reply, used last.
+        :returns: The consolidated plan.
+        """
         # Let the planner's reply to APPROVED settle so the
         # consolidation turn doesn't race it, drive the turn, then let
         # THAT settle and read the final message (agy's reply lags).
@@ -7278,6 +7432,158 @@ class PipelineRunner:
                 f'full plan ({len(plan)} chars) from the session.'
             )
         return plan or approved or first_reply
+
+    def _plan_checks(
+        self, stage: pipeline.PipelineStage
+    ) -> list[pipeline.PipelineStage]:
+        """
+        The ``checks:`` stages that name *stage*, a planner.
+
+        Looked up by id across every registered stage, so a campaign's
+        renamed per-module check finds its own module's plan.
+
+        :param stage: The plan stage.
+        :returns: The checks naming it, in declaration order.
+        """
+        return [
+            check for check in self._stage_by_id.values()
+            if check.checks == stage.id
+        ]
+
+    def _run_plan_checks(
+        self, stage: pipeline.PipelineStage, plan: str
+    ) -> list[tuple[str, str]]:
+        """
+        Run every check that names this plan, side by side.
+
+        Each check stage is marked complete here, so the DAG does not
+        run it again after the plan stage.
+
+        :param stage: The plan stage.
+        :param plan: The plan to check.
+        :returns: ``(check id, claim)`` per dispute, check by check.
+        """
+        checks = self._plan_checks(stage)
+        found: dict[str, tuple[str, ...]] = {}
+
+        def run(check: pipeline.PipelineStage) -> None:
+            found[check.id] = self._run_plan_check(check, plan)
+
+        self._parallel(
+            f'{stage.id}-checks',
+            [(check.id, lambda check=check: run(check)) for check in checks],
+        )
+        with self._lock:
+            self._completed.update(check.id for check in checks)
+        return [
+            (check.id, claim)
+            for check in checks
+            for claim in found.get(check.id, ())
+        ]
+
+    def _run_plan_check(
+        self, check: pipeline.PipelineStage, plan: str
+    ) -> tuple[str, ...]:
+        """
+        Drive one plan check on a fresh read-only clone, and record it.
+
+        A fresh clone each round: a re-check after the human settled a
+        dispute must not read a tree the last round's agent touched.
+
+        :param check: The check stage.
+        :param plan: The plan to check.
+        :returns: Its disputes; empty when it found none.
+        """
+        wt = self._wt.create_node_worktree(
+            self._run_id, check.id, from_node=self._seed_from(check),
+            replace=True,
+        )
+        session = self._create_session(check.run[0], wt, 'ro', check.id)
+        out = self._drive(session, self._plan_check_instruction(check, plan))
+        self._nodes[check.id] = NodeResult(
+            check.id, 'check', worktree=wt, session=session, output=out
+        )
+        claims = parse_disputes(out)
+        if not claims:
+            self._warn_dispute_near_miss(check.id, out)
+        self._record_review(
+            check.id, check.run[0], self._next_review_round(check.id),
+            _CHECK_DISPUTED if claims else _CHECK_VERDICT, session, out,
+        )
+        self._release_completed_session(check, 'check')
+        return claims
+
+    def _report_plan_disputes(
+        self,
+        session: str,
+        stage: pipeline.PipelineStage,
+        disputes: list[tuple[str, str]],
+    ) -> None:
+        """
+        Put a plan check's disputes before the human, in their session.
+
+        Sent as one turn to the planner, so the planner can walk the
+        human through each and propose a correction. The checker does
+        not negotiate with the planner, and nothing is changed without
+        the human: approval reopens, and their next reply decides.
+
+        :param session: The planner session.
+        :param stage: The plan stage.
+        :param disputes: ``(check id, claim)`` per dispute.
+        """
+        reports = '\n\n'.join(
+            f'--- {check_id} ---\n{self._nodes[check_id].output}'
+            for check_id in dict.fromkeys(cid for cid, _c in disputes)
+        )
+        self._drive(
+            session,
+            f'A read-only check of the plan you just consolidated found '
+            f'{len(disputes)} problem(s): a claim about the existing code '
+            f'that the repository contradicts, or two sections that '
+            f'contradict each other. It ran commands against the '
+            f'repository; its reports are below.\n\n{reports}\n\n'
+            f'Walk the human through each problem and propose what you '
+            f'would change, and wait for them. Do not output a final plan '
+            f'yet. When they reply APPROVED, the plan is consolidated and '
+            f'checked again; if they reply {_APPROVED_AS_IS}, it is '
+            f'accepted as it stands.',
+        )
+        listed = '\n'.join(f'  [{cid}] {claim}' for cid, claim in disputes)
+        click.echo(
+            f'[plan] {stage.id}: the plan check found {len(disputes)} '
+            f'problem(s):\n{listed}\nThey are in the planning session '
+            f'with the full reports. Settle them there, then reply '
+            f'APPROVED (consolidated and checked again) or '
+            f'{_APPROVED_AS_IS} (accepted without another check).'
+        )
+
+    def _halt_on_plan_disputes(
+        self,
+        stage: pipeline.PipelineStage,
+        disputes: list[tuple[str, str]],
+    ) -> None:
+        """
+        Stop when a plan nobody can revise has disputed claims.
+
+        Unattended planning, or a plan finished in an earlier attempt:
+        there is no human in the planning session to settle a dispute.
+
+        :param stage: The plan stage.
+        :param disputes: ``(check id, claim)`` per dispute.
+        :raises PipelineRunError: When there is any dispute.
+        """
+        if not disputes:
+            return
+        listed = '\n'.join(f'  [{cid}] {claim}' for cid, claim in disputes)
+        raise PipelineRunError(
+            f'{stage.id}: the plan check raised {len(disputes)} '
+            f'dispute(s) — a claim the repository contradicts, or two '
+            f'sections that contradict each other:\n\n{listed}\n\n'
+            f'Nothing after the plan has run, and nobody is in the '
+            f'planning session to settle it. The full reports are in the '
+            f'run directory under reviews/. Correct the brief, or plan '
+            f'interactively, and re-run.'
+        )
 
     def _plan_consolidation_instruction(self) -> str:
         """Ask the approved planner for a standalone plan (+ chunks)."""
@@ -9813,6 +10119,37 @@ class PipelineRunner:
             + (f'\n\n{design}' if design else '')
             + f'\n\nFiles {target.id!r} added or changed:\n{files}'
             f'{_CHECK_RULES}{_REVIEW_MOUNT}'
+            f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}'
+            + self._setup_block()
+        )
+
+    def _plan_check_instruction(
+        self, stage: pipeline.PipelineStage, plan: str
+    ) -> str:
+        """
+        Frame a plan check's turn: check its facts, build nothing.
+
+        The plan is in the turn because it is not in the tree yet: the
+        check runs before the plan of record is committed.
+
+        :param stage: The stage declaring ``checks: <planner stage>``.
+        :param plan: The consolidated plan the human approved.
+        :returns: The turn text.
+        """
+        acceptance = (
+            f'\n\nAcceptance contract:\n{self._config.acceptance}'
+            if self._config.acceptance
+            else ''
+        )
+        return (
+            f'{self._chunk_preamble()}CHECK THE PLAN before it becomes the '
+            f'plan of record. Do NOT implement anything: your mount is '
+            f'read-only, and it is the repository as it stands before any '
+            f'of the plan is built. A human has approved the plan below, '
+            f'pending this check; every later stage will build on it.'
+            f'\n\nBrief:\n{self._config.task}{acceptance}'
+            f'\n\nThe plan ({stage.checks!r}):\n{plan}'
+            f'{_PLAN_CHECK_RULES}{_REVIEW_MOUNT}'
             f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}'
             + self._setup_block()
         )

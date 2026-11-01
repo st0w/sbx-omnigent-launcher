@@ -1,15 +1,20 @@
 # Full-cadre pipeline — the whole swarm in one file.
 #
-# Planning + TDD + a contract check + two COMPETING coders (Claude vs agy), each
-# vetted by a security + bug reviewer consensus gate; a judge picks the winner, a
-# refactor agent polishes it, and one final review ships it. Every role the
-# launcher ships, working together:
+# Planning + a plan check + TDD + a contract check + two COMPETING coders
+# (Claude vs agy), each vetted by a security + bug reviewer consensus gate; a
+# judge picks the winner, a refactor agent polishes it, and one final review
+# ships it. Every role the launcher ships, working together:
 #
 #   plan ─▶ tests ─▶ check ─┬─▶ impl-a (Claude) ─▶ review-a [sec+bugs] ─┐
 #    (agy)  (TDD)   (ro)    └─▶ impl-b (agy)    ─▶ review-b [sec+bugs] ─┴─▶ pick ─▶ refactor ─▶ review-r ─▶ publish
-#                                each review loops findings back to its OWN impl on a block   (winner)   [sec+bugs]
+#   [plan-check]                 each review loops findings back to its OWN impl on a block   (winner)   [sec+bugs]
 #
-# The check reads the frozen suite beside the brief and the plan before either
+# `plan-check` runs INSIDE the plan stage: when you reply APPROVED, it runs a
+# command for each of the plan's claims about existing code before the plan is
+# final. A false claim goes back to your planning session and approval reopens
+# (APPROVED re-checks; APPROVED AS IS accepts without another check).
+#
+# `check` reads the frozen suite beside the brief and the plan before either
 # coder starts. A contract no implementation could satisfy stops the run there
 # (`DISPUTED:`), before two full implement stages are spent on it.
 #
@@ -20,8 +25,8 @@
 # judge publishes its winner as its own branch, so the refactor writer can seed
 # `from: pick`.
 #
-# This is the heaviest example — up to ~13 microVMs (plan + tests + check +
-# 2 impls + 4 impl-reviewers + judge + refactor + 2 refactor-reviewers). Uses three
+# This is the heaviest example — up to ~14 microVMs (plan + plan-check + tests +
+# check + 2 impls + 4 impl-reviewers + judge + refactor + 2 refactor-reviewers). Uses three
 # Antigravity (agy) agents; see Setup in README.md. To run with NO agy at all,
 # swap the antigravity-native agents below for claude-native (give impl_agy a
 # different model/effort so the two coders still differ) and drop agy_enabled
@@ -56,6 +61,9 @@ agents:
     template: tdd-writer
     model: claude-sonnet-5
     effort: high
+  plan_checker:                 # runs a command per plan claim, inside your approval
+    template: plan-checker
+    model: claude-sonnet-5
   checker:                      # reads the suite + brief + plan; stops the run on DISPUTED:
     template: contract-checker
     model: claude-sonnet-5
@@ -84,6 +92,7 @@ agents:
 
 stages:
   - { id: plan,  run: plan }                                    # design (interactive)
+  - { id: plan-check, run: plan_checker, checks: plan, needs: [plan] }  # runs inside plan's approval
   - { id: tests, run: tdd, write: true, needs: [plan] }         # tests only, own branch
   - { id: check, run: checker, checks: tests, needs: [tests] }  # can the contract be met?
   - id: implement                                               # two ISOLATED writers
