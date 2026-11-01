@@ -7334,28 +7334,73 @@ class PipelineRunner:
                 if checks else ''
             )
         )
-        disputed = False
+        names = ', '.join(c.id for c in checks)
+        self._sc.post_notice(
+            session,
+            'Your move: reply exactly APPROVED when the plan is right',
+            'Ask questions or ask for changes in normal messages first. '
+            'When the plan is right, send a message that is exactly: '
+            'APPROVED\n\nNothing else may be in that message, or it does '
+            'not count. The planner then writes the final plan'
+            + (
+                f', and {names} checks it: a command for each claim the '
+                f'plan makes about existing code. That takes a few '
+                f'minutes.'
+                if checks
+                else ', and the pipeline moves on.'
+            ),
+        )
+        disputes: list[tuple[str, str]] = []
         while True:
             approved, phrase = self._wait_for_approval(session, checks)
+            self._sc.post_notice(
+                session,
+                'Approved: the planner is writing the final plan',
+                'The planner is consolidating the final plan from this '
+                'conversation (one more turn).',
+            )
             plan = self._consolidate_plan(session, approved, first_reply)
             if not checks:
+                self._sc.post_notice(
+                    session, 'The plan is final: the pipeline moves on'
+                )
                 return plan
             assert stage is not None
-            if disputed and phrase == _APPROVED_AS_IS:
+            if disputes and phrase == _APPROVED_AS_IS:
                 click.echo(
                     f'[plan] {stage.id}: accepted AS IS over the '
                     f'disputes the last check raised, without another '
                     f'check. The disputed round is in the reviews record.'
                 )
+                self._sc.post_notice(
+                    session,
+                    'Accepted as is: the plan is final',
+                    f'Accepted over {len(disputes)} problem(s) from the '
+                    f'last check, without another check. The pipeline '
+                    f'moves on.',
+                )
                 return plan
+            self._sc.post_notice(
+                session,
+                'Checking the plan (a few minutes): nothing to do yet',
+                f'{names}: running a command for each claim the plan '
+                f'makes about existing code, and reading its sections '
+                f'against each other. The result appears here when it '
+                f'finishes.',
+            )
             disputes = self._run_plan_checks(stage, plan)
             if not disputes:
                 click.echo(
                     f'[plan] {stage.id}: the plan check found no false '
                     f'claim or contradiction; the plan is final.'
                 )
+                self._sc.post_notice(
+                    session,
+                    'Plan check passed: the plan is final',
+                    f'{names} found no false claim and no contradiction. '
+                    f'The pipeline moves on.',
+                )
                 return plan
-            disputed = True
             self._report_plan_disputes(session, stage, disputes)
 
     def _wait_for_approval(
@@ -7535,18 +7580,35 @@ class PipelineRunner:
             f'--- {check_id} ---\n{self._nodes[check_id].output}'
             for check_id in dict.fromkeys(cid for cid, _c in disputes)
         )
+        self._sc.post_notice(
+            session,
+            f'Plan check found {len(disputes)} problem(s): the planner '
+            f'will propose fixes',
+            'The report from the check follows, sent to the planner, '
+            'which will walk you through each problem.',
+        )
         self._drive(
             session,
-            f'A read-only check of the plan you just consolidated found '
-            f'{len(disputes)} problem(s): a claim about the existing code '
-            f'that the repository contradicts, or two sections that '
-            f'contradict each other. It ran commands against the '
-            f'repository; its reports are below.\n\n{reports}\n\n'
-            f'Walk the human through each problem and propose what you '
-            f'would change, and wait for them. Do not output a final plan '
-            f'yet. When they reply APPROVED, the plan is consolidated and '
-            f'checked again; if they reply {_APPROVED_AS_IS}, it is '
-            f'accepted as it stands.',
+            f'From the pipeline, not the human: a read-only check of the '
+            f'plan you just consolidated found {len(disputes)} problem(s): '
+            f'a claim about the existing code that the repository '
+            f'contradicts, or two sections that contradict each other. It '
+            f'ran commands against the repository; its reports are '
+            f'below.\n\n{reports}\n\nWalk the human through each problem '
+            f'and propose what you would change, and wait for them. Do not '
+            f'output a final plan yet. When they reply APPROVED, the plan '
+            f'is consolidated and checked again; if they reply '
+            f'{_APPROVED_AS_IS}, it is accepted as it stands.',
+        )
+        self._sc.post_notice(
+            session,
+            'Your move: reply APPROVED to re-check, or APPROVED AS IS to '
+            'accept',
+            'Settle the problems above with the planner, in normal '
+            'messages. Then send a message that is exactly one of:\n\n'
+            'APPROVED: the planner writes the final plan again, and it is '
+            'checked again.\n\nAPPROVED AS IS: the plan is accepted as it '
+            'stands, with no further check.',
         )
         listed = '\n'.join(f'  [{cid}] {claim}' for cid, claim in disputes)
         click.echo(
