@@ -29,6 +29,7 @@ from click.testing import CliRunner, Result
 from sbx_omnigent import egress, pipeline
 from sbx_omnigent import runner as R
 from sbx_omnigent.swarm_session import (
+    PlanDecision,
     SwarmRunnerUnavailable,
     SwarmSessionClient,
     SwarmSessionError,
@@ -373,6 +374,9 @@ class FakeSC:
         self.events: list[tuple[str, str]] = []
         self.warmed: list[str] = []
         self.approvals: list[str] = []
+        #: The phrase each approval is sent with, in order; past the end
+        #: of the list every approval is plain ``APPROVED`` (#49).
+        self.approval_phrases: list[str] = []
         #: node labels already provisioned when approval began (proves
         #: writers were pre-warmed before the human approved).
         self.labels_at_approval: list[str] = []
@@ -446,6 +450,14 @@ class FakeSC:
     def wait_for_terminal_ready(self, session, **kw) -> bool:
         self.warmed.append(session)
         return True
+
+    def wait_for_plan_decision(self, session, **kw) -> PlanDecision:
+        plan = self.wait_for_plan_approval(session, **kw)
+        phrase = (
+            self.approval_phrases.pop(0) if self.approval_phrases
+            else 'APPROVED'
+        )
+        return PlanDecision(plan=plan, phrase=phrase)
 
     def wait_for_plan_approval(self, session, **kw) -> str:
         # Non-blocking fake: record the call and return the planner's
@@ -1746,6 +1758,301 @@ class TestTwoContractChecks(_Base):
         both = message + ' ' + printed
         self.assertIn('excludes the upper bound', both)
         self.assertIn('cannot both pass', both)
+
+
+#: A plan check (#49): it runs inside the plan stage's approval loop.
+_PLAN_CHECKED = """\
+name: planchecked
+repo: ./proj
+publish: none
+task: |
+  build parse_ports
+acceptance: |
+  ranges are inclusive
+setup: |
+  install the toolchain
+agents:
+  plan: {template: planner, model: claude-sonnet-5}
+  pchk: {template: plan-checker, model: claude-sonnet-5}
+  tw: {template: tdd-writer, model: claude-sonnet-5}
+  build: {template: coder, model: claude-sonnet-5}
+stages:
+  - {id: plan, run: plan}
+  - {id: plan-check, run: pchk, checks: plan, needs: [plan]}
+  - {id: tests, run: tw, write: true, needs: [plan]}
+  - {id: build, run: build, write: true, from: tests, needs: [plan]}
+"""
+
+
+class TestThePlanCheckTurn(_Base):
+    """What a plan checker is asked to do (#49)."""
+
+    _PLAN = 'THE PLAN: port ranges use the Range type in ports.py.'
+
+    def _message(self) -> str:
+        cfg = self._cfg(_PLAN_CHECKED)
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        return runner._plan_check_instruction(
+            runner._stage_by_id['plan-check'], self._PLAN
+        )
+
+    def test_it_carries_the_plan_and_the_brief(self) -> None:
+        message = self._message()
+        for part in (
+            self._PLAN,                # not in the tree yet
+            'build parse_ports',       # the brief
+            'ranges are inclusive',    # the acceptance contract
+            'install the toolchain',   # setup, to run its checks
+        ):
+            with self.subTest(part=part):
+                self.assertIn(part, message)
+
+    def test_it_says_the_mount_is_read_only(self) -> None:
+        self.assertIn(R._REVIEW_MOUNT, self._message())
+
+    def test_it_carries_the_unattended_rules(self) -> None:
+        self.assertIn(R._UNATTENDED, self._message())
+
+    def test_it_is_not_a_build_order(self) -> None:
+        message = self._message()
+        self.assertNotIn('Task:', message)
+        self.assertIn('Do NOT implement', message)
+
+    def test_every_claim_needs_a_command_and_its_output(self) -> None:
+        message = self._message()
+        self.assertIn('the command you ran', message)
+        self.assertIn('its output', message)
+
+    def test_it_asks_for_contradictions_between_sections(self) -> None:
+        self.assertIn('contradict each other', self._message())
+
+    def test_it_is_told_the_design_is_not_its_call(self) -> None:
+        self.assertIn('not your call', self._message())
+
+    def test_its_own_text_would_not_halt_the_run(self) -> None:
+        self.assertEqual(R.parse_disputes(self._message()), ())
+
+
+def _messages_for(sc: FakeSC, label: str) -> list[str]:
+    """Every message sent to the sessions labelled *label*, in order."""
+    return [m for sess, m in sc.sent if sc._label.get(sess) == label]
+
+
+class TestThePlanCheckInsideApproval(_Base):
+    """
+    A plan check runs when the human approves, before the plan is final
+    (#49). A dispute goes back to the planning session and approval
+    reopens; the human settles it, and `APPROVED AS IS` accepts the plan
+    without another check.
+
+    Observed downstream: checking a plan's claims about frozen code
+    found two false claims that three reviews had passed.
+    """
+
+    _DISPUTE = (
+        'DISPUTED: the plan says ports.py limits specs to 64 bytes; '
+        'ports.py:9 limits them to 64 characters.'
+    )
+    _CLEAN = 'CLAIMS CHECKED:\n- parse_ports takes (spec: str)'
+
+    def _go(self, checks, *, phrases=(), interactive=True, wt=None):
+        sc = FakeSC({
+            'plan': 'THE PLAN', 'plan-check': list(checks),
+            'tests': 't', 'build': 'b',
+        })
+        sc.approval_phrases = list(phrases)
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            result, sc, wt = self._run(
+                _PLAN_CHECKED, {}, sc=sc, wt=wt,
+                interactive_plan=interactive,
+            )
+        printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
+        return result, sc, wt, printed
+
+    # ── no dispute ────────────────────────────────────────────────
+
+    def test_a_clean_check_lets_the_plan_through(self) -> None:
+        result, sc, _wt, _p = self._go([self._CLEAN])
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(len(sc.approvals), 1)
+
+    def test_it_runs_before_the_tests_stage(self) -> None:
+        _r, sc, _wt, _p = self._go([self._CLEAN])
+        order = [sc._label[session] for session, _m in sc.sent]
+        self.assertLess(order.index('plan-check'), order.index('tests'))
+
+    def test_it_reads_the_consolidated_plan(self) -> None:
+        _r, sc, _wt, _p = self._go([self._CLEAN])
+        self.assertIn('THE PLAN', _messages_for(sc, 'plan-check')[0])
+
+    def test_it_runs_once_not_again_as_a_stage(self) -> None:
+        _r, sc, _wt, _p = self._go([self._CLEAN, self._CLEAN])
+        self.assertEqual(len(_messages_for(sc, 'plan-check')), 1)
+
+    def test_its_report_is_recorded(self) -> None:
+        _r, _sc, wt, _p = self._go([self._CLEAN])
+        record = wt.artifacts['reviews/plan-check-pchk-r1.md']
+        self.assertIn('NO DISPUTE', record)
+        self.assertIn('parse_ports takes', record)
+
+    # ── a dispute ─────────────────────────────────────────────────
+
+    def test_a_dispute_goes_back_to_the_planning_session(self) -> None:
+        _r, sc, _wt, _p = self._go([self._DISPUTE, self._CLEAN])
+        to_planner = '\n'.join(_messages_for(sc, 'plan'))
+        self.assertIn('64 characters', to_planner)
+        self.assertIn('APPROVED AS IS', to_planner)
+
+    def test_approval_reopens_and_the_plan_is_checked_again(self) -> None:
+        result, sc, _wt, _p = self._go([self._DISPUTE, self._CLEAN])
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(len(sc.approvals), 2)
+        self.assertEqual(len(_messages_for(sc, 'plan-check')), 2)
+
+    def test_no_writer_starts_while_it_is_disputed(self) -> None:
+        _r, sc, _wt, _p = self._go([self._DISPUTE, self._CLEAN])
+        order = [sc._label[session] for session, _m in sc.sent]
+        last_check = len(order) - 1 - order[::-1].index('plan-check')
+        self.assertLess(last_check, order.index('tests'))
+
+    def test_the_console_says_where_to_settle_it(self) -> None:
+        _r, _sc, _wt, printed = self._go([self._DISPUTE, self._CLEAN])
+        self.assertIn('64 characters', printed)
+        self.assertIn('APPROVED AS IS', printed)
+
+    def test_both_rounds_are_recorded(self) -> None:
+        _r, _sc, wt, _p = self._go([self._DISPUTE, self._CLEAN])
+        # The table row, not the header, which names both verdicts.
+        first = wt.artifacts['reviews/plan-check-pchk-r1.md']
+        self.assertIn('| `plan-check-pchk` | 1 | DISPUTE RAISED |', first)
+        second = wt.artifacts['reviews/plan-check-pchk-r2.md']
+        self.assertIn('| `plan-check-pchk` | 2 | NO DISPUTE |', second)
+
+    # ── the override ──────────────────────────────────────────────
+
+    def test_approved_as_is_accepts_without_another_check(self) -> None:
+        result, sc, _wt, printed = self._go(
+            [self._DISPUTE, self._DISPUTE],
+            phrases=['APPROVED', 'APPROVED AS IS'],
+        )
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(len(_messages_for(sc, 'plan-check')), 1)
+        self.assertIn('AS IS', printed)
+
+    def test_the_first_approval_is_always_checked(self) -> None:
+        # "As is" means "over the dispute you showed me"; before any
+        # check there is nothing to accept it over.
+        _r, sc, _wt, _p = self._go(
+            [self._DISPUTE, self._CLEAN],
+            phrases=['APPROVED AS IS', 'APPROVED'],
+        )
+        self.assertEqual(len(_messages_for(sc, 'plan-check')), 2)
+
+    # ── no human ──────────────────────────────────────────────────
+
+    def test_unattended_a_dispute_stops_the_run(self) -> None:
+        sc = FakeSC({
+            'plan': 'THE PLAN', 'plan-check': self._DISPUTE,
+            'tests': 't', 'build': 'b',
+        })
+        with self.assertRaises(R.PipelineRunError) as caught:
+            self._run(_PLAN_CHECKED, {}, sc=sc, interactive_plan=False)
+        self.assertIn('64 characters', str(caught.exception))
+        self.assertEqual(sc.message_for_label('tests'), '')
+
+    def test_unattended_a_clean_check_runs_on(self) -> None:
+        result, _sc, _wt, _p = self._go([self._CLEAN], interactive=False)
+        self.assertEqual(result.status, 'completed')
+
+    # ── resume ────────────────────────────────────────────────────
+
+    def test_a_resumed_check_of_a_finished_plan_still_stops(self) -> None:
+        # The plan completed in an earlier attempt and nobody is in its
+        # session any more, so a dispute can only stop the run.
+        cfg = self._cfg(_PLAN_CHECKED)
+        wt = FakeWT()
+        wt.state_to_load = {
+            'version': R.RUN_STATE_VERSION, 'completed': ['plan'],
+            'completed_chunks': [], 'plan_of_record': 'THE PLAN',
+            'published': [], 'last_branch_node': None, 'subtasks': [],
+            'nodes': {'plan': {
+                'kind': 'reader', 'branch': None,
+                'worktree': '/wt/r1/nodes/plan', 'output': 'THE PLAN',
+                'verdict': None, 'selected': None,
+            }},
+        }
+        sc = FakeSC({'plan-check': self._DISPUTE, 'tests': 't'})
+        runner = R.PipelineRunner(
+            cfg, session_client=sc, worktree_manager=wt, run_id='r1',
+            agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0, resume=True,
+        )
+        with self.assertRaises(R.PipelineRunError) as caught:
+            runner.run()
+        self.assertIn('64 characters', str(caught.exception))
+        self.assertIn('THE PLAN', sc.message_for_label('plan-check'))
+
+
+class TestPlanChecksSideBySideAndPerModule(_Base):
+    """Two plan checks run together; a campaign checks each module's
+    own plan inside that module's approval (#49)."""
+
+    _DISPUTE = 'DISPUTED: ports.py:9 limits specs to characters, not bytes.'
+    _CLEAN = 'CLAIMS CHECKED:\n- parse_ports takes (spec: str)'
+
+    _TWO = _PLAN_CHECKED.replace(
+        '  pchk: {template: plan-checker, model: claude-sonnet-5}\n',
+        '  pchk: {template: plan-checker, model: claude-sonnet-5}\n'
+        '  pchk2: {template: plan-checker, model: claude-sonnet-5}\n',
+    ).replace(
+        '  - {id: plan-check, run: pchk, checks: plan, needs: [plan]}\n',
+        '  - id: plan-checks\n'
+        '    parallel:\n'
+        '      - {id: pc-a, run: pchk, checks: plan, needs: [plan]}\n'
+        '      - {id: pc-b, run: pchk2, checks: plan, needs: [plan]}\n',
+    )
+
+    def test_both_run_and_either_dispute_reopens_approval(self) -> None:
+        sc = FakeSC({
+            'plan': 'THE PLAN', 'pc-a': [self._CLEAN, self._CLEAN],
+            'pc-b': [self._DISPUTE, self._CLEAN], 'tests': 't', 'build': 'b',
+        })
+        result, sc, _wt = self._run(self._TWO, {}, sc=sc)
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(len(sc.approvals), 2)
+        for check in ('pc-a', 'pc-b'):
+            with self.subTest(check=check):
+                self.assertEqual(len(_messages_for(sc, check)), 2)
+        self.assertIn('characters, not bytes', '\n'.join(
+            _messages_for(sc, 'plan')
+        ))
+
+    def test_each_module_s_plan_is_checked_in_its_own_approval(
+        self,
+    ) -> None:
+        text = _PER_MODULE.replace(
+            '  plan: {template: planner, model: claude-sonnet-5}\n',
+            '  plan: {template: planner, model: claude-sonnet-5}\n'
+            '  pchk: {template: plan-checker, model: claude-sonnet-5}\n',
+        ).replace(
+            '  - {id: plan, run: plan}\n',
+            '  - {id: plan, run: plan}\n'
+            '  - {id: plan-check, run: pchk, checks: plan, needs: [plan]}\n',
+        )
+        sc = FakeSC({
+            'm0-plan': 'D0', 'm1-plan': 'D1',
+            'm0-plan-check': self._CLEAN, 'm1-plan-check': self._CLEAN,
+        })
+        result, sc, _wt = self._run(text, {}, sc=sc)
+        self.assertEqual(result.status, 'completed')
+        self.assertIn('D0', sc.message_for_label('m0-plan-check'))
+        self.assertIn('D1', sc.message_for_label('m1-plan-check'))
+        order = [sc._label[session] for session, _m in sc.sent]
+        self.assertLess(order.index('m0-plan-check'), order.index('m0-tests'))
 
 
 _CAMPAIGN_CHECKED = """\

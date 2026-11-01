@@ -143,7 +143,7 @@ inferred from its keys:
 | **writer** | `write: true` | isolated `rw` worktree + branch | Implements; its committed branch is the artifact. |
 | **review** | `gate:` / `on_block:` | `:ro` on the target writer's branch | One or more reviewers vote via a `VERDICT:` line; a block loops findings back to `on_block`. |
 | **judge** | `selects:` | `:ro` compare tree | Reads competing writer branches side by side and picks a winner via a `SELECT:` line. |
-| **check** | `checks: <tests stage>` | `:ro` on the tests branch | Reads the frozen suite beside the brief and plan before the writers start; a `DISPUTED:` line stops the run. See [A contract check before the writers](#a-contract-check-before-the-writers). |
+| **check** | `checks: <tests stage>` or `checks: <plan stage>` | `:ro` on the tests branch, or the base tree | Checks the frozen suite before the writers start, or the plan's claims before the plan is final; a `DISPUTED:` line stops the run or reopens approval. See [A contract check before the writers](#a-contract-check-before-the-writers) and [A plan check inside approval](#a-plan-check-inside-approval). |
 
 Stage keys:
 
@@ -334,6 +334,9 @@ prewarm: false             # writers boot when they're first driven instead
 The planner still waits for your approval; only the background boots are
 skipped.
 
+A `checks:` stage that names the plan runs when you approve, before the plan is
+final. See [A plan check inside approval](#a-plan-check-inside-approval).
+
 ### Plan of record
 
 On approval the planner is driven one more turn to re-emit its design as a
@@ -516,6 +519,57 @@ neither is lost. A checker that didn't dispute still has its findings recorded.
 Listed one after the other instead, a dispute from the first would stop the run
 before the second had looked. On `--resume`, only a checker that disputed runs
 again.
+
+## A plan check inside approval
+
+A plan makes claims about the code it builds on: this function takes these
+arguments, this limit is in characters, these two values are comparable. The
+planner checks them by reading, and isn't allowed to run anything. A wrong claim
+is found when the tests are built on it, or by a reviewer later. A `checks:`
+stage that names the plan stage checks those claims before the plan is final:
+
+```yaml
+agents:
+  plan_checker: {template: plan-checker, model: claude-fable-5-1, effort: max}
+stages:
+  - { id: plan, run: plan }
+  - { id: plan-check, run: plan_checker, checks: plan, needs: [plan] }
+  - { id: tests, run: tdd, write: true, needs: [plan] }
+```
+
+Its agent (the `plan-checker` template) gets the consolidated plan, the brief
+and the acceptance contract, on a read-only copy of the repository as it stands.
+For every claim about existing code it runs a command and reports the claim, the
+command and its output. It also reads the plan's sections against each other.
+Whether the design is right isn't its call.
+
+**It runs inside the approval, not after it.** When you reply `APPROVED`, the
+plan is consolidated and then checked:
+
+- **No dispute:** the plan is final. Every claim that held is listed in the
+  check's record under `CLAIMS CHECKED:`, so the approval isn't taken on trust.
+- **A false claim, or two sections that contradict each other:** the checker's
+  report goes into the planning session, and the console prints the claims.
+  Approval reopens. Settle each dispute with the planner, then reply:
+  - **`APPROVED`:** the plan is consolidated and checked again.
+  - **`APPROVED AS IS`:** the plan is accepted without another check. Use it when
+    the checker is wrong. The disputed round stays in the reviews record.
+
+  `APPROVED AS IS` only means something after a dispute. On the first approval
+  the plan is always checked.
+- **Unattended planning** (`--no-interactive-plan`): nobody is in the session to
+  settle a dispute, so a dispute stops the run before the tests are written.
+
+The checker never argues with the planner; you decide. Nothing waits on the
+check stage in `needs`, because it has run before the plan stage completes.
+Several plan checks in one `parallel:` block run side by side, as with
+[two contract checkers](#two-checkers-from-different-providers), and any one's
+dispute reopens approval. In a per-module campaign each module's plan is
+checked in that module's approval. Each round is recorded beside the reviewers'
+reports, `NO DISPUTE` or `DISPUTE RAISED`, and never reaches the writers as
+design context. If the plan stage finished in an earlier attempt and the check
+didn't, `--resume` runs the check on the finished plan, and a dispute stops the
+run.
 
 ## Campaigns — build in sequence, one chunk at a time
 
@@ -1419,7 +1473,8 @@ commits/merges):
 | `coder` | Implements to the acceptance contract; makes upstream tests pass. |
 | `security-reviewer` | Read-only security audit; ends with `VERDICT:`. |
 | `bug-reviewer` | Read-only correctness audit; ends with `VERDICT:`. |
-| `contract-checker` | Read-only check that the frozen suite, brief and plan can all be met; for a `checks:` stage. |
+| `contract-checker` | Read-only check that the frozen suite, brief and plan can all be met; for a `checks: <tests stage>` stage. |
+| `plan-checker` | Read-only check of a plan's claims about existing code, each with a command and its output; for a `checks: <plan stage>` stage. |
 | `judge` | Compares competing candidate branches; ends with `SELECT: <id>`. |
 | `refactoring` | Behavior-preserving cleanup of working code; keeps all tests green. |
 

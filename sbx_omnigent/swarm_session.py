@@ -385,6 +385,20 @@ def _is_bare_approval(text: str, phrases: tuple[str, ...]) -> bool:
 _DEFAULT_PLAN_APPROVAL_IDLE_S = 3600.0
 
 
+@dataclass(frozen=True)
+class PlanDecision:
+    """
+    A human's approval of a plan, and which phrase they sent.
+
+    :param plan: The plan approved: the last assistant message before
+        the approval turn.
+    :param phrase: The approval phrase, uppercased, e.g. ``"APPROVED"``.
+    """
+
+    plan: str
+    phrase: str
+
+
 def _approved_plan_text(
     items: list[dict[str, object]],
     phrases: tuple[str, ...],
@@ -393,6 +407,24 @@ def _approved_plan_text(
 ) -> str | None:
     """
     The plan a human approved in a planner session, or ``None``.
+
+    :param items: Session items oldest-first (from ``read_items``).
+    :param phrases: Uppercase approval phrases to match exactly.
+    :param seen_ids: Ids of items already present when the wait began.
+    :returns: The approved plan text, or ``None`` if not yet approved.
+    """
+    turn = _approval_turn(items, phrases, seen_ids=seen_ids)
+    return None if turn is None else turn[0]
+
+
+def _approval_turn(
+    items: list[dict[str, object]],
+    phrases: tuple[str, ...],
+    *,
+    seen_ids: frozenset[str] | set[str] = frozenset(),
+) -> tuple[str, str] | None:
+    """
+    The plan a human approved, and the phrase they approved it with.
 
     Three conditions must hold, because this gate is the ONLY thing
     standing between a generated plan and an unattended build, and it
@@ -417,24 +449,27 @@ def _approved_plan_text(
     :param phrases: Uppercase approval phrases to match exactly.
     :param seen_ids: Ids of items already present when the wait began;
         these can never constitute the approval.
-    :returns: The approved plan text, or ``None`` if not yet approved.
+    :returns: ``(plan, phrase)``, or ``None`` if not yet approved.
     """
     approval_idx: int | None = None
+    phrase = ''
     for i, item in enumerate(items):
         if item.get('type') != 'message' or item.get('role') != 'user':
             continue
         item_id = item.get('id')
         if isinstance(item_id, str) and item_id in seen_ids:
             continue  # pre-existing turn (the runner's own instruction)
-        if _is_bare_approval(_item_message_text(item), phrases):
+        text = _item_message_text(item)
+        if _is_bare_approval(text, phrases):
             approval_idx = i
+            phrase = ' '.join(text.strip(_APPROVAL_TRIM).split()).upper()
     if approval_idx is None:
         return None
     for item in reversed(items[:approval_idx]):
         if item.get('type') == 'message' and item.get('role') == 'assistant':
             text = _item_message_text(item)
             if text:
-                return text
+                return text, phrase
     # Fail closed: nothing was said before this "approval".
     return None
 
@@ -1245,6 +1280,32 @@ class SwarmSessionClient:
         idle_timeout: float = _DEFAULT_PLAN_APPROVAL_IDLE_S,
     ) -> str:
         """
+        Block until a human approves the plan; return the plan text.
+
+        See :meth:`wait_for_plan_decision`, which this wraps for callers
+        that do not need to know which phrase was sent.
+
+        :param session_id: The planner session to watch.
+        :param approval_phrases: Uppercase phrases counting as approval.
+        :param poll: Seconds between item-store polls.
+        :param idle_timeout: Cap on how long the session may sit SILENT.
+        :returns: The approved plan text.
+        :raises SwarmSessionError: If the session sits silent too long.
+        """
+        return self.wait_for_plan_decision(
+            session_id, approval_phrases=approval_phrases, poll=poll,
+            idle_timeout=idle_timeout,
+        ).plan
+
+    def wait_for_plan_decision(
+        self,
+        session_id: str,
+        *,
+        approval_phrases: tuple[str, ...] = _PLAN_APPROVAL_PHRASES,
+        poll: float = 5.0,
+        idle_timeout: float = _DEFAULT_PLAN_APPROVAL_IDLE_S,
+    ) -> PlanDecision:
+        """
         Block until a human approves the plan in the session, then
         return the approved plan text.
 
@@ -1277,7 +1338,7 @@ class SwarmSessionClient:
         :param poll: Seconds between item-store polls.
         :param idle_timeout: Cap on how long the session may sit SILENT.
             Every new turn restarts it.
-        :returns: The approved plan text.
+        :returns: The approved plan and the phrase that approved it.
         :raises SwarmSessionError: If the session sits silent for
             *idle_timeout* with no approval.
         """
@@ -1308,11 +1369,11 @@ class SwarmSessionClient:
                 )
             except SwarmSessionError:
                 items = []
-            plan = _approved_plan_text(
+            turn = _approval_turn(
                 items, approval_phrases, seen_ids=baseline
             )
-            if plan is not None:
-                return plan
+            if turn is not None:
+                return PlanDecision(plan=turn[0], phrase=turn[1])
             ids = {
                 item_id
                 for item in items

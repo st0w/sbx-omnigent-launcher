@@ -847,14 +847,17 @@ class TestAContractCheckStage(_Base):
         self.assertIn("'check'", message)
         self.assertIn("'tset'", message)
 
-    def test_a_target_that_is_not_a_tests_stage_is_refused(self) -> None:
-        message = self._refused(self._check_line(
-            '  - {id: check, run: checker, checks: plan, '
-            'needs: [tests, plan]}'
-        ))
-        self.assertIn("checks 'plan'", message)
+    def test_a_target_that_is_neither_kind_is_refused(self) -> None:
+        # A coder's branch is neither a frozen suite nor a plan.
+        stages = _CHECK_STAGES + (
+            '  - {id: late, run: checker, checks: impl-a, needs: [impl-a]}\n'
+            '  - {id: after, run: impl, write: true, needs: [late]}\n'
+        )
+        message = self._refused(stages)
+        self.assertIn("checks 'impl-a'", message)
         self.assertIn('tdd-writer', message)
         self.assertIn('tests_only', message)
+        self.assertIn('planner', message)
 
     def test_a_check_that_does_not_need_its_target_is_refused(self) -> None:
         message = self._refused(self._check_line(
@@ -896,6 +899,74 @@ class TestAContractCheckStage(_Base):
         ))
 
 
+class TestAPlanCheckStage(_Base):
+    """`checks:` may name a planner stage (#49).
+
+    A plan check runs inside the plan stage's approval loop, before the
+    plan is final and before anything else runs, so it needs no writer
+    waiting for it. The other placement rules still hold.
+    """
+
+    _PLAN_CHECK = (
+        '  - {id: plan-check, run: checker, checks: plan, needs: [plan]}\n'
+    )
+
+    def _with(self, line: str) -> str:
+        return _CHECK_AGENTS + _CHECK_STAGES.replace(
+            '  - {id: tests, run: tdd',
+            line + '  - {id: tests, run: tdd',
+        )
+
+    def _refused(self, line: str) -> str:
+        with self.assertRaises(P.PipelineError) as caught:
+            self._load(self._with(line))
+        return str(caught.exception)
+
+    def test_a_plan_check_loads(self) -> None:
+        cfg = self._load(self._with(self._PLAN_CHECK))
+        stages = {s.id: s for s in P._iter_stages(cfg.stages)}
+        self.assertEqual(stages['plan-check'].checks, 'plan')
+
+    def test_no_writer_has_to_wait_for_it(self) -> None:
+        # Nothing lists plan-check in needs, and that is fine: it has
+        # run before the plan stage completes.
+        cfg = self._load(self._with(self._PLAN_CHECK))
+        self.assertFalse(
+            any('plan-check' in s.needs for s in P._iter_stages(cfg.stages))
+        )
+
+    def test_two_plan_checks_side_by_side_load(self) -> None:
+        cfg = self._load(self._with(
+            '  - id: plan-checks\n'
+            '    parallel:\n'
+            '      - {id: pc-a, run: checker, checks: plan, needs: [plan]}\n'
+            '      - {id: pc-b, run: other, checks: plan, needs: [plan]}\n'
+        ))
+        stages = {s.id: s for s in P._iter_stages(cfg.stages)}
+        self.assertEqual(stages['pc-b'].checks, 'plan')
+
+    def test_it_must_need_the_plan(self) -> None:
+        message = self._refused(
+            '  - {id: plan-check, run: checker, checks: plan}\n'
+        )
+        self.assertIn("'plan'", message)
+        self.assertIn('needs', message)
+
+    def test_it_runs_one_agent(self) -> None:
+        message = self._refused(
+            '  - {id: plan-check, run: [checker, other], checks: plan, '
+            'needs: [plan]}\n'
+        )
+        self.assertIn('one agent', message)
+
+    def test_it_sets_no_other_kind_s_key(self) -> None:
+        message = self._refused(
+            '  - {id: plan-check, run: checker, checks: plan, '
+            'needs: [plan], gate: consensus}\n'
+        )
+        self.assertIn('gate', message)
+
+
 class TestTheShippedContractCheck(unittest.TestCase):
     """The template and the example that show `checks:` (#50)."""
 
@@ -918,6 +989,13 @@ class TestTheShippedContractCheck(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertFalse(line.lstrip().startswith('DISPUTED'))
 
+    def test_the_plan_checker_template_ships(self) -> None:
+        prompt = P.template_prompt('plan-checker')
+        self.assertIn('`DISPUTED:`', prompt)
+        for line in prompt.splitlines():
+            with self.subTest(line=line):
+                self.assertFalse(line.lstrip().startswith('DISPUTED'))
+
     def test_the_full_cadre_example_checks_its_tests(self) -> None:
         cfg = P.load_pipeline(self._EXAMPLE)
         stages = {s.id: s for s in P._iter_stages(cfg.stages)}
@@ -928,6 +1006,14 @@ class TestTheShippedContractCheck(unittest.TestCase):
         for writer in ('impl-a', 'impl-b'):
             with self.subTest(writer=writer):
                 self.assertIn('check', stages[writer].needs)
+
+    def test_the_full_cadre_example_checks_its_plan(self) -> None:
+        cfg = P.load_pipeline(self._EXAMPLE)
+        stages = {s.id: s for s in P._iter_stages(cfg.stages)}
+        self.assertEqual(stages['plan-check'].checks, 'plan')
+        self.assertEqual(
+            cfg.agents[stages['plan-check'].run[0]].template, 'plan-checker'
+        )
 
 
 class TestAClaudeAgentMustFitItsLaunchCommand(_Base):

@@ -259,7 +259,8 @@ file (give only one of each inline/file pair).
 | `coder` | Implements to the acceptance contract; makes upstream tests pass. |
 | `security-reviewer` | Read-only security audit; ends with `VERDICT:`. |
 | `bug-reviewer` | Read-only correctness audit; ends with `VERDICT:`. |
-| `contract-checker` | Read-only check that the frozen suite, brief and plan can all be met, for a `checks:` stage. |
+| `contract-checker` | Read-only check that the frozen suite, brief and plan can all be met, for a `checks: <tests stage>` stage. |
+| `plan-checker` | Read-only check of a plan's claims about existing code, each with a command and its output, for a `checks: <plan stage>` stage. |
 | `judge` | Compares competing candidate branches; ends with `SELECT: <id>`. |
 | `refactoring` | Behavior-preserving cleanup of working code; keeps tests green. |
 
@@ -274,7 +275,7 @@ inferred from its keys:
 | **writer** | `write: true` | isolated `rw` worktree + branch | Implements; its committed branch is the artifact. |
 | **review** | `gate:` / `on_block:` | `:ro` on the target writer's branch | One or more reviewers vote via `VERDICT:`; a block loops findings back to `on_block`. |
 | **judge** | `selects:` | `:ro` compare tree | Reads competing writer branches side by side and picks a winner via `SELECT:`. |
-| **check** | `checks: <tests stage>` | `:ro` on the tests branch | Reads the frozen suite beside the brief and plan before the writers start; `DISPUTED:` stops the run. See [docs/PIPELINES.md](docs/PIPELINES.md#a-contract-check-before-the-writers). |
+| **check** | `checks: <tests stage>` or `checks: <plan stage>` | `:ro` | Checks the frozen suite before the writers start, or the plan's claims inside your approval; `DISPUTED:` stops the run or reopens approval. See [docs/PIPELINES.md](docs/PIPELINES.md#a-contract-check-before-the-writers). |
 
 Edges are `needs:` (and the explicit `from:` seed override). **Branches are the
 artifacts**: a writer's worktree is *cut from* its upstream branch (a coder

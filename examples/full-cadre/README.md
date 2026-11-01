@@ -1,8 +1,9 @@
 # Full cadre — the whole swarm in one pipeline
 
-Every role the launcher ships, working together on one task: a **planner**, a
-dedicated **TDD** author, a **contract check** of its suite, **two competing
-coders** (Claude vs Antigravity) each
+Every role the launcher ships, working together on one task: a **planner**
+whose claims are **checked** before its plan is final, a dedicated **TDD**
+author, a **contract check** of its suite, **two competing coders** (Claude vs
+Antigravity) each
 on its own isolated branch, a **security** reviewer and a **bug** reviewer gating
 *each* candidate, a **judge** that picks the winner, a **refactor** agent that
 polishes it, and one final review before publish.
@@ -16,6 +17,7 @@ plan ─▶ tests ─▶ check ─┬─▶ impl-a (Claude) ─▶ review-a [sec
 | Node | Template | Harness | Model | Role |
 | --- | --- | --- | --- | --- |
 | `plan` | planner | antigravity-native | Gemini 3.8 Flash, high | read-only design (interactive) |
+| `plan-check` | plan-checker | claude-native | Claude Sonnet 5 | checks the plan's claims about existing code, inside your approval (`:ro`) |
 | `tests` | tdd-writer | claude-native | Claude Sonnet 5, high | writes a failing test suite |
 | `check` | contract-checker | claude-native | Claude Sonnet 5 | checks the suite, brief and plan can all be met (`:ro`) |
 | `impl-a` | coder | claude-native | Claude Sonnet 5, high | competing coder, own branch |
@@ -24,6 +26,15 @@ plan ─▶ tests ─▶ check ─┬─▶ impl-a (Claude) ─▶ review-a [sec
 | `bugs` | bug-reviewer | antigravity-native | Gemini 3.8 Flash, high | correctness audit (`:ro`) |
 | `judge` | judge | claude-native | Claude Opus 4.8 | picks the winning branch |
 | `refactor` | refactoring | claude-native | Claude Sonnet 5, high | cleans up the winner (behavior-preserving) |
+
+## The plan check inside your approval
+
+When you reply `APPROVED` to the planner, `plan-check` runs a command against
+the repository for each claim the plan makes about existing code, before the
+plan is final. If one is false, or two sections contradict each other, its
+report goes into your planning session and approval reopens. Settle it with the
+planner, then reply `APPROVED` to have the plan checked again, or
+`APPROVED AS IS` to accept it without another check.
 
 ## The contract check before the coders
 
@@ -67,8 +78,8 @@ Antigravity:
    Use the [`mixed-models`](../mixed-models/) example's
    [`config.sample.yaml`](../mixed-models/config.sample.yaml) as your server
    `sandbox:` block (it sets `agy_enabled: true`).
-3. **Resources**: this pipeline can hold **~13 microVMs** over its life (plan +
-   tests + check + 2 impls + 4 impl-reviewers + judge + refactor +
+3. **Resources**: this pipeline can hold **~14 microVMs** over its life (plan +
+   plan-check + tests + check + 2 impls + 4 impl-reviewers + judge + refactor +
    2 refactor-reviewers).
    Make sure `sbx.worktree_root` is set and your host can spare the memory. Prefer
    `sbx.provision_stagger_s` at its default so the near-simultaneous VM launches
