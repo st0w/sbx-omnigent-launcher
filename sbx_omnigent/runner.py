@@ -1083,6 +1083,34 @@ _REVIEW_DISPUTE = (
     'would change.'
 )
 
+#: The line a check's reply must end with to count as a pass.
+_CHECK_COMPLETE = 'CHECK COMPLETE'
+
+#: Told to every check, contract and plan alike. Live, a Claude checker
+#: ended its turn to wait for a background `cargo test`, saying it would
+#: finish the report afterwards; the runner read that as the report,
+#: found no dispute, and recorded a pass. A pass must now be said.
+_CHECK_FINISH = (
+    '\n\nWHEN YOU ARE DONE. Your reply is read the moment your turn '
+    'ends, so do not end your turn while a command you started is still '
+    'running, in the background or anywhere else: wait for it, or run '
+    'it in the foreground. End your report with a line reading exactly '
+    f'`{_CHECK_COMPLETE}`. A reply without that line is treated as '
+    'unfinished, never as a pass: you are asked once to finish it, and '
+    'after that the check counts as not passed.'
+)
+
+#: Sent once to a check whose reply neither disputed nor said it was
+#: finished.
+_CHECK_FINISH_ASK = (
+    f'Your reply did not end with a line reading exactly '
+    f'`{_CHECK_COMPLETE}`, so the check is not finished and cannot count '
+    f'as a pass. If a command you started is still running, wait for it '
+    f'to finish. Then reply with your complete report, every dispute and '
+    f'finding included, ending with a line reading exactly '
+    f'`{_CHECK_COMPLETE}`.'
+)
+
 #: What a contract check stops the run for, and what it only records
 #: (#50). The marker is kept mid-sentence for the same reason as in
 #: :data:`_REVIEW_DISPUTE`: a checker quoting this back must not halt.
@@ -1106,6 +1134,7 @@ _CHECK_RULES = (
     'requirement. The run continues '
     'and a human reads them. If you find nothing of either kind, say '
     'that plainly and how you checked.'
+    + _CHECK_FINISH
 )
 
 #: What a plan check is asked to do (#49). Kept in the turn, not only
@@ -1132,6 +1161,7 @@ _PLAN_CHECK_RULES = (
     'reading exactly `CLAIMS CHECKED:`, each with the command that '
     'showed it, and anything you could not check under a line reading '
     'exactly `FINDINGS:`, one `- ` item per line.'
+    + _CHECK_FINISH
 )
 
 #: What a contract check's record says when it let the writers go on:
@@ -1590,6 +1620,25 @@ _DISPUTE_RE = re.compile(
     r'[ \t]*[:\u2014\u2013-][ \t]*(?P<claim>\S.*?)[ \t]*$',
     re.MULTILINE,
 )
+
+
+def check_finished(text: str | None) -> bool:
+    """
+    Whether a check's reply says it finished: a ``CHECK COMPLETE`` line.
+
+    The words must be the whole line, give or take markdown emphasis or
+    backticks, so a reply that only promises to end with them ("I will
+    end with CHECK COMPLETE once the tests finish") is not finished.
+
+    :param text: A check's reply.
+    :returns: ``True`` when some line is exactly the marker.
+    """
+    if not text:
+        return False
+    return any(
+        line.strip().strip('*_`').strip() == _CHECK_COMPLETE
+        for line in text.splitlines()
+    )
 
 
 def parse_disputes(text: str | None) -> tuple[str, ...]:
@@ -6689,8 +6738,7 @@ class PipelineRunner:
                 if not self._forfeit_blocked_reviews(stage, blocked):
                     raise
             return
-        if stage.id in self._completed:
-            self._note_skipped(stage)
+        if self._skip_as_completed(stage):
             return
         kind = self._stage_kind(stage)
         # The cap counts nodes being DRIVEN, so it is charged to
@@ -6739,19 +6787,39 @@ class PipelineRunner:
         # node that failed, not the approved plan behind it.
         self._save_state()
 
-    def _note_skipped(self, stage: pipeline.PipelineStage) -> None:
+    def _skip_as_completed(self, stage: pipeline.PipelineStage) -> bool:
         """
-        Say why a completed stage is skipped, unless it ran in a plan.
+        Whether a stage is skipped as already complete, saying why.
 
         A plan check is completed inside the plan stage's approval
         (#49), so reaching it afterwards is not a resume and says
-        nothing.
+        nothing. A contract check recorded complete without a reply
+        that says it finished is NOT skipped: an older launcher recorded
+        a pass for a check whose turn ended while it waited on a
+        background test run, and that must not stand on resume.
 
-        :param stage: The completed stage being skipped.
+        :param stage: The stage about to run.
+        :returns: ``True`` to skip it.
         """
+        if stage.id not in self._completed:
+            return False
         target = self._stage_by_id.get(stage.checks) if stage.checks else None
-        if target is None or not self._is_planner(target):
-            click.echo(f'[resume] skipping {stage.id} (already complete)')
+        if target is not None and self._is_planner(target):
+            return True
+        node = self._nodes.get(stage.id)
+        if target is not None and not check_finished(
+            node.output if node is not None else None
+        ):
+            self._completed.discard(stage.id)
+            self._nodes.pop(stage.id, None)
+            click.echo(
+                f'[resume] {stage.id}: recorded as complete, but its reply '
+                f'never ended with {_CHECK_COMPLETE}, so it never finished. '
+                f'Running it again.'
+            )
+            return False
+        click.echo(f'[resume] skipping {stage.id} (already complete)')
+        return True
 
     @staticmethod
     def _stage_kind(stage: pipeline.PipelineStage) -> str:
@@ -7269,11 +7337,13 @@ class PipelineRunner:
             replace=self._resume,
         )
         session = self._create_session(stage.run[0], wt, 'ro', stage.id)
-        out = self._drive(session, self._check_instruction(stage))
+        first = self._drive(session, self._check_instruction(stage))
+        out = self._finish_check(stage.id, session, first)
         self._nodes[stage.id] = NodeResult(
             stage.id, 'check', worktree=wt, session=session, output=out
         )
         self._halt_on_reader_dispute(stage)
+        self._halt_on_unfinished_check(stage, session, out)
         self._record_review(
             stage.id, stage.run[0], self._next_review_round(stage.id),
             _CHECK_VERDICT, session, out,
@@ -7544,19 +7614,81 @@ class PipelineRunner:
             replace=True,
         )
         session = self._create_session(check.run[0], wt, 'ro', check.id)
-        out = self._drive(session, self._plan_check_instruction(check, plan))
+        out = self._finish_check(
+            check.id, session,
+            self._drive(session, self._plan_check_instruction(check, plan)),
+        )
+        claims = parse_disputes(out)
+        if not claims and not check_finished(out):
+            # Counted as a problem: interactive approval reopens with
+            # the human told why, and unattended planning stops.
+            claim = (
+                f'{check.id} did not finish: its reply never ended with '
+                f'{_CHECK_COMPLETE}, so the plan was not fully checked.'
+            )
+            claims = (claim,)
+            out = f'{claim}\n\nIts last reply:\n\n{out}'
+        elif not claims:
+            self._warn_dispute_near_miss(check.id, out)
         self._nodes[check.id] = NodeResult(
             check.id, 'check', worktree=wt, session=session, output=out
         )
-        claims = parse_disputes(out)
-        if not claims:
-            self._warn_dispute_near_miss(check.id, out)
         self._record_review(
             check.id, check.run[0], self._next_review_round(check.id),
             _CHECK_DISPUTED if claims else _CHECK_VERDICT, session, out,
         )
         self._release_completed_session(check, 'check')
         return claims
+
+    def _finish_check(self, check_id: str, session: str, out: str) -> str:
+        """
+        Ask a check once more when it neither disputed nor finished.
+
+        A dispute is never asked again: the claim is the evidence, and
+        it stops the run or reopens approval either way. Only a pass
+        has to be said, so only a reply with neither is sent
+        :data:`_CHECK_FINISH_ASK`, and its answer replaces the reply.
+
+        :param check_id: The check stage's id.
+        :param session: Its session, still alive.
+        :param out: Its reply.
+        :returns: The reply to judge: *out*, or the answer to the ask.
+        """
+        if parse_disputes(out) or check_finished(out):
+            return out
+        click.echo(
+            f'[check] {check_id}: its reply neither raised a dispute nor '
+            f'ended with {_CHECK_COMPLETE}, so it has not finished; '
+            f'asking it once to finish.'
+        )
+        return self._drive(session, _CHECK_FINISH_ASK)
+
+    def _halt_on_unfinished_check(
+        self, stage: pipeline.PipelineStage, session: str, out: str
+    ) -> None:
+        """
+        Stop when a contract check never said it finished.
+
+        Called after the dispute halt, so a reply reaching here has no
+        dispute. Without :data:`_CHECK_COMPLETE` it is not a pass, so
+        nothing after the check may run on it. The stage is not
+        recorded as complete, so ``--resume`` runs it again.
+
+        :param stage: The contract check stage.
+        :param session: Its session, still alive, to capture.
+        :param out: Its reply after the one ask to finish.
+        :raises PipelineRunError: When the reply never said it finished.
+        """
+        if check_finished(out):
+            return
+        self._capture_turn(session, 'did not finish its check')
+        raise PipelineRunError(
+            f'{stage.id}: the contract check did not finish. Neither its '
+            f'reply nor the one it was asked for ends with a line reading '
+            f'{_CHECK_COMPLETE}, so it cannot count as a pass, and nothing '
+            f'after {stage.id} has run. Its reply is in the run directory '
+            f'under turns/. A --resume runs {stage.id} again.'
+        )
 
     def _report_plan_disputes(
         self,

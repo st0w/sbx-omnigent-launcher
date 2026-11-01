@@ -485,6 +485,17 @@ the stage completes. The halting rules are in its turn as well as in the
 template, so a checker given its own `prompt` still stops on a contract that
 can't be met.
 
+**A pass has to be said.** A check's report must end with a line reading exactly
+`CHECK COMPLETE`, and the check is told not to end its turn while a command it
+started is still running. A reply with no `DISPUTED:` line and no
+`CHECK COMPLETE` is unfinished, not a pass. Seen live: a checker ended its turn
+to wait for a background `cargo test`, and that waiting message was recorded as
+a pass. An unfinished check is asked once to finish. If its answer still has
+neither, a contract check stops the run, and `--resume` runs it again. A reply
+with a dispute is never asked again, finished or not, because the claim stops the
+run either way. On `--resume`, a contract check recorded as complete whose reply
+never ended with `CHECK COMPLETE` (one an older launcher let through) runs again.
+
 Loading the pipeline refuses a check that couldn't do its job in time. That's
 one that:
 - names anything other than a tests stage (a writer on the `tdd-writer`
@@ -582,6 +593,12 @@ reports, `NO DISPUTE` or `DISPUTE RAISED`, and never reaches the writers as
 design context. If the plan stage finished in an earlier attempt and the check
 didn't, `--resume` runs the check on the finished plan, and a dispute stops the
 run.
+
+A plan check must also end its report with `CHECK COMPLETE`, as a contract check
+does. One that still hasn't after being asked once counts as a problem
+("did not finish"): approval reopens with that in front of you, or, unattended,
+the run stops. A plan check recorded as complete is never re-run on `--resume`,
+because you accepted that plan.
 
 ## Campaigns — build in sequence, one chunk at a time
 

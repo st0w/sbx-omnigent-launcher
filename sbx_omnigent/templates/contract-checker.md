@@ -59,3 +59,13 @@ Do not judge the design, suggest a better one, or review code style. The plan
 was approved by a human; your question is only whether this contract can be
 satisfied as written. If you find nothing of any kind, say so plainly, and say
 what you ran and read to conclude it.
+
+
+## When you are done
+
+Your reply is read the moment your turn ends. So do not end your turn while a
+command you started is still running, in the background or anywhere else: wait
+for it, or run it in the foreground. End your report with a line reading
+exactly `CHECK COMPLETE`. A reply without that line is treated as unfinished,
+never as a pass: you are asked once to finish it, and after that the check
+counts as not passed.

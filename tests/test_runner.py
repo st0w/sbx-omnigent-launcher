@@ -1377,7 +1377,8 @@ stages:
 
 _CHECKS_TESTS_REPLIES = {
     'plan': 'THE PLAN', 'tests': 't',
-    'check': 'checker-report: the contract holds', 'build': 'b',
+    'check': 'checker-report: the contract holds\nCHECK COMPLETE',
+    'build': 'b',
 }
 
 
@@ -1509,7 +1510,7 @@ class TestAContractCheck(_Base):
     _WITH_FINDINGS = (
         'The contract holds.\n\nFINDINGS:\n'
         '- test_parse_empty already passes on the unmodified tree\n'
-        '- requirement 4 has no test\n'
+        '- requirement 4 has no test\n\nCHECK COMPLETE'
     )
 
     def test_its_report_is_kept_with_the_review_records(self) -> None:
@@ -1589,7 +1590,7 @@ class TestAContractCheck(_Base):
         reply = (
             'The contract holds.\n\nFINDINGS:\n'
             '- test_parse_empty already passes on the unmodified tree\n'
-            '- requirement 4 has no test\n'
+            '- requirement 4 has no test\n\nCHECK COMPLETE'
         )
         with mock.patch('sbx_omnigent.runner.click.echo') as echo:
             result, _sc, _wt = self._go(reply)
@@ -1718,7 +1719,8 @@ stages:
 
 _TWO_CHECKS_REPLIES = {
     'plan': 'THE PLAN', 'tests': 't',
-    'check-a': 'The contract holds.', 'check-b': 'The contract holds.',
+    'check-a': 'The contract holds.\nCHECK COMPLETE',
+    'check-b': 'The contract holds.\nCHECK COMPLETE',
     'build': 'b',
 }
 
@@ -1888,7 +1890,9 @@ class TestThePlanCheckInsideApproval(_Base):
         'DISPUTED: the plan says ports.py limits specs to 64 bytes; '
         'ports.py:9 limits them to 64 characters.'
     )
-    _CLEAN = 'CLAIMS CHECKED:\n- parse_ports takes (spec: str)'
+    _CLEAN = (
+        'CLAIMS CHECKED:\n- parse_ports takes (spec: str)\n\nCHECK COMPLETE'
+    )
 
     def _go(self, checks, *, phrases=(), interactive=True, wt=None):
         sc = FakeSC({
@@ -2142,7 +2146,9 @@ class TestPlanChecksSideBySideAndPerModule(_Base):
     own plan inside that module's approval (#49)."""
 
     _DISPUTE = 'DISPUTED: ports.py:9 limits specs to characters, not bytes.'
-    _CLEAN = 'CLAIMS CHECKED:\n- parse_ports takes (spec: str)'
+    _CLEAN = (
+        'CLAIMS CHECKED:\n- parse_ports takes (spec: str)\n\nCHECK COMPLETE'
+    )
 
     _TWO = _PLAN_CHECKED.replace(
         '  pchk: {template: plan-checker, model: claude-sonnet-5}\n',
@@ -2222,11 +2228,266 @@ class TestAContractCheckInACampaign(_Base):
     def test_each_module_checks_its_own_tests(self) -> None:
         _r, _sc, wt = self._run(
             _CAMPAIGN_CHECKED,
-            {'plan': _plan_with_subtasks('m0', 'm1')},
+            {
+                'plan': _plan_with_subtasks('m0', 'm1'),
+                'm0-check': 'holds\nCHECK COMPLETE',
+                'm1-check': 'holds\nCHECK COMPLETE',
+            },
             interactive_plan=False,
         )
         self.assertEqual(wt.node_from['m0-check'], 'm0-tests')
         self.assertEqual(wt.node_from['m1-check'], 'm1-tests')
+
+
+class TestACheckMustSayItFinished(_Base):
+    """
+    A check passes only when its reply says it finished.
+
+    Live, a Claude contract checker ended its turn to wait for a
+    background `cargo test`, saying it would finish the report after.
+    The runner read that as the report, found no `DISPUTED:` line and
+    recorded a pass. The other checker found three real problems.
+    """
+
+    _UNFINISHED = (
+        'All reading is done; the test run is still going in the '
+        'background. I will finish the report when it completes.'
+    )
+    _DONE = 'The contract holds.\n\nCHECK COMPLETE'
+
+    @staticmethod
+    def _wt() -> FakeWT:
+        wt = FakeWT()
+        wt.diff_files['tests'] = ['tests/test_ports.py']
+        return wt
+
+    def _go(self, check_replies):
+        sc = FakeSC({**_CHECKS_TESTS_REPLIES, 'check': list(check_replies)})
+        return self._run(_CHECKS_TESTS, {}, sc=sc, wt=self._wt())
+
+    # ── the line ──────────────────────────────────────────────────
+
+    def test_the_line_on_its_own_is_finished(self) -> None:
+        for text in (
+            'report\nCHECK COMPLETE',
+            'report\n**CHECK COMPLETE**\n',
+            'report\n`CHECK COMPLETE`',
+            'CHECK COMPLETE\n\nafterword',
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(R.check_finished(text))
+
+    def test_the_words_mid_sentence_are_not(self) -> None:
+        for text in (
+            None,
+            '',
+            self._UNFINISHED,
+            'I will end with CHECK COMPLETE once the tests finish.',
+            'CHECK COMPLETE soon',
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(R.check_finished(text))
+
+    # ── what the checker is told ──────────────────────────────────
+
+    def test_the_contract_check_is_told_to_finish(self) -> None:
+        _r, sc, _wt = self._go([self._DONE])
+        message = sc.message_for_label('check')
+        self.assertIn('CHECK COMPLETE', message)
+        self.assertIn('still running', message)
+
+    def test_the_plan_check_is_told_to_finish(self) -> None:
+        cfg = self._cfg(_PLAN_CHECKED)
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        message = runner._plan_check_instruction(
+            runner._stage_by_id['plan-check'], 'THE PLAN'
+        )
+        self.assertIn('CHECK COMPLETE', message)
+        self.assertIn('still running', message)
+
+    # ── a contract check ──────────────────────────────────────────
+
+    def test_a_finished_pass_is_not_asked_again(self) -> None:
+        result, sc, _wt = self._go([self._DONE])
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(len(_messages_for(sc, 'check')), 1)
+
+    def test_an_unfinished_reply_is_asked_once_to_finish(self) -> None:
+        result, sc, _wt = self._go([self._UNFINISHED, self._DONE])
+        self.assertEqual(result.status, 'completed')
+        asks = _messages_for(sc, 'check')
+        self.assertEqual(len(asks), 2)
+        self.assertIn('CHECK COMPLETE', asks[1])
+        self.assertIn('complete report', asks[1])
+
+    def test_its_finished_report_is_the_one_recorded(self) -> None:
+        _r, _sc, wt = self._go([self._UNFINISHED, self._DONE])
+        record = wt.artifacts['reviews/check-checker-r1.md']
+        self.assertIn('The contract holds.', record)
+
+    def test_never_finishing_stops_the_run(self) -> None:
+        sc = FakeSC({
+            **_CHECKS_TESTS_REPLIES,
+            'check': [self._UNFINISHED, self._UNFINISHED],
+        })
+        with self.assertRaises(R.PipelineRunError) as caught:
+            self._run(_CHECKS_TESTS, {}, sc=sc, wt=self._wt())
+        message = str(caught.exception)
+        self.assertTrue(message.startswith('check: '), message)
+        self.assertIn('did not finish', message)
+        self.assertIn('CHECK COMPLETE', message)
+        self.assertEqual(sc.message_for_label('build'), '')
+
+    def test_a_dispute_is_never_asked_again(self) -> None:
+        # The claim is the evidence; it stops the run either way.
+        sc = FakeSC({
+            **_CHECKS_TESTS_REPLIES,
+            'check': ['DISPUTED: tests/x.py:3 cannot compile.'],
+        })
+        with self.assertRaises(R.PipelineRunError) as caught:
+            self._run(_CHECKS_TESTS, {}, sc=sc, wt=self._wt())
+        self.assertIn('cannot compile', str(caught.exception))
+        self.assertEqual(len(_messages_for(sc, 'check')), 1)
+
+    def test_a_dispute_in_the_second_reply_stops_the_run(self) -> None:
+        sc = FakeSC({
+            **_CHECKS_TESTS_REPLIES,
+            'check': [self._UNFINISHED, 'DISPUTED: tests/x.py:3 fails.'],
+        })
+        with self.assertRaises(R.PipelineRunError) as caught:
+            self._run(_CHECKS_TESTS, {}, sc=sc, wt=self._wt())
+        self.assertIn('tests/x.py:3 fails', str(caught.exception))
+
+    # ── a plan check ──────────────────────────────────────────────
+
+    def _plan(self, checks, *, phrases=(), interactive=True):
+        sc = FakeSC({
+            'plan': 'THE PLAN', 'plan-check': list(checks),
+            'tests': 't', 'build': 'b',
+        })
+        sc.approval_phrases = list(phrases)
+        return self._run(
+            _PLAN_CHECKED, {}, sc=sc, interactive_plan=interactive,
+        )
+
+    def test_an_unfinished_plan_check_is_asked_once_to_finish(self) -> None:
+        result, sc, _wt = self._plan([self._UNFINISHED, self._DONE])
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(len(_messages_for(sc, 'plan-check')), 2)
+        self.assertEqual(len(sc.approvals), 1)
+
+    def test_a_plan_check_that_never_finishes_is_a_problem(self) -> None:
+        result, sc, _wt = self._plan(
+            [self._UNFINISHED, self._UNFINISHED],
+            phrases=['APPROVED', 'APPROVED AS IS'],
+        )
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(len(sc.approvals), 2)
+        headlines = [h for lb, h in sc.headlines if lb == 'plan']
+        self.assertIn('Plan check found 1 problem(s)', ' '.join(headlines))
+        to_planner = '\n'.join(_messages_for(sc, 'plan'))
+        self.assertIn('did not finish', to_planner)
+
+    def test_unattended_a_plan_check_that_never_finishes_stops(self) -> None:
+        sc = FakeSC({
+            'plan': 'THE PLAN',
+            'plan-check': [self._UNFINISHED, self._UNFINISHED],
+            'tests': 't', 'build': 'b',
+        })
+        with self.assertRaises(R.PipelineRunError) as caught:
+            self._run(_PLAN_CHECKED, {}, sc=sc, interactive_plan=False)
+        self.assertIn('did not finish', str(caught.exception))
+        self.assertEqual(sc.message_for_label('tests'), '')
+
+
+class TestAResumeRerunsACheckThatNeverFinished(_Base):
+    """
+    A contract check recorded complete without finishing runs again.
+
+    An older launcher recorded a pass for a check whose turn ended
+    while it waited on a background test run (k8s-clusters-1, k1). On
+    resume that check must not stand as a pass. A plan check is left
+    alone: a human accepted that plan.
+    """
+
+    @staticmethod
+    def _state(completed, outputs, kinds):
+        return {
+            'version': R.RUN_STATE_VERSION,
+            'completed': list(completed),
+            'completed_chunks': [],
+            'plan_of_record': 'THE PLAN',
+            'published': [],
+            'last_branch_node': None,
+            'subtasks': [],
+            'nodes': {
+                n: {
+                    'kind': kinds.get(n, 'reader'),
+                    'branch': f'pl/r1/{n}' if kinds.get(n) == 'writer'
+                    else None,
+                    'worktree': f'/wt/r1/nodes/{n}',
+                    'output': outputs[n],
+                    'verdict': None,
+                    'selected': None,
+                }
+                for n in completed
+            },
+        }
+
+    def _resume(self, text, state, replies):
+        cfg = self._cfg(text)
+        wt = FakeWT()
+        wt.diff_files['tests'] = ['tests/test_ports.py']
+        wt.state_to_load = state
+        sc = FakeSC(dict(replies))
+        runner = R.PipelineRunner(
+            cfg, session_client=sc, worktree_manager=wt, run_id='r1',
+            agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0, resume=True,
+        )
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            result = runner.run()
+        printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
+        return result, sc, printed
+
+    def _contract(self, check_output):
+        state = self._state(
+            ['plan', 'tests', 'check'],
+            {'plan': 'THE PLAN', 'tests': 't', 'check': check_output},
+            {'tests': 'writer', 'check': 'check'},
+        )
+        return self._resume(
+            _CHECKS_TESTS, state, dict(_CHECKS_TESTS_REPLIES)
+        )
+
+    def test_an_unfinished_contract_check_runs_again(self) -> None:
+        result, sc, printed = self._contract(
+            'I will finish the report when the tests complete.'
+        )
+        self.assertEqual(result.status, 'completed')
+        self.assertNotEqual(sc.message_for_label('check'), '')
+        self.assertIn('[resume] check:', printed)
+        self.assertIn('CHECK COMPLETE', printed)
+
+    def test_a_finished_contract_check_is_still_skipped(self) -> None:
+        _r, sc, printed = self._contract('holds\nCHECK COMPLETE')
+        self.assertEqual(sc.message_for_label('check'), '')
+        self.assertIn('skipping check', printed)
+
+    def test_a_completed_plan_check_is_left_alone(self) -> None:
+        state = self._state(
+            ['plan', 'plan-check'],
+            {'plan': 'THE PLAN', 'plan-check': 'no completion line here'},
+            {'plan-check': 'check'},
+        )
+        _r, sc, _p = self._resume(
+            _PLAN_CHECKED, state, {'tests': 't', 'build': 'b'}
+        )
+        self.assertEqual(sc.message_for_label('plan-check'), '')
 
 
 class TestADisputeHaltsInsteadOfReDriving(_Base):
