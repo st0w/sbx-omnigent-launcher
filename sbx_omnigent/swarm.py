@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -139,14 +138,6 @@ class SwarmHandle:
 #: credential to install, not merely whether to install agy's.
 MOUNT_CREDENTIAL_KINDS: tuple[str, ...] = ('agy', 'codex')
 
-#: A reviewer's build-cache seed token: it names the seeded scratch
-#: ``<mounted path>.seed-<token>`` beside the tree under review (#37).
-#: Lowercase hex only, because Omnigent lowercases the fragment that
-#: carries it and forbids ``:`` and ``#`` there, so it can never be a
-#: path.
-MOUNT_SEED_RE = re.compile(r'[0-9a-f]{12}')
-
-
 def credential_kind_for(harness: str | None) -> str | None:
     """
     Which credential a harness needs seeded into its VM.
@@ -167,7 +158,6 @@ def mount_sentinel(
     mode: str,
     *,
     credential: str | None = None,
-    seed: str | None = None,
 ) -> str:
     """
     Build the launcher mount sentinel for a worktree + mode.
@@ -179,15 +169,10 @@ def mount_sentinel(
         THIS VM — one of :data:`MOUNT_CREDENTIAL_KINDS`, or ``None`` to
         seed nothing (Claude). Tagged as a ``-<kind>`` suffix on the
         mode fragment, which round-trips Omnigent's branch validation.
-    :param seed: For a reviewer only: the token of its seeded build
-        scratch (:data:`MOUNT_SEED_RE`), tagged as ``.<token>`` after
-        the mode. ``None`` gives the reviewer an empty scratch.
     :returns: e.g. ``"git@sbxmount:/srv/worktrees/a#ro"``, or
-        ``"…#rw-agy"`` / ``"…#rw-codex"`` when *credential* is set, or
-        ``"…#ro.<token>"`` when *seed* is.
-    :raises ValueError: If *mode* is not ``"rw"``/``"ro"``,
-        *credential* is not a known kind, or *seed* is malformed or
-        given for a writer.
+        ``"…#rw-agy"`` / ``"…#rw-codex"`` when *credential* is set.
+    :raises ValueError: If *mode* is not ``"rw"``/``"ro"``, or
+        *credential* is not a known kind.
     """
     if mode not in ('rw', 'ro'):
         raise ValueError(f"mount mode must be 'rw' or 'ro', got {mode!r}")
@@ -196,12 +181,6 @@ def mount_sentinel(
             f'unknown mount credential {credential!r}; expected one of '
             f'{", ".join(MOUNT_CREDENTIAL_KINDS)} or None'
         )
-    if seed is not None:
-        if mode != 'ro':
-            raise ValueError('only a reviewer (mode ro) takes a build seed')
-        if not MOUNT_SEED_RE.fullmatch(seed):
-            raise ValueError(f'malformed build seed token {seed!r}')
-        mode = f'{mode}.{seed}'
     fragment = f'{mode}-{credential}' if credential else mode
     return f'git@sbxmount:{worktree_path}#{fragment}'
 

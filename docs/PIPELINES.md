@@ -893,9 +893,9 @@ List as many directories as the project builds into:
 build_cache: [target, node_modules, dist]  # Rust plus a web frontend
 ```
 
-- **It covers the whole pipeline.** Every writer and reader clone is seeded,
-  and every reviewer builds in a seeded scratch. There is no per-stage
-  setting. The verify gate is never seeded (see below).
+- **It covers every writer and reader.** Each of their clones is seeded.
+  Reviewers and the verify gate are not: they build on their VM's own disk
+  (see below). There is no per-stage setting.
 - **Entries are top-level directory names.** Paths, `.` and `..` are refused
   when the pipeline loads, so a nested directory such as `web/node_modules`
   can't be cached. An entry the project never produces is skipped, and a
@@ -950,15 +950,15 @@ to complete refills it straight away.
 - **When it is used.** Writer and reader clones are seeded from it. It is
   refreshed after every stage that completes, so the next node starts from the
   newest build. A stage that failed never refreshes it.
-- **Reviewers build in a seeded scratch.** A reviewer's tree is mounted
-  read-only, so it can't build in place. Each reviewer gets its own directory
-  beside the round's snapshot, cloned from the cache, as its read-write mount,
-  and its instruction names it (for Cargo, `CARGO_TARGET_DIR=<scratch>/target`).
-  The scratch is cut fresh on every launch, so a retried reviewer never
-  inherits what the last guest wrote. Nothing a reviewer builds is read back
-  into the cache, and the scratches are removed with the round's snapshot. If
-  a scratch can't be seeded, that reviewer builds from clean on its VM's own
-  disk, as it did before there was a cache.
+- **Reviewers build on their VM's own disk.** A reviewer's tree is mounted
+  read-only, and its instruction says to put build output on the VM's disk
+  (for Cargo, `CARGO_TARGET_DIR=/tmp/review-target`). Reviewers used to build
+  in a scratch on the host, cloned from the cache. Live, those builds ran
+  through the sbx mount several times slower, and twice read zero-length or
+  truncated objects from the clone ("memory map must have a non-zero
+  length"). The reviewers then blocked on builds that couldn't run, and the
+  writer was sent to fix code that had nothing wrong with it. A reviewer now
+  builds from clean, on a fast disk, and nothing it builds reaches the host.
 - **The verify gate is never seeded.** The cache is filled from writers' build
   directories, and a writer controls its own: build output planted there with
   timestamps newer than the sources would be reused by the build tool instead
@@ -976,13 +976,12 @@ to complete refills it straight away.
   never fails a run.
 - **Disk.** Seeding costs nothing only on a filesystem that clones copy-on-write:
   APFS on macOS, or btrfs and XFS with reflink on Linux. Anywhere else, each
-  node and each reviewer's scratch gets a full copy of the cache, and the disk
-  preflight counts the reviewers of the largest review stage as host worktrees.
+  writer and reader clone gets a full copy of the cache.
 
 Measured on a Rust workspace: a seeded rebuild took 16 s where a from-clean one
-took 121 s. Building on the reviewer's mount rather than the VM's own disk costs
-little: on a small crate, a from-clean build took 14.5 s on the mount against
-12.4 s on the VM's disk, and a seeded one took 0.3 s.
+took 121 s. Where a build runs matters more on a large workspace: on a live
+one, `cargo clippy --workspace --all-targets` took about a minute on a
+sandbox's own disk, and over 50 minutes through the mount.
 
 ## Verification — the one check the orchestrator makes itself
 

@@ -130,12 +130,6 @@ class FakeWT:
         self.replaced: dict[str, bool] = {}
         #: node -> whether its clone was seeded from the build cache.
         self.seeded: dict[str, bool] = {}
-        #: (mounted path, token) per reviewer scratch cut.
-        self.seeds: list[tuple[str, str]] = []
-        #: Snapshot labels whose reviewer scratches were disposed.
-        self.disposed_seeds: list[str] = []
-        #: Make seed_review_scratch fail.
-        self.seed_raises = False
         #: Whether create_run was asked to reuse an existing hub.
         self.reused = False
         #: Make commit_node raise (salvage must not mask the failure).
@@ -203,16 +197,6 @@ class FakeWT:
     def create_review_snapshot(self, run_id, node_id, *, label) -> str:
         self.snapshots.append((node_id, label))
         return f'/wt/{run_id}/nodes/{label}'
-
-    def seed_review_scratch(self, run_id, mounted_path, token) -> str:
-        if self.seed_raises:
-            raise click.ClickException('cannot clone the cache')
-        self.seeds.append((mounted_path, token))
-        return f'{mounted_path}.seed-{token}'
-
-    def dispose_review_seeds(self, run_id, snapshot_label) -> int:
-        self.disposed_seeds.append(snapshot_label)
-        return 1
 
     def node_ahead_of_hub(self, run_id, node_id) -> bool:
         return node_id in self.ahead
@@ -14974,85 +14958,44 @@ def _with_cache(text: str, names: str = '[target]') -> str:
     )
 
 
-class TestAReviewerBuildsFromTheWarmCache(_Base):
-    """Reviewers compiled the workspace from clean every turn (#37).
-    With a build cache, each gets a seeded scratch beside the round's
-    snapshot as its read-write primary, and is told to build there."""
+class TestAReviewerBuildsOnItsOwnDisk(_Base):
+    """
+    A reviewer builds on its VM's own disk, with or without a cache.
 
-    _SCRATCH = '/wt/r1/nodes/review-r1.seed-'
+    Reviewers used to get a scratch on the host cloned from the warm
+    build cache. Live, builds there ran through the sbx mount several
+    times slower and twice read zero-length or truncated objects from
+    the cloned cache, so reviewers blocked on builds that could not run
+    (#144). The gate already builds on its own disk.
+    """
 
-    def _reviewer(self, text: str, **kw):
-        sc = kw.pop('sc', None) or FakeSC(dict(_LINEAR_REPLIES))
-        wt = kw.pop('wt', None) or FakeWT()
-        result, _sc, _wt = self._run(text, {}, sc=sc, wt=wt, **kw)
+    def _reviewer(self, text: str):
+        sc = FakeSC(dict(_LINEAR_REPLIES))
+        result, _sc, _wt = self._run(text, {}, sc=sc)
         created = next(
             c for c in sc.creates if sc.label_of(c['sid']) == 'review-sec'
         )
-        return result, sc, wt, created['workspace'], sc.message_for_label(
+        return result, created['workspace'], sc.message_for_label(
             'review-sec'
         )
 
-    def test_the_sentinel_carries_the_reviewers_token(self) -> None:
-        _r, _sc, _wt, workspace, _msg = self._reviewer(_with_cache(_LINEAR))
-        token = R._seed_token('review-sec')
-        self.assertTrue(workspace.endswith(f'#ro.{token}'), workspace)
-
-    def test_the_scratch_is_cut_beside_the_snapshot(self) -> None:
-        _r, _sc, wt, _ws, _msg = self._reviewer(_with_cache(_LINEAR))
-        self.assertEqual(
-            wt.seeds, [('/wt/r1/nodes/review-r1', R._seed_token('review-sec'))]
-        )
-
-    def test_the_instruction_names_the_seeded_target(self) -> None:
-        _r, _sc, _wt, _ws, msg = self._reviewer(_with_cache(_LINEAR))
-        scratch = f'{self._SCRATCH}{R._seed_token("review-sec")}'
-        self.assertIn(f'CARGO_TARGET_DIR={scratch}/target', msg)
-        self.assertNotIn('/tmp/review-target', msg)
-
-    def test_other_cache_names_are_listed_without_cargo(self) -> None:
-        _r, _sc, _wt, _ws, msg = self._reviewer(
-            _with_cache(_LINEAR, '[node_modules]')
-        )
-        scratch = f'{self._SCRATCH}{R._seed_token("review-sec")}'
-        self.assertIn(f'{scratch}/node_modules', msg)
-        self.assertNotIn('CARGO_TARGET_DIR', msg)
-
-    def test_the_rounds_scratches_are_disposed(self) -> None:
-        _r, _sc, wt, _ws, _msg = self._reviewer(_with_cache(_LINEAR))
-        self.assertEqual(wt.disposed_seeds, ['review-r1'])
-
-    def test_a_retried_reviewer_is_seeded_afresh(self) -> None:
-        sc = FakeSC(dict(_LINEAR_REPLIES))
-        sc.turn_outcomes['review-sec'] = ['lost']
-        _r, _sc, wt, _ws, _msg = self._reviewer(_with_cache(_LINEAR), sc=sc)
-        self.assertEqual(len(wt.seeds), 2)
-
-    def test_a_seeding_failure_falls_back_to_building_from_clean(self) -> None:
-        wt = FakeWT()
-        wt.seed_raises = True
-        result, _sc, _wt, workspace, msg = self._reviewer(
-            _with_cache(_LINEAR), wt=wt
-        )
+    def test_with_a_cache_the_mount_carries_no_seed(self) -> None:
+        result, workspace, _msg = self._reviewer(_with_cache(_LINEAR))
         self.assertEqual(result.status, 'completed')
         self.assertTrue(workspace.endswith('#ro'), workspace)
-        self.assertIn('/tmp/review-target', msg)
 
-    def test_an_empty_cache_list_keeps_todays_reviewer(self) -> None:
-        _r, _sc, wt, workspace, msg = self._reviewer(
-            _with_cache(_LINEAR, '[]')
-        )
+    def test_with_a_cache_it_is_told_to_build_on_its_own_disk(self) -> None:
+        _r, _ws, msg = self._reviewer(_with_cache(_LINEAR))
+        self.assertIn('CARGO_TARGET_DIR=/tmp/review-target', msg)
+        self.assertNotIn('.seed-', msg)
+
+    def test_without_a_cache_nothing_changes(self) -> None:
+        _r, workspace, msg = self._reviewer(_LINEAR)
         self.assertTrue(workspace.endswith('#ro'), workspace)
-        self.assertIn('/tmp/review-target', msg)
-        self.assertEqual(wt.seeds, [])
+        self.assertIn('CARGO_TARGET_DIR=/tmp/review-target', msg)
 
-    def test_no_cache_keeps_todays_reviewer(self) -> None:
-        _r, _sc, wt, workspace, msg = self._reviewer(_LINEAR)
-        self.assertTrue(workspace.endswith('#ro'), workspace)
-        self.assertIn('/tmp/review-target', msg)
-        self.assertEqual(wt.seeds, [])
-
-    def _refactor_review(self, source, scratch):
-        cfg = self._cfg(source)
+    def test_a_refactor_reviewer_is_told_too(self) -> None:
+        cfg = self._cfg(_with_cache(_JUDGE_REFACTOR))
         r = R.PipelineRunner(
             cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
             run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
@@ -15061,14 +15004,9 @@ class TestAReviewerBuildsFromTheWarmCache(_Base):
         r._nodes['refactor'] = R.NodeResult(
             'refactor', 'writer', branch='b/refactor'
         )
-        return r._review_instruction(r._stage_by_id['review-r'], scratch)
-
-    def test_a_refactor_reviewer_is_told_too(self) -> None:
-        source = _with_cache(_JUDGE_REFACTOR)
-        self.assertNotEqual(source, _JUDGE_REFACTOR)
-        msg = self._refactor_review(source, '/s')
+        msg = r._review_instruction(r._stage_by_id['review-r'])
         self.assertIn('You are reviewing a REFACTOR', msg)
-        self.assertIn('CARGO_TARGET_DIR=/s/target', msg)
+        self.assertIn('CARGO_TARGET_DIR=/tmp/review-target', msg)
 
 
 class TestTheCacheIsKeyedByTheRepository(_Base):
@@ -15098,27 +15036,20 @@ class TestTheCacheIsKeyedByTheRepository(_Base):
         )
 
 
-class TestASeededReviewerIsCountedOnDisk(_Base):
-    """A seeded scratch is a full copy of the cache wherever the
-    filesystem cannot clone copy-on-write, so it is a build worktree."""
-
-    def test_seeded_reviewers_count_only_with_a_cache(self) -> None:
-        self.assertEqual(R.review_seed_worktrees(self._cfg(_LINEAR)), 0)
-        self.assertEqual(
-            R.review_seed_worktrees(self._cfg(_with_cache(_LINEAR))), 1
-        )
+class TestReviewersAddNoHostWorktrees(_Base):
+    """A reviewer builds on its VM's disk, so a cache adds no host
+    worktree to the disk preflight."""
 
     def _trees_in_refusal(self, text: str) -> str:
         with self.assertRaises(click.ClickException) as caught:
             R.preflight_disk(self._cfg(text), usage=lambda _p: _Usage(0))
         return caught.exception.format_message()
 
-    def test_the_preflight_adds_them(self) -> None:
+    def test_a_cache_adds_none(self) -> None:
         self.assertIn('1 host worktree(s)', self._trees_in_refusal(_LINEAR))
         self.assertIn(
-            '2 host worktree(s)', self._trees_in_refusal(_with_cache(_LINEAR))
+            '1 host worktree(s)', self._trees_in_refusal(_with_cache(_LINEAR))
         )
-
 
 
 class TestNoBuildCacheFlag(_Base):
