@@ -288,6 +288,26 @@ class TestStartHostDispatch(unittest.TestCase):
         cs.assert_called_once_with('box', ['/scratch', f'{self.real}:ro'])
         self.assertEqual(ws, self.real)
 
+    def test_a_seeded_sentinel_is_refused(self) -> None:
+        # Only a runner from before reviewers built on their own disk
+        # (#144) sends one. Even with its scratch in place, the
+        # reviewer is not booted on a build directory from the host.
+        os.makedirs(f'{self.real}.seed-0123456789ab')
+        with (
+            mock.patch.object(self.launcher, '_create_sandbox') as cs,
+            mock.patch.object(self.launcher, '_launch_host'),
+            mock.patch.object(
+                self.launcher, '_make_scratch', return_value='/scratch'
+            ),
+            mock.patch.object(self.launcher, '_seed_claude_settings'),
+        ):
+            with self.assertRaises(click.ClickException):
+                self._run(
+                    repo_url=_sentinel(self.swarm),
+                    repo_branch='ro.0123456789ab',
+                )
+        cs.assert_not_called()
+
     def test_non_sentinel_repo_url_delegates(self) -> None:
         with (
             mock.patch.object(self.launcher, '_create_sandbox') as cs,
