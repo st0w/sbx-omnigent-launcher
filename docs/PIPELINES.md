@@ -914,7 +914,21 @@ Observed live: an implementer left both crate roots holding the test author's
 success — and collected `VERDICT: APPROVED` from **two independent reviewers**.
 Only the judge caught it, by diffing.
 
-Three things close that gap.
+Four things close that gap.
+
+**A writer has to say it finished (automatic).** Every writer turn, the first
+and every re-drive, must end its reply with a line reading exactly
+`WORK COMPLETE`, and the writer is told not to end its turn while a command it
+started is still running. Its work is committed the moment its turn ends, so a
+reply without that line is unfinished. Seen live: a test writer twice ended its
+turn saying it was waiting for a background compile, and both times the runner
+committed what was there, temporary stubs in production code included. An
+unfinished writer is asked once to finish before anything is committed. If its
+answer still doesn't say it finished, the runner keeps its turn record, commits
+the tree as partial work, and stops the run, rather than send a tree that may be
+mid-change to review. `--resume` runs the stage again from that commit. A reply
+raising `DISPUTED:` needs no finish line, because the dispute stops the run
+either way.
 
 **The no-op guard (automatic).** After a writer commits, the runner compares its
 branch to the tree it was cut from and requires at least one changed file that
