@@ -1397,8 +1397,7 @@ class WorktreeManager:
 
         Always cut fresh, so a retried reviewer never inherits what an
         earlier reviewer VM wrote into its scratch. Never read back
-        into the cache: only completed writer stages and the verify
-        gate refresh it.
+        into the cache: only completed writer stages refresh it.
 
         :param run_id: Pipeline run id.
         :param mounted_path: The tree the reviewer mounts read-only; it

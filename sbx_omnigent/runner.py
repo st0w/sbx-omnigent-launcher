@@ -4239,11 +4239,9 @@ class PipelineRunner:
                 self._evidence[winner] = outcome
                 ran = ', '.join(s.label for s in outcome.steps) or 'gate'
                 click.echo(f'[verify] {winner}: passed ({ran}).')
-                # The gate builds the workspace from clean AND runs the
-                # instrumented coverage pass, so its build directory is
-                # the most complete one this run produces — the best
-                # possible seed for the next chunk.
-                self._refresh_build_cache(f'{winner}-verify')
+                # No cache refresh from the gate: it builds on its
+                # sandbox's own disk (#144), so it leaves no build
+                # output on the host.
                 return
             why = (
                 'timed out'
@@ -4295,7 +4293,9 @@ class PipelineRunner:
         its own: output planted there with timestamps newer than the
         sources is reused by the build tool rather than rebuilt. The
         gate is the one check that must not take an agent's word, so
-        it builds from clean. Its build still refreshes the cache.
+        it builds from clean, in a copy on its sandbox's own disk
+        (:func:`verify.on_own_disk`), so it leaves nothing to refresh
+        the cache with.
 
         :param winner: The node whose branch to verify.
         :param spec: The configured gate.
@@ -8669,8 +8669,7 @@ class PipelineRunner:
         Each reviewer gets its own directory beside the round's
         snapshot, cloned fresh from the cache, as its read-write
         primary. Nothing a reviewer writes there is read back into
-        the cache: the cache is refreshed only from writers and the
-        gate.
+        the cache: the cache is refreshed only from writers.
 
         Best-effort: a reviewer that cannot be seeded reviews exactly
         as it did before there was a cache, building from clean on

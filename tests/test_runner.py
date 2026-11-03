@@ -12837,6 +12837,20 @@ class TestVerifyGate(_Base):
         self.assertTrue(gates)
         self.assertFalse(any(wt.seeded[n] for n in gates))
 
+    def test_the_gate_does_not_refresh_the_cache(self) -> None:
+        # The gate builds on its sandbox's own disk (#144), so it leaves
+        # no build output on the host to refresh the cache from.
+        cached = _VERIFY.replace(
+            'publish: local', 'publish: local\nbuild_cache: [target]'
+        )
+        patch, _calls = self._gate([_outcome(True)])
+        runner, _sc, wt = self._build(cached)
+        with patch:
+            runner.run()
+        refreshed = [p.rsplit('/', 1)[-1] for p in wt.cache_refreshed]
+        self.assertIn('build', refreshed)
+        self.assertFalse(any(n.endswith('-verify') for n in refreshed))
+
     def test_the_writers_clones_still_are(self) -> None:
         patch, _calls = self._gate([_outcome(True)])
         runner, _sc, wt = self._build()

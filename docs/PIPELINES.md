@@ -862,9 +862,8 @@ to complete refills it straight away.
   share them. A mirror whose origin is some other repository is refused, never
   fetched.
 - **When it is used.** Writer and reader clones are seeded from it. It is
-  refreshed after every stage that completes, and after a gate that passes,
-  so the next node starts from the newest build. A stage that failed never
-  refreshes it.
+  refreshed after every stage that completes, so the next node starts from the
+  newest build. A stage that failed never refreshes it.
 - **Reviewers build in a seeded scratch.** A reviewer's tree is mounted
   read-only, so it can't build in place. Each reviewer gets its own directory
   beside the round's snapshot, cloned from the cache, as its read-write mount,
@@ -878,8 +877,10 @@ to complete refills it straight away.
   directories, and a writer controls its own: build output planted there with
   timestamps newer than the sources would be reused by the build tool instead
   of rebuilt. The gate is the one check that doesn't take an agent's word, so
-  its clone starts with no build output and it builds from clean. Its build
-  still refreshes the cache.
+  its clone starts with no build output and it builds from clean. It builds in
+  a copy on its sandbox's own disk (see
+  [Verification](#verification--the-one-check-the-orchestrator-makes-itself)),
+  so it doesn't refresh the cache.
 - **Staleness is the build tool's job.** A cache from another branch or
   toolchain is revalidated by the build tool (Cargo fingerprints every
   artifact), so for honestly built output the worst case is a from-clean
@@ -1237,7 +1238,9 @@ Two things now prevent a repeat:
 dishonesty detectable; this makes correctness *provable*. Before a branch
 publishes, the runner stands up a **fresh, disposable microVM** on a clean clone
 of exactly that branch, runs `verify.setup` followed by `verify.command`, and
-believes only the exit status:
+believes only the exit status. Both run in a copy of the branch on the sandbox's
+own disk, so nothing is built through the mount: a build that writes through
+the mount to the host was several times slower live.
 
 ```yaml
 verify:
