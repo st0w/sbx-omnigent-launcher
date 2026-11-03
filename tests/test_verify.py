@@ -10,7 +10,10 @@ leaked microVM costs disk on every subsequent module. Run:
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
+import tempfile
 import unittest
 
 from sbx_omnigent import verify
@@ -272,6 +275,138 @@ class TestDemonstrationStep(unittest.TestCase):
         )
         self.assertEqual([s.label for s in outcome.steps], ['tests'])
         self.assertEqual(runner.verbs().count('exec'), 1)
+
+
+class TestTheGateBuildsOnItsOwnDisk(unittest.TestCase):
+    """
+    The gate copies the mounted branch onto the sandbox's own disk and
+    runs there (#144).
+
+    Live, a build writing through the sandbox's mount to the host was
+    several times slower than the same build on the sandbox's disk: a
+    gate spent over 50 minutes in `cargo clippy` with its CPUs idle,
+    waiting on the mount. The gate never uses the build cache, so the
+    mount gave it nothing.
+
+    These run the real program the gate sends, in /bin/sh, with HOME
+    pointed at a temporary directory standing in for the sandbox's disk.
+    """
+
+    def setUp(self) -> None:
+        self.root = tempfile.mkdtemp(prefix='gate-disk-')
+        self.home = os.path.join(self.root, 'home')
+        os.mkdir(self.home)
+        self.workspace = os.path.join(self.root, 'mounted branch')
+        os.mkdir(self.workspace)
+        with open(
+            os.path.join(self.workspace, 'Cargo.toml'), 'w', encoding='utf-8'
+        ) as fh:
+            fh.write('[workspace]\n')
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _programs(self, script, demo=None, workspace=None):
+        """The program each exec step sends, as the sandbox runs it."""
+        runner = FakeRunner()
+        run_verification(
+            name='verify-x', workspace=workspace or self.workspace,
+            script=script, demo_script=demo, image='img', run=runner,
+        )
+        return [c[-1] for c in runner.calls if c[1] == 'exec']
+
+    def _sh(self, program):
+        return subprocess.run(
+            ['/bin/sh', '-c', program],
+            cwd=self.workspace,
+            env={'HOME': self.home, 'PATH': os.environ['PATH']},
+            capture_output=True, text=True, timeout=60,
+        )
+
+    def _copy(self) -> str:
+        return os.path.join(self.home, verify.LOCAL_WORKDIR)
+
+    def test_the_command_runs_in_a_copy_on_the_sandbox_disk(self) -> None:
+        (program,) = self._programs(build_script(None, 'pwd > where'))
+        proc = self._sh(program)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        where = os.path.join(self._copy(), 'where')
+        with open(where, encoding='utf-8') as fh:
+            ran_in = fh.read().strip()
+        self.assertEqual(
+            os.path.realpath(ran_in), os.path.realpath(self._copy())
+        )
+
+    def test_the_branch_is_copied_there(self) -> None:
+        (program,) = self._programs(build_script(None, 'true'))
+        self.assertEqual(self._sh(program).returncode, 0)
+        self.assertTrue(
+            os.path.isfile(os.path.join(self._copy(), 'Cargo.toml'))
+        )
+
+    def test_setup_runs_in_the_copy_too(self) -> None:
+        (program,) = self._programs(
+            build_script('pwd > setup-ran-here', 'true')
+        )
+        self.assertEqual(self._sh(program).returncode, 0)
+        self.assertTrue(
+            os.path.isfile(os.path.join(self._copy(), 'setup-ran-here'))
+        )
+
+    def test_nothing_is_built_in_the_mounted_branch(self) -> None:
+        (program,) = self._programs(build_script(None, 'mkdir target'))
+        self.assertEqual(self._sh(program).returncode, 0)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.workspace, 'target'))
+        )
+        self.assertTrue(os.path.isdir(os.path.join(self._copy(), 'target')))
+
+    def test_the_demo_runs_in_the_same_copy(self) -> None:
+        # The demonstration proves the code the gate just tested runs,
+        # so it uses that build, not a second copy of the branch.
+        tests, demo = self._programs(
+            build_script(None, 'touch built-by-tests'),
+            demo=build_script(None, 'test -f built-by-tests && pwd > where'),
+        )
+        self.assertEqual(self._sh(tests).returncode, 0)
+        proc = self._sh(demo)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # A second copy would land INSIDE the first, under its name.
+        nested = os.path.join(
+            self._copy(), os.path.basename(self.workspace)
+        )
+        self.assertFalse(os.path.exists(nested))
+
+    def test_an_awkward_workspace_path_is_quoted(self) -> None:
+        odd = os.path.join(self.root, "it's a $HOME `dir`")
+        os.mkdir(odd)
+        with open(os.path.join(odd, 'marker'), 'w', encoding='utf-8') as fh:
+            fh.write('x')
+        (program,) = self._programs(build_script(None, 'true'), workspace=odd)
+        proc = self._sh(program)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(self._copy(), 'marker')))
+
+    def test_a_failed_copy_never_reaches_the_command(self) -> None:
+        # It stops before the setup marker, so run_verification reports
+        # it as the gate's own prologue failing, not the branch.
+        missing = os.path.join(self.root, 'no such branch')
+        (program,) = self._programs(
+            build_script(None, 'true'), workspace=missing
+        )
+        proc = self._sh(program)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn(_SETUP_MARKER, proc.stdout + proc.stderr)
+
+    def test_the_recorded_command_is_the_projects_own(self) -> None:
+        # The pull request shows what the project asked to run, not the
+        # gate's copying.
+        runner = FakeRunner([FakeProc(0), FakeProc(0, 'ok')])
+        outcome = run_verification(
+            name='verify-x', workspace=self.workspace, script='make check',
+            image='img', run=runner,
+        )
+        self.assertEqual(outcome.steps[0].command, 'make check')
 
 
 class TestBrokenPrologue(unittest.TestCase):

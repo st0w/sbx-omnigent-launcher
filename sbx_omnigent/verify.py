@@ -25,6 +25,7 @@ coverage report looks like, only what exit 0 means.
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -70,6 +71,14 @@ _MAX_LINE_CHARS = 500
 #: whose OWN setup was broken got reported as the branch failing its
 #: tests, which re-drove a writer three times over code that was fine.
 _SETUP_MARKER = '__omni_verify_setup_ok__'
+
+#: Where each gate step runs: a copy of the mounted branch on the
+#: sandbox's own disk, under ``$HOME`` (#144). A build writing through
+#: the mount to the host was several times slower than the same build
+#: on the sandbox's disk; live, a gate spent over 50 minutes in
+#: ``cargo clippy`` with its CPUs idle. The gate never uses the build
+#: cache, so the mount gave it nothing.
+LOCAL_WORKDIR = 'omni-verify'
 
 #: ANSI/VT escapes a test runner emits when it thinks it has a terminal.
 #: Stripped because this output is embedded in a pull request, where
@@ -329,6 +338,30 @@ def build_script(setup: str | None, command: str) -> str:
     return '\n'.join(parts) + '\n'
 
 
+def on_own_disk(workspace: str, program: str) -> str:
+    """
+    Wrap a gate step so it runs in a copy of *workspace* on the sandbox.
+
+    The first step copies the mounted branch to :data:`LOCAL_WORKDIR`;
+    a later step (the demonstration) finds it there and runs in the
+    same copy, against the build the tests step just made. A failed
+    copy stops before the setup marker, so it is reported as the gate's
+    own prologue failing, never as the branch.
+
+    :param workspace: The branch's path as mounted in the sandbox.
+    :param program: A step program from :func:`build_script`.
+    :returns: The program the sandbox runs.
+    """
+    local = f'"$HOME"/{LOCAL_WORKDIR}'
+    return (
+        'set -e\n'
+        f'if [ ! -d {local} ]; then '
+        f'cp -a {shlex.quote(workspace)} {local}; fi\n'
+        f'cd {local}\n'
+        + program
+    )
+
+
 def _manage(
     run: Callable[..., subprocess.CompletedProcess[str]],
     argv: list[str],
@@ -405,6 +438,9 @@ def run_verification(
     """
     Run *script* in a fresh sandbox on *workspace*, then destroy it.
 
+    Each step runs in a copy of *workspace* on the sandbox's own disk
+    (see :func:`on_own_disk`), so nothing is built through the mount.
+
     The sandbox is a plain shell box: no agy credential seeding, no
     Omnigent host, no publish token — nothing this process holds is
     passed to it. Its only powers are the mounted worktree and the
@@ -460,7 +496,10 @@ def run_verification(
         def _step(label: str, program: str) -> StepOutcome:
             try:
                 proc = run(
-                    ['sbx', 'exec', name, '--', 'sh', '-c', program],
+                    [
+                        'sbx', 'exec', name, '--', 'sh', '-c',
+                        on_own_disk(workspace, program),
+                    ],
                     timeout=timeout_s + _EXEC_MARGIN_S,
                 )
             except subprocess.TimeoutExpired:
@@ -485,9 +524,10 @@ def run_verification(
                 # broken setup script.
                 raise VerifyError(
                     f'the verification sandbox never reached the '
-                    f'{label} command: verify.setup failed (exit '
-                    f'{proc.returncode}) — the prologue the gate '
-                    f'runs, not the branch. Its output:\n'
+                    f'{label} command: its prologue failed (exit '
+                    f'{proc.returncode}) — copying the branch onto the '
+                    f"sandbox's disk, or verify.setup — not the branch. "
+                    f'Its output:\n'
                     + salient_tail(
                         clamp_lines(scrub(combined)), _OUTPUT_TAIL
                     )
