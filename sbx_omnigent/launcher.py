@@ -857,6 +857,7 @@ class SbxLauncher(ExecModelHostLauncher):
             *workspaces,
             '--template',
             self._image,
+            *sbx_cli.pull_args(self._image),
             '--name',
             name,
             '--quiet',

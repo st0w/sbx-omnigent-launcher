@@ -45,7 +45,7 @@ from omnigent.server.managed_hosts import (
     _parse_host_config,
 )
 
-from sbx_omnigent import claude, egress, pipeline
+from sbx_omnigent import claude, egress, image, pipeline
 from sbx_omnigent._compat import load_agy_bridge
 from sbx_omnigent.defaults import (
     DEFAULT_EGRESS_ALLOW,
@@ -72,6 +72,12 @@ _NO_SWARM_AGENTS_ENV = 'OMNI_SBX_NO_SWARM_AGENTS'
 #: Under the user's home so the server can read them for its process
 #: lifetime; replaced in place on each run of a given pipeline.
 _PIPELINE_AGENTS_ROOT = Path.home() / '.sbx-swarm' / 'pipeline-agents'
+
+#: The ``--pipeline`` file's image (``image:``, #38), set before the
+#: server parses its sandbox config so that parse can boot agents from
+#: it: the template name, and the base it is built from.
+_PIPELINE_IMAGE_ENV = 'OMNI_SBX_PIPELINE_IMAGE'
+_PIPELINE_IMAGE_BASE_ENV = 'OMNI_SBX_PIPELINE_IMAGE_BASE'
 
 
 def _as_int(value: object, field: str) -> int | None:
@@ -519,6 +525,50 @@ def _publish_egress_policy(
         ) from exc
 
 
+def _pipeline_agent_image(configured: str) -> str:
+    """
+    The image agents boot: the ``--pipeline`` file's, else the config's.
+
+    A pipeline's ``image:`` is its toolchain, built from a host image;
+    Omnigent's host inside it must match this server, so a base other
+    than ``sandbox.sbx.image`` is pointed out. Advises only.
+
+    :param configured: ``sandbox.sbx.image``, or its default.
+    :returns: The template name every agent sandbox boots.
+    """
+    tag = os.environ.get(_PIPELINE_IMAGE_ENV)
+    if not tag:
+        return configured
+    base = os.environ.get(_PIPELINE_IMAGE_BASE_ENV, '')
+    if base != configured:
+        print(
+            f"[sbx-omnigent] NOTE: the pipeline's image.from ({base}) is "
+            f"not 'sandbox.sbx.image' ({configured}). Agents boot the "
+            f'pipeline image, so their Omnigent host is the one in '
+            f'{base}; it must match this server.',
+            file=sys.stderr,
+        )
+    return tag
+
+
+def _publish_agent_image(worktree_root: str, agent_image: str) -> None:
+    """
+    Publish the image agents boot, for the pipeline runner to check.
+
+    :param worktree_root: ``sbx.worktree_root``.
+    :param agent_image: The image every agent sandbox boots.
+    :raises ValueError: If it cannot be written, which fails startup:
+        a runner that cannot read it refuses to run a pipeline image.
+    """
+    try:
+        image.publish_agent_image(worktree_root, agent_image)
+    except OSError as exc:
+        raise ValueError(
+            f'could not publish the agent image to '
+            f"'sandbox.sbx.worktree_root' ({worktree_root}): {exc}"
+        ) from exc
+
+
 def _build_sbx_config(raw: dict[str, Any]) -> ManagedSandboxConfig:
     """
     Build a :class:`ManagedSandboxConfig` for ``provider: sbx``.
@@ -544,11 +594,12 @@ def _build_sbx_config(raw: dict[str, Any]) -> ManagedSandboxConfig:
     if not isinstance(sbx, dict):
         raise ValueError("server config 'sandbox.sbx' must be a mapping")
 
-    image = sbx.get('image', DEFAULT_HOST_IMAGE)
-    if not isinstance(image, str) or not image.strip():
+    configured_image = sbx.get('image', DEFAULT_HOST_IMAGE)
+    if not isinstance(configured_image, str) or not configured_image.strip():
         raise ValueError(
             "server config 'sandbox.sbx.image' must be a non-empty string"
         )
+    agent_image = _pipeline_agent_image(configured_image)
 
     profile = sbx.get('profile')
     if profile is not None and not isinstance(profile, str):
@@ -597,10 +648,11 @@ def _build_sbx_config(raw: dict[str, Any]) -> ManagedSandboxConfig:
     warn_on_inert_providers(host_config)
     if worktree_root is not None:
         _publish_egress_policy(worktree_root, egress_allow)
+        _publish_agent_image(worktree_root, agent_image)
 
     def factory() -> SbxLauncher:
         return SbxLauncher(
-            image=image,
+            image=agent_image,
             profile=profile,
             cpus=cpus,
             memory=memory,
@@ -849,7 +901,9 @@ def register_pipeline_agents(pipeline_path: str) -> dict[str, str]:
     namespaced bundle dir under :data:`_PIPELINE_AGENTS_ROOT`, and
     appends those dirs to the builtin-agent env so the server registers
     them (deterministic ids) at app creation — the only way a managed,
-    model-pinnable pipeline agent reaches the server.
+    model-pinnable pipeline agent reaches the server. A pipeline with an
+    ``image:`` also names its image for the sandbox config parse, so
+    every agent boots it (#38).
 
     :param pipeline_path: Path to the pipeline file.
     :returns: ``{agent_name: namespaced_spec_name}``.
@@ -862,6 +916,13 @@ def register_pipeline_agents(pipeline_path: str) -> dict[str, str]:
         mapping = pipeline.materialize_agents(config, dest)
     except pipeline.PipelineError as exc:
         raise SystemExit(f'pipeline error: {exc}') from exc
+    tag = pipeline.image_tag(config)
+    if tag is not None and config.image is not None:
+        os.environ[_PIPELINE_IMAGE_ENV] = tag
+        os.environ[_PIPELINE_IMAGE_BASE_ENV] = config.image.base
+    else:
+        os.environ.pop(_PIPELINE_IMAGE_ENV, None)
+        os.environ.pop(_PIPELINE_IMAGE_BASE_ENV, None)
     _append_builtin_agent_dirs(
         sorted(str(dest / spec) for spec in mapping.values())
     )

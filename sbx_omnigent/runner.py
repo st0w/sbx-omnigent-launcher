@@ -58,6 +58,7 @@ from sbx_omnigent import (
     egress,
     guest_log,
     harness_versions,
+    image,
     orphans,
     pane,
     pipeline,
@@ -4322,7 +4323,13 @@ class PipelineRunner:
                 if (demo := spec.rendered_demo())
                 else None
             ),
-            image=spec.image or DEFAULT_HOST_IMAGE,
+            # The pipeline's image when it has one: the gate then runs
+            # on the same toolchain every agent built with (#38).
+            image=(
+                pipeline.image_tag(self._config)
+                or spec.image
+                or DEFAULT_HOST_IMAGE
+            ),
             # The operator's list, not the built-in default: the gate
             # got the default even under `egress_allow: []` (#41).
             egress=(
@@ -11787,17 +11794,74 @@ def read_operator_egress(
     :param worktree_root: The runner's ``--worktree-root``, which must
         be the server's ``sbx.worktree_root``.
     :returns: The operator's allowlist, or ``None`` when the pipeline
-        has neither a ``verify:`` gate to give it to nor ``egress:``
-        hosts to check against it.
+        has no ``verify:`` gate to give it to, no ``egress:`` hosts to
+        check against it, and no ``image:`` to build with it.
     :raises click.ClickException: If the list is missing or unreadable:
         a gate run on a guessed allowlist is what this replaces.
     """
-    if config.verify is None and not config.egress:
+    if config.verify is None and not config.egress and config.image is None:
         return None
     try:
         return egress.read_policy(worktree_root)
     except egress.PolicyError as exc:
         raise click.ClickException(str(exc)) from exc
+
+
+def ensure_pipeline_image(
+    config: pipeline.PipelineConfig,
+    worktree_root: str,
+    egress_allow: tuple[str, ...],
+) -> None:
+    """
+    Make sure the pipeline's image exists before any turn (#38).
+
+    Built once per recipe: the template's name is a fingerprint of the
+    recipe, so an unchanged one is reused and a changed one is a new
+    build. First the server must be booting its agents from that same
+    image; otherwise the agents and the gate would run on different
+    toolchains, and that is refused before anything is built.
+
+    :param config: The parsed pipeline; no ``image:`` does nothing.
+    :param worktree_root: The runner's ``--worktree-root``, where the
+        server published the image its agents boot.
+    :param egress_allow: Hosts the build may reach: the gate's list.
+    :raises click.ClickException: If the server boots another image,
+        or the image cannot be checked for or built.
+    """
+    tag = pipeline.image_tag(config)
+    if tag is None or config.image is None:
+        return
+    try:
+        served = image.read_agent_image(worktree_root)
+    except image.ImageError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if served != tag:
+        raise click.ClickException(
+            f"the server's agents boot {served}, but this pipeline's "
+            f'image is {tag}. The image: block changed after the server '
+            f'started, or the server was not started with this file. '
+            f'Restart the server with --pipeline pointing at this file.'
+        )
+    try:
+        if image.image_built(tag):
+            click.echo(f'[image] using {tag}')
+            return
+        click.echo(
+            f'[image] building {tag} from {config.image.base}: runs '
+            f'image.setup once per recipe (often 10-20 minutes); later '
+            f'runs reuse it.'
+        )
+        image.build_image(
+            tag=tag,
+            spec=config.image,
+            name=image.build_box_name(config.name),
+            egress=egress_allow,
+        )
+    except image.ImageError as exc:
+        raise click.ClickException(
+            f'could not build the pipeline image: {exc}'
+        ) from exc
+    click.echo(f'[image] built {tag}')
 
 
 def preflight_egress(
@@ -11827,15 +11891,19 @@ def preflight_egress(
         f'[egress] checking {n} declared host(s) in a short-lived '
         f"sandbox scoped like this run's VMs..."
     )
-    image = (config.verify.image if config.verify else None) or (
-        DEFAULT_HOST_IMAGE
+    # The pipeline image's base, not the image: it may not be built yet,
+    # and the build itself needs these hosts.
+    image_ref = (
+        (config.image.base if config.image else None)
+        or (config.verify.image if config.verify else None)
+        or DEFAULT_HOST_IMAGE
     )
     try:
         verdicts = egress.check_declared_hosts(
             name=egress.check_box_name(run_id),
             hosts=config.egress,
             allowlist=allowlist,
-            image=image,
+            image=image_ref,
         )
     except egress.EgressCheckError as exc:
         raise click.ClickException(
@@ -12326,6 +12394,13 @@ def main(
         preflight_egress(
             config, operator_egress, run_id=run_id or config.name
         )
+    # After the egress check, whose hosts the build needs; before the
+    # harvester and the run, so a failed build costs no turn.
+    ensure_pipeline_image(
+        config,
+        worktree_root,
+        DEFAULT_EGRESS_ALLOW if operator_egress is None else operator_egress,
+    )
     harvester: subprocess.Popen[bytes] | None = None
     if not skip_agy_check:
         # An agy pipeline needs a live harvester or every agy turn dies

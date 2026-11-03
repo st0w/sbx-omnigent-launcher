@@ -5,6 +5,8 @@ Run: .venv/bin/python -m unittest discover -s tests
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import shutil
 import tempfile
@@ -15,6 +17,7 @@ from unittest import mock
 from omnigent.spec import parse
 
 from sbx_omnigent import entrypoint as E
+from sbx_omnigent import image, pipeline
 
 _PIPE = (
     'name: p\n'
@@ -89,6 +92,91 @@ class TestRegisterPipelineAgents(unittest.TestCase):
         with mock.patch.object(E, '_PIPELINE_AGENTS_ROOT', self.dest):
             with self.assertRaises(SystemExit):
                 E.register_pipeline_agents(str(bad))
+
+
+_IMAGE_BLOCK = (
+    'image:\n'
+    '  from: ghcr.io/omnigent-ai/omnigent-host:v0.20.0\n'
+    '  setup: apt-get install -y jq\n'
+)
+_SERVER_URL = 'http://host.docker.internal:6767'
+
+
+class TestThePipelinesImageReachesItsAgents(unittest.TestCase):
+    """A server started with ``--pipeline`` boots its agents from that
+    pipeline's image, and publishes which image it gave them (#38)."""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix='ep-img-'))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.wt = str(self.root / 'wt')
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        for name in (E._PIPELINE_IMAGE_ENV, E._PIPELINE_IMAGE_BASE_ENV):
+            os.environ.pop(name, None)
+        agents = mock.patch.object(
+            E, '_PIPELINE_AGENTS_ROOT', self.root / 'agents'
+        )
+        agents.start()
+        self.addCleanup(agents.stop)
+
+    def _register(self, text: str) -> pipeline.PipelineConfig:
+        path = self.root / 'pipeline.yaml'
+        path.write_text(text, encoding='utf-8')
+        E.register_pipeline_agents(str(path))
+        return pipeline.load_pipeline(str(path))
+
+    def _agent_image(self, **sbx: object) -> str:
+        deployment = E._build_sbx_config({
+            'server_url': _SERVER_URL,
+            'sbx': {'worktree_root': self.wt, **sbx},
+        })
+        launcher = deployment.launcher_factory()
+        return launcher._image
+
+    def test_agents_boot_the_pipelines_image(self) -> None:
+        cfg = self._register(_PIPE + _IMAGE_BLOCK)
+        self.assertEqual(self._agent_image(), pipeline.image_tag(cfg))
+
+    def test_the_server_publishes_it_for_the_runner(self) -> None:
+        cfg = self._register(_PIPE + _IMAGE_BLOCK)
+        self._agent_image()
+        self.assertEqual(
+            image.read_agent_image(self.wt), pipeline.image_tag(cfg)
+        )
+
+    def test_without_an_image_the_config_decides(self) -> None:
+        self._register(_PIPE)
+        self.assertEqual(
+            self._agent_image(image='example.invalid/host:2'),
+            'example.invalid/host:2',
+        )
+        self.assertEqual(
+            image.read_agent_image(self.wt), 'example.invalid/host:2'
+        )
+
+    def test_a_pipeline_without_one_clears_an_earlier_one(self) -> None:
+        self._register(_PIPE + _IMAGE_BLOCK)
+        self._register(_PIPE)
+        self.assertEqual(self._agent_image(), E.DEFAULT_HOST_IMAGE)
+
+    def test_a_different_base_is_pointed_out(self) -> None:
+        self._register(_PIPE + _IMAGE_BLOCK)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._agent_image(image='ghcr.io/omnigent-ai/omnigent-host:v9')
+        self.assertIn('image.from', err.getvalue())
+        self.assertIn('omnigent-host:v9', err.getvalue())
+
+    def test_a_matching_base_is_quiet(self) -> None:
+        self._register(_PIPE + _IMAGE_BLOCK)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._agent_image(
+                image='ghcr.io/omnigent-ai/omnigent-host:v0.20.0'
+            )
+        self.assertNotIn('image.from', err.getvalue())
 
 
 if __name__ == '__main__':

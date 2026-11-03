@@ -148,6 +148,21 @@ def run(
         raise SbxNotResponding(command, timeout_s) from exc
 
 
+def pull_args(image: str) -> list[str]:
+    """
+    The ``--pull`` flags ``sbx create`` needs to boot *image*.
+
+    A ``localhost/`` template exists only in sbx's local store (see
+    :mod:`sbx_omnigent.image`); sbx's default policy, ``always``, would
+    look for it in a registry and fail. Any other image keeps sbx's
+    default.
+
+    :param image: The template the sandbox boots from.
+    :returns: ``["--pull", "never"]`` for a local template, else ``[]``.
+    """
+    return ['--pull', 'never'] if image.startswith('localhost/') else []
+
+
 def require_responsive(
     *,
     runner: Runner | None = None,

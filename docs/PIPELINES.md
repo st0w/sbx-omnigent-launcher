@@ -75,6 +75,10 @@ prewarm: false             # optional — default true; see "Pre-warm"
 egress: [sh.rustup.rs, static.rust-lang.org]  # optional — hosts setup and the
                            #   gate fetch, checked before any turn (see
                            #   "Declared egress")
+image:                     # optional — the toolchain, built ONCE into a local
+  from: ghcr.io/omnigent-ai/omnigent-host:v0.20.0  #   template that every agent
+  setup: |                 #   VM and the gate boot (see "A prebuilt toolchain
+    apt-get update && apt-get install -y jq  #   image"). SHELL, run as root.
 verify:                    # optional — the mechanical gate run before publish
   coverage_min: 95         #   substituted for {coverage_min} in the command
   setup: |                 #   SHELL (not prose) — prepares the gate's own VM
@@ -85,7 +89,8 @@ verify:                    # optional — the mechanical gate run before publish
     cargo llvm-cov --workspace --fail-under-lines {coverage_min}
   demo: ./scripts/demo.sh  #   optional — its output becomes the PR's proof
   image: ghcr.io/omnigent-ai/omnigent-host:v0.20.0  # optional — pin the gate's VM
-                           #   to the image your agents use (default: `:latest`)
+                           #   to the image your agents use (default: `:latest`;
+                           #   not allowed with `image:`, which the gate boots)
 # task/acceptance/context each accept a *_file variant (task_file:, acceptance_file:,
 # context_file:) that reads the text from a path relative to this yaml — pick ONE
 # of the pair. See "Text from a file" below.
@@ -785,6 +790,78 @@ the turn's budget**, so a stage that asks one clarifying question can exhaust
 turn_timeout: 3600      # seconds; --turn-timeout overrides it
 ```
 
+## A prebuilt toolchain image
+
+**Install the toolchain once, not in every VM.** Without this, each coder,
+reviewer and gate starts from the bare host image and installs the same
+toolchain. Observed on a live Rust campaign: the gate spent 12 min 52 s on setup
+before its command started, and paid it again on every attempt; three cargo
+tools were compiled from source each time; and each agent VM held its own 4 GB
+Rust toolchain.
+
+Declare the toolchain under `image:` and the runner builds it into a local sbx
+template the first time a run needs it. Every agent VM and the gate then boot
+from that template, which takes about a second.
+
+```yaml
+image:
+  from: ghcr.io/omnigent-ai/omnigent-host:v0.20.0  # the host image your server runs
+  setup: |                     # SHELL, run once as root in a throwaway sandbox
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get -o DPkg::Lock::Timeout=600 update
+    apt-get -o DPkg::Lock::Timeout=600 install -y build-essential pkg-config
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain <version>
+    . "$HOME/.cargo/env"
+    cargo install --locked cargo-llvm-cov@<version> cargo-audit@<version>
+  cpus: 4                      # optional — the build sandbox's size
+  memory: 8g                   # optional
+  timeout: 3600                # optional — seconds the setup may run (default 3600)
+```
+
+**What goes where.** `image.setup` is everything that doesn't depend on the
+branch: system packages, compilers, and tools like coverage and audit commands.
+`verify.setup` keeps only what does depend on it, if anything. `setup:` stays
+prose for the agents: tell them the toolchain is already installed. Agents and
+the gate run as root, so what the image installs under `/root` is on their
+path.
+
+**Pin every version.** The image is built once and reused, so `latest` means
+whichever release was current on the day it was built. Pinned versions make
+the image the same on every machine, and make a version change a recipe change.
+
+**How a build happens.** At start-up, after the egress check, the runner names
+the image `localhost/omni-sbx-<pipeline>:<fingerprint>`. The fingerprint is a
+hash of `from` and `setup`. If sbx already has a template by that name, the run
+uses it. If not, the runner creates a sandbox from `from` with nothing mounted,
+gives it the gate's network allowlist, runs `setup` under `set -e`, then stops
+the sandbox and saves it as the template. The sandbox is removed whether or not
+the build succeeds. A failed setup stops the run before any turn, with the end
+of its output. Changing `from` or `setup` names a new image, so the next run
+builds again. `cpus`, `memory` and `timeout` affect only the build, so changing
+them doesn't.
+
+The first build costs the setup's own time plus saving the template: a spike
+saved a 3 GB sandbox in about 2½ minutes. Nothing about the image depends on
+the branch, so a campaign builds it at most once.
+
+**The server must use the same image.** The server boots agents and the runner
+builds the image, and they are separate processes. Start the server with
+`--pipeline` pointing at the same file, and its agents boot the pipeline's image
+(with `--pull never`, since the template exists only on this machine). At
+start-up the server publishes the image its agents boot to
+`.sbx-omnigent-image.json` at the top of `sbx.worktree_root`. The runner
+refuses to start if that file is missing or names another image. That happens
+when `image:` changed after the server started: restart the server.
+
+`from` must carry the Omnigent host your server expects, so it should be the
+image `sandbox.sbx.image` names. The server prints a note at start-up when they
+differ.
+
+**Disk.** Templates live in sbx's local image store, and each recipe change
+adds one. List them with `sbx template ls`. Remove an old one with
+`sbx template rm <name>` once no run uses it.
+
 ## Warm build cache
 
 Every node starts from a fresh clone, so without a cache every node compiles the
@@ -1171,6 +1248,9 @@ setup: |
   Then `cargo test` must run for real before you report any result.
 ```
 
+With a pipeline [`image:`](#a-prebuilt-toolchain-image), the toolchain is
+already installed, so say that instead and keep only the project's own steps.
+
 **Size the gate's sandbox, because nothing else will.** The gate builds its own
 box rather than going through the server, so `sandbox.sbx.cpus` and
 `sandbox.sbx.memory` — which cap every *agent* VM — never reach it. Left unset,
@@ -1188,7 +1268,9 @@ Set `verify.cpus` and `verify.memory` to whatever the agent VMs get.
 **Pin the gate's image too.** `sandbox.sbx.image` doesn't reach the gate either: it
 boots the launcher's default, `ghcr.io/omnigent-ai/omnigent-host:latest`, unless
 `verify.image` names another. Set it to the image your agents run, or the branch is
-verified on a different toolchain from the one it was built and reviewed on.
+verified on a different toolchain from the one it was built and reviewed on. With
+a pipeline [`image:`](#a-prebuilt-toolchain-image), the gate boots that image and
+`verify.image` is refused.
 
 **The gate gets the operator's allowlist.** Its network access is the server's
 `sandbox.sbx.egress_allow`, resolved the same way as for agent VMs (unset is the

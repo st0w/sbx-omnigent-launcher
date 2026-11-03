@@ -27,6 +27,7 @@ here into typed form but EXECUTED by the runner (Stage 3).
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -466,6 +467,7 @@ class PipelineConfig:
     subtasks: tuple[Subtask, ...] = ()
     turn_timeout: float | None = None
     verify: VerifySpec | None = None
+    image: ImageSpec | None = None
     disk: DiskSpec = field(default_factory=DiskSpec)
     source_path: Path | None = field(default=None, compare=False)
 
@@ -1073,11 +1075,13 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
         subtasks=_parse_subtasks_config(root, base_dir),
         turn_timeout=_parse_turn_timeout(root.get('turn_timeout')),
         verify=_parse_verify(root.get('verify')),
+        image=_parse_image(root.get('image')),
         disk=_parse_disk(root.get('disk')),
         source_path=fpath,
     )
     _validate(config)
     _validate_verify_setup(config)
+    _validate_image(config)
     return config
 
 
@@ -1239,6 +1243,134 @@ def _parse_generated(value: object) -> tuple[str, ...]:
             raise PipelineError(f'generated[{i}] must be a non-empty string')
         out.append(pattern)
     return tuple(out)
+
+
+@dataclass(frozen=True)
+class ImageSpec:
+    """
+    The pipeline's toolchain image (``image:``, #38).
+
+    Built once per recipe into a local sbx template, which every agent
+    sandbox and the verify gate then boot from, instead of each one
+    installing the same toolchain at run time.
+
+    :param base: The image the build starts from (``image.from``); it
+        must carry Omnigent's host, so it is the host image the server
+        runs, e.g. ``ghcr.io/omnigent-ai/omnigent-host:v0.20.0``.
+    :param setup: Shell run once, as root, in the build sandbox.
+    :param cpus: CPUs for the build sandbox; ``None`` for sbx's default.
+    :param memory: Memory for the build sandbox, e.g. ``"8g"``.
+    :param timeout_s: How long the setup may run.
+    """
+
+    base: str
+    setup: str
+    cpus: int | None = None
+    memory: str | None = None
+    timeout_s: float = 3600.0
+
+
+#: Bumped when what goes into an image changes for a reason other than
+#: its recipe, so every pipeline's image is rebuilt once.
+_IMAGE_FORMAT = 'omni-sbx-image-v1'
+
+#: The keys an ``image:`` block may have.
+_IMAGE_KEYS = frozenset({'from', 'setup', 'cpus', 'memory', 'timeout'})
+
+
+def image_tag(config: PipelineConfig) -> str | None:
+    """
+    The local template name a pipeline's image is built and booted as.
+
+    Computed from the pipeline file alone, so the server (which gives
+    its agents the image) and the runner (which builds it) agree
+    without talking to each other. The fingerprint covers what the
+    image IS: its base and its setup, not the resources it was built
+    with. ``localhost/`` keeps sbx from reading the name as a Docker Hub
+    repository.
+
+    :param config: The parsed pipeline.
+    :returns: e.g. ``localhost/omni-sbx-discover:0123456789abcdef``, or
+        ``None`` when the pipeline declares no image.
+    """
+    if config.image is None:
+        return None
+    recipe = f'{_IMAGE_FORMAT}\n{config.image.base}\n{config.image.setup}'
+    digest = hashlib.sha256(recipe.encode()).hexdigest()[:16]
+    return f'localhost/omni-sbx-{config.name}:{digest}'
+
+
+def _parse_image(raw: object) -> ImageSpec | None:
+    """
+    Parse the optional ``image:`` block.
+
+    :param raw: The raw field, or ``None`` for no image.
+    :returns: The :class:`ImageSpec`, or ``None``.
+    :raises PipelineError: On a malformed block, a missing ``from`` or
+        ``setup``, an unknown key, or a bad resource.
+    """
+    if raw is None:
+        return None
+    entry = _require_mapping(raw, 'image')
+    unknown = sorted(str(key) for key in entry if key not in _IMAGE_KEYS)
+    if unknown:
+        raise PipelineError(
+            f'image: unknown key(s) {", ".join(repr(k) for k in unknown)}; '
+            f'expected from, setup, cpus, memory, timeout'
+        )
+    base = _opt_str(entry.get('from'), 'image.from')
+    if base is None:
+        raise PipelineError(
+            'image.from is required: the host image the build starts from'
+        )
+    setup = entry.get('setup')
+    if not isinstance(setup, str) or not setup.strip():
+        raise PipelineError(
+            'image.setup is required: the shell that installs the toolchain'
+        )
+    cpus = entry.get('cpus')
+    if cpus is not None and (
+        isinstance(cpus, bool) or not isinstance(cpus, int) or cpus < 1
+    ):
+        raise PipelineError('image.cpus must be a positive integer')
+    memory = entry.get('memory')
+    if memory is not None and (
+        not isinstance(memory, str) or not memory.strip()
+    ):
+        raise PipelineError('image.memory must be a non-empty string')
+    timeout = entry.get('timeout')
+    if timeout is not None and (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or timeout <= 0
+    ):
+        raise PipelineError('image.timeout must be a positive number')
+    return ImageSpec(
+        base=base,
+        setup=setup.strip(),
+        cpus=cpus,
+        memory=memory.strip() if memory else None,
+        timeout_s=float(timeout) if timeout is not None else 3600.0,
+    )
+
+
+def _validate_image(config: PipelineConfig) -> None:
+    """
+    Refuse an ``image:`` beside a ``verify.image``.
+
+    With both, which one the gate boots would be a guess.
+
+    :param config: The assembled config.
+    :raises PipelineError: When both are set.
+    """
+    if config.image is not None and config.verify is not None and (
+        config.verify.image is not None
+    ):
+        raise PipelineError(
+            'verify.image and image: are both set. With image:, the gate '
+            'boots the pipeline image like every agent; remove '
+            'verify.image.'
+        )
 
 
 @dataclass(frozen=True)

@@ -15283,5 +15283,183 @@ class TestDeclaredEgressIsCheckedBeforeTheRun(_Base):
         check.assert_not_called()
 
 
+_IMAGE_BLOCK = """\
+image:
+  from: ghcr.io/omnigent-ai/omnigent-host:v0.20.0
+  setup: apt-get install -y jq
+"""
+_WITH_IMAGE = _LINEAR + _IMAGE_BLOCK
+
+
+class TestThePipelineImageIsReadyBeforeTheRun(_Base):
+    """The runner builds the pipeline's image once per recipe, before
+    any turn, and refuses a server whose agents would boot another
+    (#38)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.wt = str(self.root / 'w')
+
+    def _ensure(self, text: str = _WITH_IMAGE, *, built: bool = True,
+                build_error: Exception | None = None,
+                egress_allow: tuple[str, ...] = ('pypi.org',)):
+        cfg = self._cfg(text)
+        out = io.StringIO()
+        with mock.patch.object(
+            R.image, 'image_built', return_value=built
+        ) as is_built, mock.patch.object(
+            R.image, 'build_image', side_effect=build_error
+        ) as build, contextlib.redirect_stdout(out):
+            R.ensure_pipeline_image(cfg, self.wt, egress_allow)
+        return cfg, is_built, build, out.getvalue()
+
+    def _serve(self, cfg_text: str = _WITH_IMAGE) -> str:
+        tag = pipeline.image_tag(self._cfg(cfg_text))
+        assert tag is not None
+        R.image.publish_agent_image(self.wt, tag)
+        return tag
+
+    def test_a_pipeline_without_one_does_nothing(self) -> None:
+        _cfg, is_built, build, _out = self._ensure(_LINEAR)
+        is_built.assert_not_called()
+        build.assert_not_called()
+
+    def test_a_built_image_is_reused(self) -> None:
+        tag = self._serve()
+        _cfg, _is_built, build, out = self._ensure()
+        build.assert_not_called()
+        self.assertIn(f'[image] using {tag}', out)
+
+    def test_a_missing_image_is_built_with_the_gates_egress(self) -> None:
+        tag = self._serve()
+        cfg, _is_built, build, out = self._ensure(built=False)
+        kwargs = build.call_args.kwargs
+        self.assertEqual(kwargs['tag'], tag)
+        self.assertEqual(kwargs['spec'], cfg.image)
+        self.assertEqual(kwargs['egress'], ('pypi.org',))
+        self.assertTrue(kwargs['name'].startswith('image-build-'))
+        self.assertIn('[image] building', out)
+        self.assertIn('once per recipe', out)
+
+    def test_a_failed_build_stops_the_run(self) -> None:
+        self._serve()
+        with self.assertRaises(click.ClickException) as caught:
+            self._ensure(
+                built=False,
+                build_error=R.image.ImageError('image.setup failed (exit 2)'),
+            )
+        self.assertIn('image.setup failed', caught.exception.format_message())
+
+    def test_a_server_with_another_image_is_refused(self) -> None:
+        R.image.publish_agent_image(self.wt, 'ghcr.io/x/host:v1')
+        with self.assertRaises(click.ClickException) as caught:
+            self._ensure()
+        message = caught.exception.format_message()
+        self.assertIn('ghcr.io/x/host:v1', message)
+        self.assertIn('--pipeline', message)
+
+    def test_a_server_that_published_nothing_is_refused(self) -> None:
+        with self.assertRaises(click.ClickException) as caught:
+            self._ensure()
+        self.assertIn('Restart the server', caught.exception.format_message())
+
+    def test_the_refusal_comes_before_any_build(self) -> None:
+        R.image.publish_agent_image(self.wt, 'ghcr.io/x/host:v1')
+        with mock.patch.object(R.image, 'build_image') as build, \
+                mock.patch.object(R.image, 'image_built') as is_built:
+            with self.assertRaises(click.ClickException):
+                R.ensure_pipeline_image(
+                    self._cfg(_WITH_IMAGE), self.wt, ()
+                )
+        is_built.assert_not_called()
+        build.assert_not_called()
+
+    def test_an_image_alone_reads_the_operators_list(self) -> None:
+        egress.publish_policy(self.wt, ('pypi.org',))
+        self.assertEqual(
+            R.read_operator_egress(self._cfg(_WITH_IMAGE), self.wt),
+            ('pypi.org',),
+        )
+
+    def _main(self, *, built: bool, build_error: Exception | None = None):
+        egress.publish_policy(self.wt, ('pypi.org',))
+        self._serve()
+        cfg_path = self.root / 'pipeline.yaml'
+        cfg_path.write_text(_WITH_IMAGE, encoding='utf-8')
+        with mock.patch.object(R, 'preflight_sbx'), \
+                mock.patch.object(R, 'preflight_disk'), \
+                mock.patch.object(R, 'preflight_codex_auth'), \
+                mock.patch.object(R, 'preflight_codex_login'), \
+                mock.patch.object(
+                    R.image, 'image_built', return_value=built
+                ), \
+                mock.patch.object(
+                    R.image, 'build_image', side_effect=build_error
+                ) as build, \
+                mock.patch.object(R, '_drive') as drive:
+            res = CliRunner().invoke(R.main, [
+                '-c', str(cfg_path),
+                '--canonical-root', str(self.root / 'c'),
+                '--worktree-root', self.wt,
+                '--skip-agy-check',
+            ])
+        return res, build, drive
+
+    def test_main_builds_before_the_run(self) -> None:
+        res, build, drive = self._main(built=False)
+        self.assertEqual(res.exit_code, 0, res.output)
+        build.assert_called_once()
+        drive.assert_called_once()
+
+    def test_main_stops_when_the_build_fails(self) -> None:
+        res, _build, drive = self._main(
+            built=False, build_error=R.image.ImageError('setup failed')
+        )
+        self.assertEqual(res.exit_code, 1)
+        self.assertIn('setup failed', res.output)
+        drive.assert_not_called()
+
+
+class TestTheGateBootsThePipelineImage(_Base):
+    """With ``image:``, the gate boots the same image every agent did
+    (#38), and the egress check boots its base."""
+
+    _build = TestVerifyGate._build
+    _gate = TestVerifyGate._gate
+
+    def test_the_gate_boots_the_pipelines_image(self) -> None:
+        text = _VERIFY + _IMAGE_BLOCK
+        runner, _sc, _wt = self._build(text)
+        patch, calls = self._gate([_outcome(True)])
+        with patch:
+            runner.run()
+        self.assertEqual(
+            calls[0]['image'], pipeline.image_tag(self._cfg(text))
+        )
+
+    def test_without_one_the_gate_boots_the_host_image(self) -> None:
+        runner, _sc, _wt = self._build(_VERIFY)
+        patch, calls = self._gate([_outcome(True)])
+        with patch:
+            runner.run()
+        self.assertEqual(calls[0]['image'], R.DEFAULT_HOST_IMAGE)
+
+    def test_the_egress_check_boots_the_images_base(self) -> None:
+        text = _DECLARES + _IMAGE_BLOCK
+        seen: dict[str, str] = {}
+
+        def check(*, name, hosts, allowlist, image, runner=None):
+            seen['image'] = image
+            return tuple(egress.HostVerdict(h, True, '') for h in hosts)
+
+        with mock.patch.object(
+            egress, 'check_declared_hosts', side_effect=check
+        ), contextlib.redirect_stdout(io.StringIO()):
+            R.preflight_egress(self._cfg(text), (), run_id='r1')
+        self.assertEqual(
+            seen['image'], 'ghcr.io/omnigent-ai/omnigent-host:v0.20.0'
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
