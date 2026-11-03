@@ -8983,6 +8983,133 @@ stages:
 """
 
 
+class _CutRecordingWT(FakeWT):
+    """A FakeWT that keeps every cut, not just each node's last."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cuts: list[tuple[str, str | None]] = []
+
+    def create_node_worktree(self, run_id, node_id, **kwargs) -> str:
+        self.cuts.append((node_id, kwargs.get('from_node')))
+        return super().create_node_worktree(run_id, node_id, **kwargs)
+
+
+_PER_MODULE_CHECKED = _PER_MODULE.replace(
+    '  plan: {template: planner, model: claude-sonnet-5}\n',
+    '  plan: {template: planner, model: claude-sonnet-5}\n'
+    '  pchk: {template: plan-checker, model: claude-sonnet-5}\n',
+).replace(
+    '  - {id: plan, run: plan}\n',
+    '  - {id: plan, run: plan}\n'
+    '  - {id: plan-check, run: pchk, checks: plan, needs: [plan]}\n',
+)
+
+
+class TestAPlanCheckReadsItsPlansTree(_Base):
+    """
+    A plan check reads the tree its plan was written against.
+
+    Live (k8s-clusters-1, module k2): the module's planner worked on
+    the campaign tip, k1's winner, but its plan check was cut from the
+    base branch. It reported the k1 work missing and checked every
+    claim about k1's code against code without it. ``APPROVED`` then
+    re-checked on a clone cut the same way, so the false disputes came
+    back.
+    """
+
+    _DISPUTE = 'DISPUTED: ports.py:9 limits specs to characters, not bytes.'
+    _CLEAN = (
+        'CLAIMS CHECKED:\n- parse_ports takes (spec: str)\n\nCHECK COMPLETE'
+    )
+
+    def _modules(self, m1_checks) -> _CutRecordingWT:
+        wt = _CutRecordingWT()
+        sc = FakeSC({
+            'm0-plan': 'D0', 'm1-plan': 'D1',
+            'm0-plan-check': self._CLEAN, 'm1-plan-check': list(m1_checks),
+        })
+        result, _sc, _wt = self._run(_PER_MODULE_CHECKED, {}, sc=sc, wt=wt)
+        self.assertEqual(result.status, 'completed')
+        return wt
+
+    def test_the_first_modules_check_reads_base_like_its_planner(
+        self,
+    ) -> None:
+        wt = self._modules([self._CLEAN])
+        self.assertIsNone(wt.node_from['m0-plan'])
+        self.assertIsNone(wt.node_from['m0-plan-check'])
+
+    def test_a_later_modules_check_reads_the_campaign_tip(self) -> None:
+        wt = self._modules([self._CLEAN])
+        self.assertEqual(wt.node_from['m1-plan'], 'campaign')
+        self.assertEqual(wt.node_from['m1-plan-check'], 'campaign')
+
+    def test_a_re_check_after_a_dispute_reads_it_too(self) -> None:
+        wt = self._modules([self._DISPUTE, self._CLEAN])
+        cuts = [seed for node, seed in wt.cuts if node == 'm1-plan-check']
+        self.assertEqual(cuts, ['campaign', 'campaign'])
+
+    def test_a_resumed_check_of_a_finished_plan_reads_it_too(self) -> None:
+        # Module m0 is done and m1's plan finished in an earlier
+        # attempt; only m1's check is left to run.
+        cfg = self._cfg(_PER_MODULE_CHECKED)
+        wt = _CutRecordingWT()
+        reader = {'kind': 'reader', 'branch': None, 'verdict': None,
+                  'selected': None}
+        wt.state_to_load = {
+            'version': R.RUN_STATE_VERSION,
+            'completed': [
+                'm0-plan', 'm0-plan-check', 'm0-tests', 'm0-build',
+                'm1-plan',
+            ],
+            'completed_chunks': ['m0'],
+            'plan_of_record': None,
+            'published': [],
+            'last_branch_node': 'm0-build',
+            'subtasks': [],
+            'nodes': {
+                'm0-plan': {**reader, 'worktree': '/wt/r1/nodes/m0-plan',
+                            'output': 'D0'},
+                'm0-tests': {**reader, 'kind': 'writer',
+                             'branch': 'pl/r1/m0-tests',
+                             'worktree': '/wt/r1/nodes/m0-tests',
+                             'output': 't'},
+                'm0-build': {**reader, 'kind': 'writer',
+                             'branch': 'pl/r1/m0-build',
+                             'worktree': '/wt/r1/nodes/m0-build',
+                             'output': 'b'},
+                'm1-plan': {**reader, 'worktree': '/wt/r1/nodes/m1-plan',
+                            'output': 'D1'},
+            },
+        }
+        sc = FakeSC({'m1-plan-check': self._CLEAN})
+        runner = R.PipelineRunner(
+            cfg, session_client=sc, worktree_manager=wt, run_id='r1',
+            agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0, resume=True,
+        )
+        with mock.patch('sbx_omnigent.runner.click.echo'):
+            runner.run()
+        self.assertIn('D1', sc.message_for_label('m1-plan-check'))
+        self.assertEqual(
+            [seed for node, seed in wt.cuts if node == 'm1-plan-check'],
+            ['campaign'],
+        )
+
+    def test_a_contract_check_still_reads_its_writer(self) -> None:
+        _r, _sc, wt = self._run(
+            _CAMPAIGN_CHECKED,
+            {
+                'plan': _plan_with_subtasks('m0', 'm1'),
+                'm0-check': 'holds\nCHECK COMPLETE',
+                'm1-check': 'holds\nCHECK COMPLETE',
+            },
+            interactive_plan=False,
+        )
+        self.assertEqual(wt.node_from['m1-check'], 'm1-tests')
+
+
 class TestCampaign(_Base):
     """Sequential per-chunk build loop (≥2 proposed subtasks)."""
 

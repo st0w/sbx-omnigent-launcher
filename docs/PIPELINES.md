@@ -562,8 +562,8 @@ stages:
 ```
 
 Its agent (the `plan-checker` template) gets the consolidated plan, the brief
-and the acceptance contract, on a read-only copy of the repository as it stands.
-For every claim about existing code it runs a command and reports the claim, the
+and the acceptance contract, on a read-only copy of the tree the plan was
+written against: the same commit its planner started from. For every claim about existing code it runs a command and reports the claim, the
 command and its output. It also reads the plan's sections against each other.
 Whether the design is right isn't its call.
 
@@ -593,7 +593,9 @@ check stage in `needs`, because it has run before the plan stage completes.
 Several plan checks in one `parallel:` block run side by side, as with
 [two contract checkers](#two-checkers-from-different-providers), and any one's
 dispute reopens approval. In a per-module campaign each module's plan is
-checked in that module's approval. Each round is recorded beside the reviewers'
+checked in that module's approval, on the campaign tip that module's planner
+designed against (see [Threading](#campaigns--build-in-sequence-one-chunk-at-a-time)).
+Each round is recorded beside the reviewers'
 reports, `NO DISPUTE` or `DISPUTE RAISED`, and never reaches the writers as
 design context. If the plan stage finished in an earlier attempt and the check
 didn't, `--resume` runs the check on the finished plan, and a dispute stops the
@@ -638,6 +640,13 @@ node(s) seed `from:` the campaign tip (the prior chunk's winner), so module N is
 built against modules 0…N-1. A chunk's winner (the judge's selection, else its
 last writer) is aliased onto the thread and published. Node ids are namespaced
 per chunk (`pl/<run>/<chunk>-tests`, …) so branches never collide.
+
+A plan check reads the same tree as the planner it checks, in every module: the
+base branch for chunk 0 and the campaign tip after it. That holds for a re-check
+after a dispute, and for a `--resume` that runs only the check. Before this, a
+later module's check was cut from the base branch, so it reported the earlier
+modules' work missing and checked the plan's claims about that work against code
+without it. A contract check reads the tests branch it checks.
 
 ### What a module's planner knows about the others
 
