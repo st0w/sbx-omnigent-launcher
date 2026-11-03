@@ -80,7 +80,6 @@ from sbx_omnigent.swarm_session import (
 )
 from sbx_omnigent.worktrees import (
     WorktreeManager,
-    _repo_key,
     github_slug,
     pr_number,
 )
@@ -809,6 +808,26 @@ _DISPOSABLE_VM = (
     'channel that reaches a human.'
 )
 
+#: Where a writer builds, and how much room it has (#144).
+#:
+#: Its worktree is a mount from the host. Live, builds through it ran
+#: many times slower than on the VM's own disk (the gate's clippy took
+#: over 50 minutes through the mount, about one on its own disk), and
+#: one read back a truncated object. Both coders moved their builds
+#: off the mount on their own, and one filled its fixed 20 GB disk,
+#: partly with a local coverage build the gate recomputes anyway.
+_WRITER_BUILD = (
+    "Build OUTSIDE your worktree, on this VM's own disk: for Cargo, "
+    '`export CARGO_TARGET_DIR=$HOME/build-target` in every shell before '
+    'any cargo command; other toolchains have an equivalent. Your '
+    'worktree is mounted from the host, and building through it is '
+    'many times slower. Edit and commit in the worktree as usual. This '
+    "VM's disk is a fixed 20 GB, shared with the toolchain, so do NOT "
+    'run a coverage build: the verify gate measures coverage in its own '
+    'sandbox, and a local coverage build costs gigabytes for a number '
+    'it recomputes.'
+)
+
 #: Most nodes of ONE stage driven at the same time.
 #:
 #: Independent nodes of a stage — the competing writers of a
@@ -818,9 +837,7 @@ _DISPOSABLE_VM = (
 #:
 #: The old reason for serializing was memory, and it did not survive
 #: measurement: guests touched 0.9-1.3 GB each during a Rust build
-#: against a 6 GB cap, on a 16 GB host. The warm build cache shortens
-#: the peak further — a seeded workspace rebuild is 16s where a
-#: from-clean one is 121s.
+#: against a 6 GB cap, on a 16 GB host.
 #:
 #: Kept as a cap rather than removed: a pipeline may declare more
 #: parallel nodes than a host can hold, and the failure mode there is
@@ -4189,9 +4206,6 @@ class PipelineRunner:
                 self._evidence[winner] = outcome
                 ran = ', '.join(s.label for s in outcome.steps) or 'gate'
                 click.echo(f'[verify] {winner}: passed ({ran}).')
-                # No cache refresh from the gate: it builds on its
-                # sandbox's own disk (#144), so it leaves no build
-                # output on the host.
                 return
             why = (
                 'timed out'
@@ -4238,14 +4252,9 @@ class PipelineRunner:
         committed state that actually ships, and inherits none of the
         multi-gigabyte build output the writer left behind.
 
-        It is not seeded from the warm build cache either. The cache is
-        filled from writers' build directories, and a writer controls
-        its own: output planted there with timestamps newer than the
-        sources is reused by the build tool rather than rebuilt. The
-        gate is the one check that must not take an agent's word, so
-        it builds from clean, in a copy on its sandbox's own disk
-        (:func:`verify.on_own_disk`), so it leaves nothing to refresh
-        the cache with.
+        The gate is the one check that must not take an agent's word,
+        so it builds from clean, in a copy on its sandbox's own disk
+        (:func:`verify.on_own_disk`).
 
         :param winner: The node whose branch to verify.
         :param spec: The configured gate.
@@ -4254,7 +4263,6 @@ class PipelineRunner:
         node_id = f'{winner}-verify'
         workspace = self._wt.create_node_worktree(
             self._run_id, node_id, from_node=winner, replace=True,
-            seed_cache=False,
         )
         click.echo(
             f'[verify] {winner}: running the gate in a disposable '
@@ -6452,31 +6460,6 @@ class PipelineRunner:
         with contextlib.suppress(click.ClickException):
             self._wt.dispose_node_worktrees(self._run_id, prewarmed)
 
-    def _refresh_build_cache(self, node_id: str) -> None:
-        """
-        Update the warm build cache from a node that just finished.
-
-        Best-effort and quiet unless something was actually cached:
-        the cache is an optimization, and a run must never fail — or
-        get noisier — because one did not take.
-
-        :param node_id: The node whose worktree to refresh from.
-        """
-        if not self._config.build_cache:
-            return
-        # No existence check here: refresh_build_cache already skips
-        # every entry it cannot find, so a second guard would only make
-        # this untestable without touching the real filesystem.
-        names = self._wt.refresh_build_cache(
-            self._wt.node_worktree_path(self._run_id, node_id)
-        )
-        if names:
-            click.echo(
-                f'[cache] {node_id}: refreshed the warm build cache '
-                f'({", ".join(names)}) — the next node starts from it '
-                f'instead of compiling from clean.'
-            )
-
     def _parallel(
         self, label: str, nodes: list[tuple[str, Callable[[], None]]]
     ) -> None:
@@ -6733,11 +6716,6 @@ class PipelineRunner:
             # BEFORE the session release, so the sample sees the
             # worktree while the node is still whole. Off unless asked.
             self._sample_disk(f'stage-complete:{stage.id}')
-            # Hand this node's build directory to the ones that follow.
-            # Only a COMPLETED stage refreshes it, so a node that died
-            # mid-build cannot leave a torn cache behind. A node with
-            # nothing built (a reader, a :ro reviewer) is a no-op.
-            self._refresh_build_cache(stage.id)
             self._release_completed_session(stage, kind)
         # Checkpoint AS the run advances: a crash then costs only the
         # node that failed, not the approved plan behind it.
@@ -8237,7 +8215,7 @@ class PipelineRunner:
             'name exactly what is needed and why, and leave that test '
             'out. Stopping to ask is correct here; implementing is not.'
             f'\n\n{_FROZEN_TESTS_CONTRACT}'
-            f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}'
+            f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}\n\n{_WRITER_BUILD}'
         )
 
     def _is_guarded(self, path: str) -> bool:
@@ -10396,7 +10374,7 @@ class PipelineRunner:
         # feature" — same role-framing reason as the test writer.
         if self._is_refactor(stage):
             return self._refactor_instruction(stage)
-        instr = self._task_block()
+        instr = f'{self._task_block()}\n\n{_WRITER_BUILD}'
         ctx = self._reader_context(stage)
         if ctx:
             instr += f'\n\n{ctx}'
@@ -10436,7 +10414,7 @@ class PipelineRunner:
             )
         instr += (
             f'\n\n{_FROZEN_TESTS_CONTRACT}'
-            f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}'
+            f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}\n\n{_WRITER_BUILD}'
             + self._setup_block()
         )
         ctx = self._reader_context(stage)
@@ -10508,7 +10486,7 @@ class PipelineRunner:
                 f'{self._config.acceptance}'
             )
         instr += (
-            f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}'
+            f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}\n\n{_WRITER_BUILD}'
             + self._setup_block()
         )
         ctx = self._reader_context(stage)
@@ -10927,6 +10905,7 @@ class PipelineRunner:
             f'then stop.\n\n{findings}\n\n{self._defer_block()}'
             f'{_FIX_NO_WEAKENING}\n\n'
             f'{_FIX_MUST_VERIFY}\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}'
+            f'\n\n{_WRITER_BUILD}'
             + self._setup_block()
         )
 
@@ -12153,13 +12132,6 @@ def preflight_agy(
     'instead when the swap secret is stale (use when a harvester '
     'already runs elsewhere).',
 )
-@click.option(
-    '--no-build-cache',
-    is_flag=True,
-    help="Ignore the pipeline's build_cache for this run: every VM "
-    'builds from clean, and the cache on disk is neither read nor '
-    'written.',
-)
 @click.option('--keep', is_flag=True, help='Leave VMs + worktrees.')
 @click.option(
     '--no-interactive-plan',
@@ -12202,7 +12174,6 @@ def main(
     turn_timeout: float | None,
     skip_disk_check: bool,
     no_auto_harvest: bool,
-    no_build_cache: bool,
     keep: bool,
     no_interactive_plan: bool,
     no_auto_approve: bool,
@@ -12211,14 +12182,6 @@ def main(
 ) -> None:
     """Fire a pipeline.yaml; provision-only when it has no task."""
     config = pipeline.load_pipeline(config_path)
-    if no_build_cache and config.build_cache:
-        # Here, before anything reads it, so the disk preflight, the
-        # reviewers and the worktree manager all see it off.
-        config = replace(config, build_cache=())
-        click.echo(
-            '[build-cache] off for this run (--no-build-cache): every '
-            'VM builds from clean.'
-        )
 
     def publish_token_provider() -> str | None:
         return resolve_publish_token(
@@ -12322,18 +12285,16 @@ def _worktree_manager(
     The host-side git manager for one run.
 
     :param config: The parsed pipeline.
-    :param canonical_root: Host dir holding the mirrors and the cache.
+    :param canonical_root: Host dir holding the mirrors.
     :param worktree_root: Host dir holding the run's worktrees.
     :param publish_token: The publish identity's token, or a reader.
-    :returns: The manager, its build cache keyed by the repository.
+    :returns: The manager.
     """
     return WorktreeManager(
         canonical_root=canonical_root,
         worktree_root=worktree_root,
         default_branch=config.base_branch or 'main',
         publish_token=publish_token,
-        build_cache=config.build_cache,
-        build_cache_key=_repo_key(config.repo),
     )
 
 

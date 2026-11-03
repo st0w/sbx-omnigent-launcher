@@ -1369,43 +1369,28 @@ class TestEgressConfig(_Base):
                 self.assertIn('egress[0]', str(caught.exception))
 
 
-class TestBuildCacheConfig(_Base):
+class TestTheBuildCacheIsRetired(_Base):
     """
-    ``build_cache`` names directories carried between nodes as a warm
-    build cache.
+    ``build_cache`` is refused, so a pipeline that still sets it says so
+    instead of silently building differently (#144).
     """
 
-    def test_absent_means_off(self) -> None:
-        self.assertEqual(self._load(_FULL).build_cache, ())
+    def test_any_value_is_refused(self) -> None:
+        for value in ('[target]', '[]', '[target, node_modules]'):
+            with self.subTest(value=value):
+                with self.assertRaises(P.PipelineError) as caught:
+                    self._load(_FULL + f'build_cache: {value}\n')
+                message = str(caught.exception)
+                self.assertIn('build_cache', message)
+                self.assertIn('Delete the line', message)
 
-    def test_an_empty_list_means_off(self) -> None:
-        # Documented as the explicit way to turn the cache off.
-        cfg = self._load(_FULL + 'build_cache: []\n')
-        self.assertEqual(cfg.build_cache, ())
+    def test_the_refusal_says_why(self) -> None:
+        with self.assertRaises(P.PipelineError) as caught:
+            self._load(_FULL + 'build_cache: [target]\n')
+        self.assertIn("VM's own disk", str(caught.exception))
 
-    def test_names_are_parsed(self) -> None:
-        cfg = self._load(_FULL + 'build_cache: [target]\n')
-        self.assertEqual(cfg.build_cache, ('target',))
-
-    def test_several_names_keep_their_order(self) -> None:
-        cfg = self._load(
-            _FULL + 'build_cache: [target, node_modules, dist]\n'
-        )
-        self.assertEqual(cfg.build_cache, ('target', 'node_modules', 'dist'))
-
-    def test_a_traversal_is_rejected(self) -> None:
-        # These names are joined onto a worktree path AND onto the
-        # canonical root, and a pipeline file is shareable content — so
-        # anything that could address a directory outside them is
-        # refused at load, not at use.
-        for bad in ('../../etc', 'a/b', '..', '.', '/abs', 'x\\y'):
-            with self.subTest(bad=bad):
-                with self.assertRaises(P.PipelineError):
-                    self._load(_FULL + f'build_cache: ["{bad}"]\n')
-
-    def test_a_scalar_is_rejected(self) -> None:
-        with self.assertRaises(P.PipelineError):
-            self._load(_FULL + 'build_cache: target\n')
+    def test_without_it_the_pipeline_loads(self) -> None:
+        self.assertEqual(self._load(_FULL).name, 'mixed-models')
 
 
 class TestTemplates(unittest.TestCase):

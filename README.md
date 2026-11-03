@@ -327,7 +327,7 @@ Editing an agent's prompt/harness/skills needs a **server restart** (agents
 register at startup); model/effort/task/DAG edits are picked up by the runner with
 no restart. Key runner flags: `--keep` (leave VMs up), `--run-id`,
 `--publish-repo`, `--publish-token-file` / `--publish-token-command`,
-`--no-interactive-plan`, `--no-auto-harvest`, `--no-build-cache`, `--resume`,
+`--no-interactive-plan`, `--no-auto-harvest`, `--resume`,
 `--turn-timeout`, `--server`. Full flag table and the provision-only mode (omit
 `task:`) are in [`docs/PIPELINES.md`](./docs/PIPELINES.md).
 
@@ -456,21 +456,15 @@ provision a fresh sandbox with a generated name each time, so a `--sandbox`
 For a **remote** server (not `host.docker.internal`), allow that hostname and
 port instead, e.g. `sbx policy allow network omnigent.example.com:443`.
 
-### Build cache: on, off, or from clean
+### Where builds happen
 
-By default every VM builds the project from clean. For a project with slow
-builds (Rust, say), `build_cache:` in `pipeline.yaml` hands build output from
-node to node:
-
-```yaml
-build_cache: [target, node_modules, dist]  # e.g. Rust plus a web frontend
-```
-
-Leave it out, or set `build_cache: []`, and every VM builds from clean; pass
-`--no-build-cache` to the runner to do the same for one run. To keep it on but
-start over once, delete its entry under `<canonical-root>/_buildcache/` (named
-`<repo>-<hash>`) between runs. The verify gate always builds from clean either
-way. Details in [`docs/PIPELINES.md`](./docs/PIPELINES.md#warm-build-cache).
+Every stage builds on its sandbox's own disk: writers outside their worktree,
+reviewers outside their read-only mount, and the verify gate in a copy of the
+branch. Building through the host mount was many times slower and read back
+truncated objects. Each sandbox's disk is a fixed 20 GB, shared with the
+toolchain. `build_cache:` is retired: a pipeline that sets it is refused, so
+delete the line. Details in
+[`docs/PIPELINES.md`](./docs/PIPELINES.md#where-builds-happen).
 
 ### Antigravity (agy) egress
 
@@ -980,7 +974,7 @@ A run occupies the host **twice over**, and the estimate counts both terms:
 | Term | How many | Default each |
 | --- | --- | --- |
 | microVMs | one per node that is still re-drivable, plus one for the verification gate, plus the *largest single* review stage's reviewers. A reviewer is freed once its round votes; a reader, a judge, and any writer no gate can loop back to are freed when their stage completes. Under `--keep` nothing is freed and they all sum | 3.5 GB |
-| host worktrees | one per **writer** — the only nodes that build into their clone. A reader's or judge's tree is ~100 KB (a node clone is local, so its objects are hardlinked), and so is a review round's source-only snapshot. With `build_cache:` set, each reviewer of the largest review stage also counts: it builds in a scratch seeded from the cache, a full copy wherever the filesystem can't clone copy-on-write | 4.0 GB |
+| host worktrees | one per **writer** — the only nodes that build into their clone. A reader's or judge's tree is ~100 KB (a node clone is local, so its objects are hardlinked), and so is a review round's source-only snapshot. | 4.0 GB |
 | headroom | for the host itself | 5 GB |
 
 Counting only the VMs is what let a run start on ~23 GB and exhaust the disk two

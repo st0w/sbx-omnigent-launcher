@@ -458,7 +458,6 @@ class PipelineConfig:
     #: What a ``tests_only`` stage may change. Empty means the built-in
     #: default set; see ``runner._TEST_PATH_GLOBS``.
     test_paths: tuple[str, ...] = ()
-    build_cache: tuple[str, ...] = ()
     #: Boot writer VMs while the interactive planner waits on a human.
     prewarm: bool = True
     #: Hosts the pipeline's setup and gate fetch, checked against the
@@ -1053,6 +1052,7 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
             _parse_stage(s, index=i) for i, s in enumerate(stages_raw)
         )
 
+    _refuse_build_cache(root)
     name = _opt_str(root.get('name'), 'name') or _sanitize(fpath.stem)
     config = PipelineConfig(
         name=_sanitize(name),
@@ -1069,7 +1069,6 @@ def load_pipeline(path: str | Path) -> PipelineConfig:
         generated=_parse_generated(root.get('generated')),
         guarded=_parse_globs(root.get('guarded'), 'guarded'),
         test_paths=_parse_globs(root.get('test_paths'), 'test_paths'),
-        build_cache=_parse_cache_dirs(root.get('build_cache')),
         prewarm=_parse_prewarm(root.get('prewarm')),
         egress=_parse_egress(root.get('egress')),
         subtasks=_parse_subtasks_config(root, base_dir),
@@ -1105,42 +1104,26 @@ def _parse_plan_artifact(value: object) -> str | None:
     return path
 
 
-def _parse_cache_dirs(value: object) -> tuple[str, ...]:
+def _refuse_build_cache(root: dict[str, object]) -> None:
     """
-    Validate the optional ``build_cache`` directory-name list.
+    Refuse the retired ``build_cache`` key, whatever its value (#144).
 
-    These names are joined onto a worktree path and onto the canonical
-    root, so they are validated as BARE directory names — no
-    separators, no ``.``/``..``, nothing absolute. A traversal here
-    would let a pipeline file address any directory on the host, and a
-    pipeline file is shareable content.
+    It carried build output between nodes through the host mount. Live,
+    builds there ran many times slower than on a VM's own disk and read
+    back truncated objects, so every stage now builds on its VM's own
+    disk and nothing uses a cache. Refused rather than ignored, so a
+    file that sets it doesn't read as if it still did something.
 
-    :param value: The raw field, or ``None`` when unset.
-    :returns: The directory names, or ``()`` when unset (cache off).
-    :raises PipelineError: If it is not a list of bare directory names.
+    :param root: The pipeline's top-level mapping.
+    :raises PipelineError: If ``build_cache`` is present.
     """
-    if value is None:
-        return ()
-    if not isinstance(value, list):
+    if 'build_cache' in root:
         raise PipelineError(
-            'build_cache must be a list of directory names, e.g. '
-            "['target']"
+            'build_cache is no longer supported: every stage builds on '
+            "its VM's own disk, where builds are many times faster than "
+            'through the host mount, so nothing uses a cache. Delete the '
+            'line.'
         )
-    out = []
-    for entry in value:
-        if not isinstance(entry, str) or not entry:
-            raise PipelineError(
-                'build_cache entries must be non-empty strings'
-            )
-        # A separator check already covers the absolute case, so this
-        # needs no path library.
-        if '/' in entry or '\\' in entry or entry in ('.', '..'):
-            raise PipelineError(
-                f'build_cache entry {entry!r} must be a bare directory '
-                f'name (no path separators, no . or ..)'
-            )
-        out.append(entry)
-    return tuple(out)
 
 
 def _parse_prewarm(value: object) -> bool:
