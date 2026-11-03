@@ -1078,6 +1078,37 @@ _CHECK_FINISH_ASK = (
     f'`{_CHECK_COMPLETE}`.'
 )
 
+#: The line a writer's reply must end with to count as finished.
+_WORK_COMPLETE = 'WORK COMPLETE'
+
+#: Told to every writer turn, the first and every re-drive. Live
+#: (k8s-clusters-1, k2-tests), a test writer ended its turn twice
+#: saying it was waiting for a background compile, and both times the
+#: runner committed the tree as finished: first with temporary stubs in
+#: production code, then with them still there. Finished must now be
+#: said, as a check's pass must (#143).
+_WRITER_FINISH = (
+    '\n\nWHEN YOU ARE DONE. Your work is committed the moment your turn '
+    'ends, so do not end it while a command you started is still '
+    'running, in the background or anywhere else: wait for it, or run '
+    'it in the foreground. Finish the work, including removing anything '
+    'temporary you added, then end your reply with a line reading '
+    f'exactly `{_WORK_COMPLETE}`. A reply without that line is treated '
+    'as unfinished: you are asked once to finish, and after that the run '
+    'stops. A reply raising a `DISPUTED:` line needs no finish line.'
+)
+
+#: Sent once to a writer whose reply neither disputed nor said it was
+#: finished.
+_WRITER_FINISH_ASK = (
+    f'Your reply did not end with a line reading exactly '
+    f'`{_WORK_COMPLETE}`, so your turn is not finished and nothing has '
+    f'been committed. If a command you started is still running, wait '
+    f'for it to finish. Then finish the work, remove anything temporary '
+    f'you added, and end your reply with a line reading exactly '
+    f'`{_WORK_COMPLETE}`.'
+)
+
 #: What a contract check stops the run for, and what it only records
 #: (#50). The marker is kept mid-sentence for the same reason as in
 #: :data:`_REVIEW_DISPUTE`: a checker quoting this back must not halt.
@@ -1589,23 +1620,44 @@ _DISPUTE_RE = re.compile(
 )
 
 
-def check_finished(text: str | None) -> bool:
+def _has_marker_line(text: str | None, marker: str) -> bool:
     """
-    Whether a check's reply says it finished: a ``CHECK COMPLETE`` line.
+    Whether some line of *text* is exactly *marker*.
 
     The words must be the whole line, give or take markdown emphasis or
     backticks, so a reply that only promises to end with them ("I will
-    end with CHECK COMPLETE once the tests finish") is not finished.
+    end with CHECK COMPLETE once the tests finish") does not count.
 
-    :param text: A check's reply.
+    :param text: A reply.
+    :param marker: The line it must contain.
     :returns: ``True`` when some line is exactly the marker.
     """
     if not text:
         return False
     return any(
-        line.strip().strip('*_`').strip() == _CHECK_COMPLETE
+        line.strip().strip('*_`').strip() == marker
         for line in text.splitlines()
     )
+
+
+def check_finished(text: str | None) -> bool:
+    """
+    Whether a check's reply says it finished: a ``CHECK COMPLETE`` line.
+
+    :param text: A check's reply.
+    :returns: ``True`` when some line is exactly the marker.
+    """
+    return _has_marker_line(text, _CHECK_COMPLETE)
+
+
+def work_finished(text: str | None) -> bool:
+    """
+    Whether a writer's reply says it finished: a ``WORK COMPLETE`` line.
+
+    :param text: A writer's reply.
+    :returns: ``True`` when some line is exactly the marker.
+    """
+    return _has_marker_line(text, _WORK_COMPLETE)
 
 
 def parse_disputes(text: str | None) -> tuple[str, ...]:
@@ -7899,6 +7951,8 @@ class PipelineRunner:
         # reports idle; wait for the worktree to settle so the commit
         # captures the finished tree, not an empty/partial one.
         self._wt.wait_for_node_settle(self._run_id, stage.id)
+        assert node.session is not None
+        self._halt_on_unfinished_writer(stage.id, node.session, node.output)
         self._commit(stage.id, f'{stage.id}: implement')
         # Before the gates below: both answer a problem by re-driving,
         # and a writer cannot re-drive its way out of a contract it
@@ -7940,8 +7994,13 @@ class PipelineRunner:
         while True:
             assert node.session is not None
             try:
-                node.output = self._drive(
-                    node.session, self._writer_instruction(stage)
+                node.output = self._finish_writer(
+                    stage.id,
+                    node.session,
+                    self._drive(
+                        node.session,
+                        self._writer_instruction(stage) + _WRITER_FINISH,
+                    ),
                 )
                 return
             except (PipelineRunError, SwarmSessionError) as exc:
@@ -8369,6 +8428,60 @@ class PipelineRunner:
             'explicitly instead of finishing quietly.'
         )
 
+    def _finish_writer(
+        self, stage_id: str, session: str, out: str
+    ) -> str:
+        """
+        Ask a writer once more when it neither disputed nor finished.
+
+        A dispute is never asked again: it stops the run either way.
+        Only a reply with neither is sent :data:`_WRITER_FINISH_ASK`,
+        and its answer replaces the reply.
+
+        :param stage_id: The writer stage's id.
+        :param session: Its session, still alive.
+        :param out: Its reply.
+        :returns: The reply to act on: *out*, or the answer to the ask.
+        """
+        if parse_disputes(out) or work_finished(out):
+            return out
+        click.echo(
+            f'[writer] {stage_id}: its reply did not end with '
+            f'{_WORK_COMPLETE}, so it has not finished; asking it once to '
+            f'finish before anything is committed.'
+        )
+        return self._drive(session, _WRITER_FINISH_ASK)
+
+    def _halt_on_unfinished_writer(
+        self, stage_id: str, session: str, out: str
+    ) -> None:
+        """
+        Stop when a writer never said it finished, keeping its work.
+
+        A reply reaching here was already asked once to finish. Without
+        :data:`_WORK_COMPLETE` the tree may still be mid-change, and a
+        review or the gate would spend its rounds on it. The tree is
+        committed as partial work and the stage is not recorded as
+        complete, so ``--resume`` runs it again from that commit.
+
+        :param stage_id: The writer stage's id.
+        :param session: Its session, still alive, to capture.
+        :param out: Its reply after the one ask to finish.
+        :raises PipelineRunError: When the reply never said it finished.
+        """
+        if parse_disputes(out) or work_finished(out):
+            return
+        self._capture_turn(session, 'did not finish its turn')
+        self._commit_partial(stage_id)
+        raise PipelineRunError(
+            f'{stage_id}: the writer did not finish its turn. Neither its '
+            f'reply nor the one it was asked for ends with a line reading '
+            f'{_WORK_COMPLETE}, so the tree may still be mid-change. It '
+            f'is committed as partial work, and the run stops rather than '
+            f'review it. Its turn is in the run directory under turns/; '
+            f'--resume runs the stage again from that commit.'
+        )
+
     def _commit_partial(self, node_id: str) -> None:
         """
         Commit whatever a failed writer left behind; never raise.
@@ -8461,12 +8574,16 @@ class PipelineRunner:
         # and a fix turn is exactly when it decides what to assert.
         if instruction is None and self._is_test_writer(stage):
             turn = f'{_FROZEN_TESTS_CONTRACT}\n\n{turn}'
-        node.output = self._drive(node.session, turn)
+        node.output = self._finish_writer(
+            stage_id, node.session,
+            self._drive(node.session, turn + _WRITER_FINISH),
+        )
         # Kept even on success: this session is disposed at publish, and
         # what a writer did with a reviewer's findings is exactly what
         # someone reading the pull request later wants to see.
         self._capture_turn(node.session, 'loop-back fix turn')
         self._wt.wait_for_node_settle(self._run_id, stage_id)
+        self._halt_on_unfinished_writer(stage_id, node.session, node.output)
         self._commit(
             stage_id, message or f'{stage_id}: address review'
         )

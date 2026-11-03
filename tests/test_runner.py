@@ -55,6 +55,11 @@ def _assert_plan_committed(case, wt, worktree, path, marker):
     )
 
 
+#: The line a writer's reply must end with; spelled out here rather than
+#: read from the runner, so the fake keeps working while it is absent.
+_WORK_COMPLETE = 'WORK COMPLETE'
+
+
 def _is_planner_label(label: str) -> bool:
     """Whether *label* names a planner node (``plan``, ``m1-plan``)."""
     return label == 'plan' or label.endswith('-plan')
@@ -404,6 +409,10 @@ class FakeSC:
         #: Set to return planner replies verbatim, for tests that drive
         #: the plan-shape guard itself.
         self.raw_plan_replies = False
+        #: Set to return writer replies verbatim. Otherwise a turn that
+        #: asks for the finish line gets it, as from a writer that did
+        #: what it was told; tests of the finish rule itself opt out.
+        self.raw_writer_replies = False
         #: Session ids whose dispose() raises (already torn down).
         self.dispose_raises: set[str] = set()
         #: Every dispose ATTEMPT, including the ones that raised —
@@ -582,6 +591,12 @@ class FakeSC:
         # the guard itself pass real text directly.
         if _is_planner_label(label) and not self.raw_plan_replies:
             reply = _plan_text(2200, reply)
+        if (
+            _WORK_COMPLETE in message
+            and not self.raw_writer_replies
+            and _WORK_COMPLETE not in reply
+        ):
+            reply = f'{reply}\n\n{_WORK_COMPLETE}'
         self._last_reply[session] = reply
         self._assistant.setdefault(session, []).append(reply)
         return SwarmTurnResult('idle', None, reply)
@@ -8692,6 +8707,136 @@ _LINEAR_REPLIES = {
 }
 
 
+class TestAWriterMustSayItFinished(_Base):
+    """
+    A writer's reply must end with ``WORK COMPLETE``.
+
+    Live (k8s-clusters-1, k2-tests), the test writer ended its turn
+    twice saying it was waiting for a background compile. Both times
+    the runner committed the tree as finished work: first with
+    temporary stubs in production code, then with them still there,
+    which stopped the run.
+    """
+
+    _UNFINISHED = 'Launched the build in the background; I will wait for it.'
+    _DONE = 'Implemented parse_ports; cargo test passes.\n\nWORK COMPLETE'
+
+    def _go(self, build, review='VERDICT: APPROVED'):
+        sc = FakeSC({'plan': 'PLAN', 'build': build, 'review-sec': review})
+        sc.raw_writer_replies = True
+        wt = FakeWT()
+        with mock.patch('sbx_omnigent.runner.click.echo'):
+            try:
+                result = self._run(_LINEAR, {}, sc=sc, wt=wt)[0]
+            except R.PipelineRunError as exc:
+                result = exc
+        return result, sc, wt
+
+    def _asks(self, sc: FakeSC) -> list[str]:
+        return [
+            m for m in _messages_for(sc, 'build') if m == R._WRITER_FINISH_ASK
+        ]
+
+    def _commits(self, wt: FakeWT) -> list[str]:
+        return [msg for node, msg, _a in wt.commits if node == 'build']
+
+    def test_a_finished_reply_is_not_asked_again(self) -> None:
+        result, sc, wt = self._go(self._DONE)
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(self._asks(sc), [])
+        self.assertIn('build: implement', self._commits(wt))
+
+    def test_an_unfinished_reply_is_asked_once(self) -> None:
+        result, sc, _wt = self._go([self._UNFINISHED, self._DONE])
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(len(self._asks(sc)), 1)
+
+    def test_it_is_committed_after_the_answer(self) -> None:
+        _r, sc, wt = self._go([self._UNFINISHED, self._DONE])
+        sends = [
+            i for i, ev in enumerate(sc.timeline)
+            if ev[0] == 'send' and ev[1] == 'build'
+        ]
+        self.assertEqual(len(sends), 2)
+        self.assertEqual(self._commits(wt)[0], 'build: implement')
+
+    def test_a_dispute_is_not_asked(self) -> None:
+        result, sc, _wt = self._go(
+            'DISPUTED: tests/x.py:5 and tests/y.py:9 cannot both pass.'
+        )
+        self.assertIsInstance(result, R.PipelineRunError)
+        self.assertEqual(self._asks(sc), [])
+
+    def test_a_reply_that_never_finishes_stops_the_run(self) -> None:
+        result, _sc, wt = self._go([self._UNFINISHED, self._UNFINISHED])
+        self.assertIsInstance(result, R.PipelineRunError)
+        self.assertIn('WORK COMPLETE', str(result))
+        commits = self._commits(wt)
+        self.assertNotIn('build: implement', commits)
+        self.assertTrue(any('partial work' in c for c in commits), commits)
+
+    def test_its_turn_is_kept(self) -> None:
+        _r, _sc, wt = self._go([self._UNFINISHED, self._UNFINISHED])
+        self.assertIn('did not finish', wt.artifacts['turns/build.md'])
+
+    def test_the_stage_is_not_recorded_complete(self) -> None:
+        cfg = self._cfg(_LINEAR)
+        sc = FakeSC({'plan': 'PLAN', 'build': self._UNFINISHED})
+        sc.raw_writer_replies = True
+        runner = R.PipelineRunner(
+            cfg, session_client=sc, worktree_manager=FakeWT(), run_id='r1',
+            agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        with mock.patch('sbx_omnigent.runner.click.echo'):
+            with self.assertRaises(R.PipelineRunError):
+                runner.run()
+        self.assertNotIn('build', runner._completed)
+
+    def test_a_fix_turn_is_held_to_it_too(self) -> None:
+        result, sc, _wt = self._go(
+            [self._DONE, self._UNFINISHED, self._DONE],
+            review=['VERDICT: BLOCKING\n- ranges are off by one',
+                    'VERDICT: APPROVED'],
+        )
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(len(self._asks(sc)), 1)
+
+    def test_every_writer_turn_carries_the_rule(self) -> None:
+        _r, sc, _wt = self._go(
+            [self._DONE, self._DONE],
+            review=['VERDICT: BLOCKING\n- ranges are off by one',
+                    'VERDICT: APPROVED'],
+        )
+        turns = _messages_for(sc, 'build')
+        self.assertEqual(len(turns), 2)
+        for turn in turns:
+            self.assertIn('WORK COMPLETE', turn)
+
+    def test_a_reviewer_turn_does_not(self) -> None:
+        _r, sc, _wt = self._go(self._DONE)
+        self.assertNotIn('WORK COMPLETE', sc.message_for_label('review-sec'))
+
+
+class TestTheFinishLineIsRead(unittest.TestCase):
+    """Only a line that is exactly the marker counts."""
+
+    def test_the_line_counts(self) -> None:
+        for text in ('done\n\nWORK COMPLETE', 'done\n**WORK COMPLETE**',
+                     'done\n`WORK COMPLETE`\n'):
+            with self.subTest(text=text):
+                self.assertTrue(R.work_finished(text))
+
+    def test_a_promise_does_not(self) -> None:
+        for text in (
+            'I will end with WORK COMPLETE once the build is done.',
+            'WORK COMPLETE is what I will say later',
+            '', None,
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(R.work_finished(text))
+
+
 class TestPlanArtifact(_Base):
     def test_consolidation_turn_driven_after_approval(self) -> None:
         # After approval the planner is driven ONE more turn to emit a
@@ -14762,7 +14907,12 @@ class TestAnApiErrorReplyFailsTheTurn(_Base):
     )
 
     def _failing(self, reply: str) -> tuple[R.PipelineRunError, FakeSC]:
-        sc = FakeSC({'tests': 'wrote tests', 'build': reply})
+        sc = FakeSC({
+            'tests': f'wrote tests\n\n{_WORK_COMPLETE}', 'build': reply,
+        })
+        # An API error is the harness talking, not the agent, so it
+        # never carries the finish line the fake would otherwise add.
+        sc.raw_writer_replies = True
         with mock.patch.object(R.pane, 'capture_pane', return_value=None):
             with self.assertRaises(R.PipelineRunError) as caught:
                 self._run(_TDD, {}, sc=sc)
