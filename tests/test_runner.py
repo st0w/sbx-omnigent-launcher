@@ -8837,6 +8837,162 @@ class TestTheFinishLineIsRead(unittest.TestCase):
                 self.assertFalse(R.work_finished(text))
 
 
+class TestCtrlCStopsTheRunNow(_Base):
+    """
+    Ctrl-C means stop, not "stop once every parallel turn is done".
+
+    Live (k8s-clusters-1, k2): Ctrl-C during four parallel reviews left
+    the runner waiting for all four to finish their turns, up to the
+    two-hour turn timeout, before it tore anything down. Only the main
+    thread sees the interrupt; the executor then joined its workers.
+    """
+
+    def _runner(self, sc=None, text=_LINEAR) -> R.PipelineRunner:
+        cfg = self._cfg(text)
+        return R.PipelineRunner(
+            cfg, session_client=sc or FakeSC({}), worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+
+    def test_a_parallel_stage_stops_without_waiting(self) -> None:
+        runner = self._runner()
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def busy() -> None:
+            release.wait(10)
+
+        def interrupted(*_a, **_k):
+            raise KeyboardInterrupt
+
+        started = time.monotonic()
+        with mock.patch.object(
+            R.concurrent.futures, 'as_completed', side_effect=interrupted
+        ), mock.patch('sbx_omnigent.runner.click.echo'):
+            with self.assertRaises(KeyboardInterrupt):
+                runner._parallel('review', [('a', busy), ('b', busy)])
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertTrue(runner._interrupted.is_set())
+
+    def test_turns_in_flight_are_captured(self) -> None:
+        runner = self._runner()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        runner._in_turn.update({'s-a', 's-b'})
+
+        def interrupted(*_a, **_k):
+            raise KeyboardInterrupt
+
+        with mock.patch.object(
+            R.concurrent.futures, 'as_completed', side_effect=interrupted
+        ), mock.patch.object(runner, '_capture_turn') as capture, \
+                mock.patch('sbx_omnigent.runner.click.echo'):
+            with self.assertRaises(KeyboardInterrupt):
+                runner._parallel(
+                    'review',
+                    [('a', lambda: release.wait(10)),
+                     ('b', lambda: release.wait(10))],
+                )
+        captured = sorted(c.args[0] for c in capture.call_args_list)
+        self.assertEqual(captured, ['s-a', 's-b'])
+        for c in capture.call_args_list:
+            self.assertIn('Ctrl-C', c.args[1])
+
+    def test_no_session_is_created_after_it(self) -> None:
+        sc = FakeSC({})
+        runner = self._runner(sc)
+        runner._interrupted.set()
+        with self.assertRaises(R.RunInterrupted):
+            runner._create_session(
+                'build', '/wt/r1/nodes/build', 'rw', 'build'
+            )
+        self.assertEqual(sc.creates, [])
+
+    def test_no_turn_is_sent_after_it(self) -> None:
+        sc = FakeSC({})
+        runner = self._runner(sc)
+        session = runner._create_session(
+            'build', '/wt/r1/nodes/build', 'rw', 'build'
+        )
+        runner._interrupted.set()
+        with self.assertRaises(R.RunInterrupted):
+            runner._drive(session, 'do the work')
+        self.assertEqual(sc.sent, [])
+
+    def test_it_is_an_interrupt_no_retry_handler_catches(self) -> None:
+        self.assertTrue(issubclass(R.RunInterrupted, KeyboardInterrupt))
+
+    def test_a_turn_lost_after_it_is_not_retried(self) -> None:
+        # Teardown disposes the sessions; a reviewer that then reads its
+        # turn as lost must not boot a fresh VM to try again.
+        holder: dict[str, R.PipelineRunner] = {}
+
+        class _Interrupting(FakeSC):
+            def send_and_wait(self, session, message, **kw):
+                if self.label_of(session) == 'review-sec':
+                    holder['runner']._interrupted.set()
+                return super().send_and_wait(session, message, **kw)
+
+        sc = _Interrupting(dict(_LINEAR_REPLIES))
+        sc.turn_outcomes['review-sec'] = ['lost']
+        runner = self._runner(sc)
+        holder['runner'] = runner
+        with mock.patch('sbx_omnigent.runner.click.echo'):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.run()
+        reviews = [
+            c for c in sc.creates if sc.label_of(c['sid']) == 'review-sec'
+        ]
+        self.assertEqual(len(reviews), 1)
+
+    def test_a_turn_is_marked_in_flight_while_it_runs(self) -> None:
+        seen: list[bool] = []
+        holder: dict[str, R.PipelineRunner] = {}
+
+        class _Watching(FakeSC):
+            def send_and_wait(self, session, message, **kw):
+                seen.append(session in holder['runner']._in_turn)
+                return super().send_and_wait(session, message, **kw)
+
+        sc = _Watching({'build': 'done'})
+        runner = self._runner(sc)
+        holder['runner'] = runner
+        session = runner._create_session(
+            'build', '/wt/r1/nodes/build', 'rw', 'build'
+        )
+        runner._drive(session, 'do the work')
+        self.assertEqual(seen, [True])
+        self.assertNotIn(session, runner._in_turn)
+
+    def test_main_exits_once_it_has_cleaned_up(self) -> None:
+        cfg_path = self.root / 'pipeline.yaml'
+        cfg_path.write_text(_LINEAR, encoding='utf-8')
+        order: list[str] = []
+        with mock.patch.object(R, 'preflight_sbx'), \
+                mock.patch.object(R, 'preflight_disk'), \
+                mock.patch.object(R, 'preflight_codex_auth'), \
+                mock.patch.object(R, 'preflight_codex_login'), \
+                mock.patch.object(
+                    R, '_drive', side_effect=KeyboardInterrupt
+                ), \
+                mock.patch.object(
+                    R, 'stop_harvester',
+                    side_effect=lambda _h: order.append('harvester'),
+                ), \
+                mock.patch.object(
+                    R, '_exit_now',
+                    side_effect=lambda code: order.append(f'exit {code}'),
+                ):
+            CliRunner().invoke(R.main, [
+                '-c', str(cfg_path),
+                '--canonical-root', str(self.root / 'c'),
+                '--worktree-root', str(self.root / 'w'),
+                '--skip-agy-check',
+            ])
+        self.assertEqual(order, ['harvester', 'exit 130'])
+
+
 class TestPlanArtifact(_Base):
     def test_consolidation_turn_driven_after_approval(self) -> None:
         # After approval the planner is driven ONE more turn to emit a

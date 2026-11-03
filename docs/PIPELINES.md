@@ -715,6 +715,20 @@ retried: a second attempt would spend a second full turn budget on something
 likely to fail the same way. Nor is a turn under `--keep`, or one whose VM
 could not be freed, since two agents would then be writing into one tree.
 
+**Ctrl-C stops the run at once.** Only the runner's main thread sees Ctrl-C.
+In a stage that drives several nodes at once (competing writers, or a stage's
+reviewers), the runner used to wait for every turn still running to finish,
+up to the turn timeout, before it stopped anything. Now it stops at once:
+- it records each turn still running in `<run>/turns/`;
+- it starts no new turn or VM, so a node whose session disappears doesn't
+  retry on a fresh VM;
+- it disposes the run's VMs and stops the agy harvester;
+- it exits with status 130, without waiting for the turns still in progress.
+
+Every stage recorded as complete stays complete, so `--resume` reruns only the
+stage that was interrupted. Press Ctrl-C once: a second one cuts short the
+turn records and cleanup.
+
 **A VM that never started is launched again, apart from that retry.** On a busy
 host, a VM's runner can miss the server's 30-second connect window, and the turn
 fails with `runner_unavailable` before anything runs. A reviewer or writer gets
