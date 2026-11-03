@@ -29,7 +29,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import time
 import urllib.parse
 from typing import TYPE_CHECKING
@@ -86,31 +85,6 @@ def _run_default(
             f'{" ".join(cmd)}\n{proc.stderr.strip()}'
         )
     return proc.stdout
-
-
-def clone_copy_command(
-    src: str, dst: str, *, platform: str | None = None
-) -> list[str]:
-    """
-    The ``cp`` argv that copies *src* to *dst*, cloning where it can.
-
-    The clone flag is not portable (#60). macOS ``cp -c`` clones with
-    ``clonefile(2)`` and falls back to a real copy. GNU ``cp`` has no
-    ``-c`` at all and rejects it; its equivalent is ``--reflink=auto``,
-    which clones on a reflink filesystem (btrfs, XFS with reflink) and
-    makes a full copy elsewhere. Any other ``cp`` gets a plain copy.
-
-    :param src: Directory to copy.
-    :param dst: Destination path, which must not exist yet.
-    :param platform: ``sys.platform`` override (tests).
-    :returns: The argv.
-    """
-    platform = sys.platform if platform is None else platform
-    if platform == 'darwin':
-        return ['cp', '-Rc', src, dst]
-    if platform.startswith('linux'):
-        return ['cp', '-R', '--reflink=auto', src, dst]
-    return ['cp', '-R', src, dst]
 
 
 def _validate_name(value: str, kind: str) -> str:
@@ -450,14 +424,6 @@ class WorktreeManager:
         be rotated or expired by then — which cost a finished module
         its pull request. A callable is read lazily and re-read once if
         the credential is rejected. See :meth:`_run_publish`.
-    :param build_cache: Directory names, relative to a node worktree
-        root, carried between nodes as a warm build cache — e.g.
-        ``('target',)`` for cargo. Empty (the default) disables it.
-        See :meth:`seed_build_cache`.
-    :param build_cache_key: Names the cache directory under
-        ``<canonical_root>/_buildcache/``; pass :func:`_repo_key`, so
-        two repositories never share one. ``None`` also disables the
-        cache.
     """
 
     def __init__(
@@ -468,11 +434,7 @@ class WorktreeManager:
         default_branch: str = 'main',
         run: Callable[..., str] = _run_default,
         publish_token: str | Callable[[], str | None] | None = None,
-        build_cache: tuple[str, ...] = (),
-        build_cache_key: str | None = None,
     ) -> None:
-        self._build_cache = build_cache
-        self._build_cache_key = build_cache_key
         self._canonical_root = canonical_root
         self._worktree_root = worktree_root
         self._default_branch = default_branch
@@ -486,9 +448,6 @@ class WorktreeManager:
         )
         self._publish_token: str | None = None
         self._publish_token_read = False
-        #: Build-cache operations (``seed``/``refresh``) whose failure
-        #: has already been reported. Once each, not once per node.
-        self._build_cache_warned: set[str] = set()
 
     def publish_token(self, *, refresh: bool = False) -> str | None:
         """
@@ -1281,7 +1240,6 @@ class WorktreeManager:
         from_node: str | None = None,
         base_branch: str | None = None,
         replace: bool = False,
-        seed_cache: bool = True,
     ) -> str:
         """
         Create an isolated, self-contained clone + branch for one node.
@@ -1306,10 +1264,6 @@ class WorktreeManager:
             earlier attempt and re-cut it (resume). When that attempt
             left a branch behind, the new clone starts from THAT branch,
             so partial work is inherited rather than thrown away.
-        :param seed_cache: Seed the clone from the warm build cache (see
-            :meth:`seed_build_cache`). ``False`` for the verify gate:
-            the cache is filled from writers' build directories, which
-            a writer controls, and the gate must not trust them.
         :returns: The node's clone path.
         :raises click.ClickException: On a missing run or git error.
         """
@@ -1372,156 +1326,7 @@ class WorktreeManager:
         # it owns, and the discarded tip is the failed attempt's.
         push = ['git', '-C', path, 'push', 'origin', branch]
         self._run([*push, '--force'] if replace else push)
-        # AFTER the push, so a cache-seeding failure can never cost the
-        # branch registration downstream nodes inherit from. The cache
-        # entries are git-ignored build output by definition, so this
-        # cannot change what the node commits.
-        if seed_cache:
-            self.seed_build_cache(path)
         return path
-
-    def _build_cache_dir(self) -> str | None:
-        """
-        Where the warm build cache lives, or ``None`` when disabled.
-
-        Sits beside ``_metrics`` and ``_retained`` under the canonical
-        root: derived state that outlives any one run, keyed by
-        repository so two projects never share a cache.
-
-        :returns: The cache directory path, or ``None``.
-        """
-        if not self._build_cache or not self._build_cache_key:
-            return None
-        return os.path.join(
-            self._canonical_root, '_buildcache', self._build_cache_key
-        )
-
-    def seed_build_cache(self, worktree_path: str) -> list[str]:
-        """
-        Clone the warm build cache into a freshly cut node worktree.
-
-        Every node starts from an empty tree, so without this every
-        node pays a from-clean compile, identical whether the increment
-        changed seven lines or seven hundred. Seeding the previous
-        node's build directory turns that into an incremental one: on a
-        Rust workspace, 16 s instead of 121 s (see
-        ``_MAX_PARALLEL_NODES`` in :mod:`sbx_omnigent.runner`).
-
-        On APFS ``cp -Rc`` is a copy-on-write CLONE: measured at 200 MB
-        in under 10 ms with no space consumed until a block diverges,
-        so a multi-gigabyte cache costs neither time nor disk to hand
-        out. On Linux ``cp --reflink=auto`` clones only on a reflink
-        filesystem and makes a full copy elsewhere, which costs real
-        disk per node. See :func:`clone_copy_command`.
-
-        STALENESS IS THE BUILD TOOL'S PROBLEM, deliberately. Cargo
-        fingerprints every artifact by source hash, feature flags and
-        compiler version, so a cache from another branch — or another
-        toolchain — is revalidated and rebuilt where it disagrees. The
-        worst case is a from-clean build; there is no case where it
-        silently uses the wrong artifact.
-
-        Best-effort throughout: a cache that cannot be read or copied
-        leaves the worktree exactly as it was. Seeding is an
-        optimization, and an optimization that can fail a run is worse
-        than no optimization.
-
-        :param worktree_path: The node's clone directory.
-        :returns: The cache entries actually seeded (for logging).
-        """
-        cache = self._build_cache_dir()
-        if cache is None:
-            return []
-        seeded = []
-        for name in self._build_cache:
-            src = os.path.join(cache, name)
-            dst = os.path.join(worktree_path, name)
-            # Never overwrite: a checked-in directory of the same name
-            # is the repository's, not ours to replace.
-            if os.path.exists(dst) or not os.path.isdir(src):
-                continue
-            try:
-                if not os.listdir(src):
-                    continue  # empty cache entry buys nothing
-                self._run(clone_copy_command(src, dst))
-                seeded.append(name)
-            except (click.ClickException, OSError) as exc:
-                # A partial copy is worse than none: a half-written
-                # build directory is exactly what a build tool cannot
-                # revalidate its way out of.
-                shutil.rmtree(dst, ignore_errors=True)
-                self._warn_build_cache('seed', name, exc)
-        return seeded
-
-    def refresh_build_cache(self, worktree_path: str) -> list[str]:
-        """
-        Replace the warm build cache from a node that just finished.
-
-        Called only after a stage COMPLETES, so the cache is never
-        refreshed from a node that failed mid-build and could leave a
-        torn build directory behind.
-
-        Written to a temporary name and renamed into place, so a crash
-        or a concurrent refresh can never leave a half-written cache
-        for the next node to seed from. Two nodes finishing at once
-        both refresh and the last one wins, which is harmless: either
-        is a valid build of the same tree.
-
-        Best-effort, like :meth:`seed_build_cache`.
-
-        :param worktree_path: The completed node's clone directory.
-        :returns: The cache entries actually refreshed (for logging).
-        """
-        cache = self._build_cache_dir()
-        if cache is None:
-            return []
-        refreshed = []
-        for name in self._build_cache:
-            src = os.path.join(worktree_path, name)
-            if not os.path.isdir(src):
-                continue
-            dst = os.path.join(cache, name)
-            staged = f'{dst}.incoming.{os.getpid()}'
-            try:
-                os.makedirs(cache, exist_ok=True)
-                shutil.rmtree(staged, ignore_errors=True)
-                self._run(clone_copy_command(src, staged))
-                previous = f'{dst}.replaced.{os.getpid()}'
-                if os.path.exists(dst):
-                    os.rename(dst, previous)
-                os.rename(staged, dst)
-                shutil.rmtree(previous, ignore_errors=True)
-                refreshed.append(name)
-            except (click.ClickException, OSError) as exc:
-                shutil.rmtree(staged, ignore_errors=True)
-                self._warn_build_cache('refresh', name, exc)
-        return refreshed
-
-    def _warn_build_cache(
-        self, operation: str, name: str, exc: Exception
-    ) -> None:
-        """
-        Say once that the build cache is not working.
-
-        Seeding and refreshing stay best-effort, but a failure used to
-        be swallowed without a word, so a cache that never took was
-        discovered only from build times (#60).
-
-        :param operation: ``'seed'`` or ``'refresh'``.
-        :param name: The cache entry that failed.
-        :param exc: The error, whose text names the command.
-        """
-        if operation in self._build_cache_warned:
-            return
-        self._build_cache_warned.add(operation)
-        detail = (
-            exc.message if isinstance(exc, click.ClickException) else exc
-        )
-        click.echo(
-            f'[build-cache] could not {operation} {name!r}: {detail}. '
-            f'Nodes build without the warm cache; the run continues. '
-            f'Reported once per run.'
-        )
 
     def write_ignored_file(
         self, worktree_path: str, name: str, content: str

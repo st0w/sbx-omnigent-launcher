@@ -69,8 +69,6 @@ generated: ["*.lock"]      # optional — files that don't count as implementati
 guarded: ["deny.toml"]     # optional — files that ARE a check (see Guarded checks)
 disk:                      # optional — per-unit estimates for the startup disk
   per_worktree_gb: 0.2     #   preflight; the defaults suit a COMPILED project
-build_cache: [target]      # optional — build output dirs handed from node to
-                           #   node (see "Warm build cache")
 prewarm: false             # optional — default true; see "Pre-warm"
 egress: [sh.rustup.rs, static.rust-lang.org]  # optional — hosts setup and the
                            #   gate fetch, checked before any turn (see
@@ -871,117 +869,40 @@ differ.
 adds one. List them with `sbx template ls`. Remove an old one with
 `sbx template rm <name>` once no run uses it.
 
-## Warm build cache
+## Where builds happen
 
-Every node starts from a fresh clone, so without a cache every node compiles the
-project from clean. `build_cache:` names the build output directories to carry
-from one node to the next. **It is off unless you set it**, and it is yours to
-choose per pipeline: on for a project whose builds are slow, off for one whose
-builds are fast or that you want built from clean everywhere.
+**Every stage builds on its sandbox's own disk, never through the host mount.**
 
-### Turning it on
+- **Writers** edit and commit in their worktree, which is mounted from the
+  host, and are told to build outside it (for Cargo,
+  `CARGO_TARGET_DIR=$HOME/build-target`).
+- **Reviewers** mount the tree read-only and put build output on the VM's disk
+  (for Cargo, `/tmp/review-target`).
+- **The verify gate** copies the branch onto its sandbox's disk and builds there
+  from clean (see
+  [Verification](#verification--the-one-check-the-orchestrator-makes-itself)).
 
-One key, at the top level of `pipeline.yaml`:
+The mount is the wrong place to build. Live, on a Rust workspace, `cargo clippy
+--workspace --all-targets` took over 50 minutes through the mount and about
+one on a sandbox's own disk. Builds there also read back zero-length or
+truncated objects ("memory map must have a non-zero length", "section table
+goes past the end of file"). A reviewer whose build couldn't run blocked, as
+it must, and the writer was sent to fix code that had nothing wrong with it.
 
-```yaml
-build_cache: [target]                      # a Rust workspace
-```
+**Each sandbox's disk is a fixed 20 GB.** sbx gives every sandbox 20 GB that
+can't be resized, and the toolchain shares it with every build: a Rust
+toolchain is about 4 GB. Writers are told so, and told to leave coverage to the
+gate, because a local coverage build costs gigabytes for a number the gate
+recomputes. Live, one coder's VM-local build directory reached 13 GB, 5 GB of
+it coverage output, and filled its disk mid-module. A [pipeline
+image](#a-prebuilt-toolchain-image) saves the install time but not the disk:
+the toolchain still lives on the same 20 GB.
 
-List as many directories as the project builds into:
-
-```yaml
-build_cache: [target, node_modules, dist]  # Rust plus a web frontend
-```
-
-- **It covers every writer and reader.** Each of their clones is seeded.
-  Reviewers and the verify gate are not: they build on their VM's own disk
-  (see below). There is no per-stage setting.
-- **Entries are top-level directory names.** Paths, `.` and `..` are refused
-  when the pipeline loads, so a nested directory such as `web/node_modules`
-  can't be cached. An entry the project never produces is skipped, and a
-  checked-in directory of the same name is never overwritten.
-- **Leave out anything tied to its own path.** A Python `.venv`, for example:
-  its scripts name the interpreter by absolute path, and each node's clone is
-  at a different one. uv rebuilds a virtualenv quickly anyway.
-
-### Turning it off: every VM builds from clean
-
-Leave `build_cache:` out, or set it to an empty list:
-
-```yaml
-build_cache: []
-```
-
-Then every writer and reader builds in a fresh clone, every reviewer builds on
-its VM's own disk, and the verify gate builds from clean as it always does. The
-cache on disk is neither read nor written. It stays where it is, and is used
-again if you turn the cache back on.
-
-To turn it off for one run without editing the file, pass `--no-build-cache`
-to the runner. The run behaves exactly as if `build_cache:` were unset, and
-says so at the start. Resuming later without the flag turns the cache back on
-for the stages still to run.
-
-### Starting over from clean, with the cache still on
-
-Delete the cache between runs:
-
-```sh
-ls <canonical-root>/_buildcache/             # find your repository's entry
-rm -rf <canonical-root>/_buildcache/<repo>-<hash>
-```
-
-`<canonical-root>` is the runner's `--canonical-root` (or
-`OMNI_SBX_CANONICAL_ROOT`). Each entry is named for the repository: the last
-segment of `repo:` without `.git`, then a hash of the whole of `repo:` (see
-below). The next run's first nodes build from clean, and the first stage to
-complete fills the cache again. During a run this buys little: the next stage
-to complete refills it straight away.
-
-### How it works
-
-- **Where the cache lives.** `<canonical-root>/_buildcache/<repo>-<hash>`,
-  beside the repository's mirror (`<canonical-root>/<repo>-<hash>.git`), so it
-  outlives any one run. The hash covers the whole of `repo:`, so `org-a/app`
-  and `org-b/app` get separate caches and separate mirrors, while spellings of
-  one repository (with or without `.git`, a relative or an absolute path)
-  share them. A mirror whose origin is some other repository is refused, never
-  fetched.
-- **When it is used.** Writer and reader clones are seeded from it. It is
-  refreshed after every stage that completes, so the next node starts from the
-  newest build. A stage that failed never refreshes it.
-- **Reviewers build on their VM's own disk.** A reviewer's tree is mounted
-  read-only, and its instruction says to put build output on the VM's disk
-  (for Cargo, `CARGO_TARGET_DIR=/tmp/review-target`). Reviewers used to build
-  in a scratch on the host, cloned from the cache. Live, those builds ran
-  through the sbx mount several times slower, and twice read zero-length or
-  truncated objects from the clone ("memory map must have a non-zero
-  length"). The reviewers then blocked on builds that couldn't run, and the
-  writer was sent to fix code that had nothing wrong with it. A reviewer now
-  builds from clean, on a fast disk, and nothing it builds reaches the host.
-- **The verify gate is never seeded.** The cache is filled from writers' build
-  directories, and a writer controls its own: build output planted there with
-  timestamps newer than the sources would be reused by the build tool instead
-  of rebuilt. The gate is the one check that doesn't take an agent's word, so
-  its clone starts with no build output and it builds from clean. It builds in
-  a copy on its sandbox's own disk (see
-  [Verification](#verification--the-one-check-the-orchestrator-makes-itself)),
-  so it doesn't refresh the cache.
-- **Staleness is the build tool's job.** A cache from another branch or
-  toolchain is revalidated by the build tool (Cargo fingerprints every
-  artifact), so for honestly built output the worst case is a from-clean
-  build, never a wrong artifact.
-- **Best-effort.** A cache that can't be seeded or refreshed leaves the node
-  building from clean, and a `[build-cache]` line says so once per run. It
-  never fails a run.
-- **Disk.** Seeding costs nothing only on a filesystem that clones copy-on-write:
-  APFS on macOS, or btrfs and XFS with reflink on Linux. Anywhere else, each
-  writer and reader clone gets a full copy of the cache.
-
-Measured on a Rust workspace: a seeded rebuild took 16 s where a from-clean one
-took 121 s. Where a build runs matters more on a large workspace: on a live
-one, `cargo clippy --workspace --all-targets` took about a minute on a
-sandbox's own disk, and over 50 minutes through the mount.
+**`build_cache:` is retired.** It carried build output from node to node
+through the mount, and with every stage building on its own disk nothing used
+it. A pipeline that still sets it is refused when it loads: delete the line.
+`--no-build-cache` is gone too. A cache left by an earlier version is under
+`<canonical-root>/_buildcache/` and can be deleted.
 
 ## Verification — the one check the orchestrator makes itself
 
@@ -1619,7 +1540,6 @@ Override any of them with an inline `prompt`/`prompt_file`, and augment with
 | `--no-interactive-plan` | Don't block the plan stage on human approval — use the planner's single-turn output as-is. |
 | `--no-auto-harvest` | Don't start an agy token harvester for this run; refuse instead when the swap secret is stale (use when one runs elsewhere). |
 | `--skip-disk-check` | Skip the preflight that refuses to start when free disk can't cover the run's microVMs. |
-| `--no-build-cache` | Ignore the pipeline's `build_cache:` for this run: every VM builds from clean, and the cache on disk is neither read nor written (see [Warm build cache](#warm-build-cache)). |
 | `--skip-codex-check` | Skip the check that the server accepts the host Codex login, for a network that blocks WebSockets but reaches Codex over HTTPS (see [Codex notes](#codex-notes)). An expired access token is still refused. |
 | `--resume` | Continue the run with this `--run-id` instead of starting clean (see [Resuming a run](#resuming-a-run)). |
 | `--turn-timeout` | Seconds one agent turn may take, overriding the pipeline's `turn_timeout`. |

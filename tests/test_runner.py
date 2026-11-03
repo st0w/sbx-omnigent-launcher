@@ -36,7 +36,7 @@ from sbx_omnigent.swarm_session import (
     SwarmTurnResult,
     SwarmTurnTimeout,
 )
-from sbx_omnigent.worktrees import WorktreeManager, _repo_key
+from sbx_omnigent.worktrees import WorktreeManager
 
 
 def _assert_plan_committed(case, wt, worktree, path, marker):
@@ -92,8 +92,6 @@ class FakeWT:
         #: None = the tracker could not be read at all.
         self.issue_bodies: str | None = ''
         self.issue_create_fails = False
-        #: Worktrees the warm build cache was refreshed from.
-        self.cache_refreshed: list[str] = []
         #: (alias_id, target_id) for each judge branch alias.
         self.aliases: list[tuple[str, str]] = []
         #: Hub branch tips by node id; unset nodes get a stable fake.
@@ -128,8 +126,6 @@ class FakeWT:
         self.state_to_load: dict | None = None
         #: node_id -> whether its worktree cut was a replacement.
         self.replaced: dict[str, bool] = {}
-        #: node -> whether its clone was seeded from the build cache.
-        self.seeded: dict[str, bool] = {}
         #: Whether create_run was asked to reuse an existing hub.
         self.reused = False
         #: Make commit_node raise (salvage must not mask the failure).
@@ -179,11 +175,10 @@ class FakeWT:
 
     def create_node_worktree(
         self, run_id, node_id, *, from_node=None, base_branch=None,
-        replace=False, seed_cache=True,
+        replace=False,
     ) -> str:
         self.node_from[node_id] = from_node
         self.replaced[node_id] = replace
-        self.seeded[node_id] = seed_cache
         return f'/wt/{run_id}/nodes/{node_id}'
 
     def reseed_node_worktree(self, run_id, node_id, from_node) -> str:
@@ -200,10 +195,6 @@ class FakeWT:
 
     def node_ahead_of_hub(self, run_id, node_id) -> bool:
         return node_id in self.ahead
-
-    def refresh_build_cache(self, path) -> list[str]:
-        self.cache_refreshed.append(path)
-        return ['target']
 
     def node_worktree_path(self, run_id, node_id) -> str:
         return f'/wt/{run_id}/nodes/{node_id}'
@@ -12864,49 +12855,6 @@ class TestChunkGranularity(unittest.TestCase):
         self.assertIn('frozen before its consumer', ask)
 
 
-class TestWarmBuildCacheIsWired(_Base):
-    """
-    A finished node hands its build directory to the next one.
-    """
-
-    def test_every_completed_stage_refreshes_the_cache(self) -> None:
-        _r, _sc, wt = self._run(
-            _LINEAR.replace(
-                'publish: local', 'publish: local\nbuild_cache: [target]'
-            ),
-            dict(_LINEAR_REPLIES),
-        )
-        nodes = [p.rsplit('/', 1)[-1] for p in wt.cache_refreshed]
-        self.assertIn('build', nodes)
-
-    def test_nothing_is_refreshed_when_the_cache_is_off(self) -> None:
-        # Every existing pipeline: absent build_cache must stay a no-op,
-        # so this cannot change behaviour for anyone who has not asked.
-        _r, _sc, wt = self._run(_LINEAR, dict(_LINEAR_REPLIES))
-        self.assertEqual(wt.cache_refreshed, [])
-
-    def test_a_failed_stage_does_not_refresh(self) -> None:
-        # Only a COMPLETED stage refreshes, so a node that died
-        # mid-build cannot leave a torn cache for the next one.
-        cfg = self._cfg(
-            _LINEAR.replace(
-                'publish: local', 'publish: local\nbuild_cache: [target]'
-            )
-        )
-        wt, sc = FakeWT(), FakeSC({'plan': 'P'})
-        sc.fail_labels = {'build'}
-        runner = R.PipelineRunner(
-            cfg, session_client=sc, worktree_manager=wt, run_id='r1',
-            agent_ids={n: f'ag-{n}' for n in cfg.agents},
-            swap_age_s=lambda: 0.0,
-        )
-        with self.assertRaises(R.PipelineRunError):
-            runner.run()
-        self.assertNotIn(
-            'build', [p.rsplit('/', 1)[-1] for p in wt.cache_refreshed]
-        )
-
-
 class TestVerifyGate(_Base):
     """The one gate that does not take an agent's word: it runs the
     project's own command in a sandbox and reads the exit code."""
@@ -12936,38 +12884,6 @@ class TestVerifyGate(_Base):
         return mock.patch.object(
             R.verify, 'run_verification', side_effect=fake
         ), calls
-
-    def test_the_gates_clone_is_not_seeded(self) -> None:
-        # The cache comes from writers' build directories. A writer
-        # could plant output there that the gate would then trust.
-        patch, _calls = self._gate([_outcome(True)])
-        runner, _sc, wt = self._build()
-        with patch:
-            runner.run()
-        gates = [n for n in wt.seeded if n.endswith('-verify')]
-        self.assertTrue(gates)
-        self.assertFalse(any(wt.seeded[n] for n in gates))
-
-    def test_the_gate_does_not_refresh_the_cache(self) -> None:
-        # The gate builds on its sandbox's own disk (#144), so it leaves
-        # no build output on the host to refresh the cache from.
-        cached = _VERIFY.replace(
-            'publish: local', 'publish: local\nbuild_cache: [target]'
-        )
-        patch, _calls = self._gate([_outcome(True)])
-        runner, _sc, wt = self._build(cached)
-        with patch:
-            runner.run()
-        refreshed = [p.rsplit('/', 1)[-1] for p in wt.cache_refreshed]
-        self.assertIn('build', refreshed)
-        self.assertFalse(any(n.endswith('-verify') for n in refreshed))
-
-    def test_the_writers_clones_still_are(self) -> None:
-        patch, _calls = self._gate([_outcome(True)])
-        runner, _sc, wt = self._build()
-        with patch:
-            runner.run()
-        self.assertTrue(wt.seeded['build'])
 
     # ── whose setup reaches the shell ─────────────────────────────
 
@@ -14952,12 +14868,6 @@ class TestAVmThatNeverStartedIsRetriedApart(_Base):
         self.assertIn(f'launch 1 of {R._LAUNCH_ATTEMPTS}', said)
 
 
-def _with_cache(text: str, names: str = '[target]') -> str:
-    return text.replace(
-        'repo: ./proj\n', f'repo: ./proj\nbuild_cache: {names}\n', 1
-    )
-
-
 class TestAReviewerBuildsOnItsOwnDisk(_Base):
     """
     A reviewer builds on its VM's own disk, with or without a cache.
@@ -14979,23 +14889,13 @@ class TestAReviewerBuildsOnItsOwnDisk(_Base):
             'review-sec'
         )
 
-    def test_with_a_cache_the_mount_carries_no_seed(self) -> None:
-        result, workspace, _msg = self._reviewer(_with_cache(_LINEAR))
-        self.assertEqual(result.status, 'completed')
-        self.assertTrue(workspace.endswith('#ro'), workspace)
-
-    def test_with_a_cache_it_is_told_to_build_on_its_own_disk(self) -> None:
-        _r, _ws, msg = self._reviewer(_with_cache(_LINEAR))
-        self.assertIn('CARGO_TARGET_DIR=/tmp/review-target', msg)
-        self.assertNotIn('.seed-', msg)
-
     def test_without_a_cache_nothing_changes(self) -> None:
         _r, workspace, msg = self._reviewer(_LINEAR)
         self.assertTrue(workspace.endswith('#ro'), workspace)
         self.assertIn('CARGO_TARGET_DIR=/tmp/review-target', msg)
 
     def test_a_refactor_reviewer_is_told_too(self) -> None:
-        cfg = self._cfg(_with_cache(_JUDGE_REFACTOR))
+        cfg = self._cfg(_JUDGE_REFACTOR)
         r = R.PipelineRunner(
             cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
             run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
@@ -15009,102 +14909,65 @@ class TestAReviewerBuildsOnItsOwnDisk(_Base):
         self.assertIn('CARGO_TARGET_DIR=/tmp/review-target', msg)
 
 
-class TestTheCacheIsKeyedByTheRepository(_Base):
-    """Keyed by name alone, two same-named repositories shared one."""
+class TestAWriterIsToldWhereToBuild(_Base):
+    """
+    Every writer turn says to build on the VM's own disk (#144).
 
-    def _cache_dir(self, repo: str) -> str | None:
-        cfg = self._cfg(_with_cache(_LINEAR).replace(
-            'repo: ./proj\n', f'repo: {repo}\n', 1
-        ))
-        mgr = R._worktree_manager(
-            cfg, canonical_root='/can', worktree_root='/wt',
-            publish_token=None,
-        )
-        return mgr._build_cache_dir()
+    Live, both coders moved their builds off the mount on their own,
+    one after reading a truncated object there, and one filled its
+    fixed 20 GB disk, partly with a local coverage build the gate
+    recomputes anyway. Nothing in a writer's turn said where to build
+    or how much disk it had.
+    """
 
-    def test_same_named_repositories_do_not_share_one(self) -> None:
-        a = self._cache_dir('https://github.com/org-a/app.git')
-        b = self._cache_dir('https://github.com/org-b/app.git')
-        self.assertIsNotNone(a)
-        self.assertNotEqual(a, b)
-
-    def test_it_is_the_repositorys_key(self) -> None:
-        url = 'https://github.com/org-a/app.git'
-        self.assertEqual(
-            self._cache_dir(url),
-            str(Path('/can') / '_buildcache' / _repo_key(url)),
+    def _runner(self, text: str) -> R.PipelineRunner:
+        cfg = self._cfg(text)
+        return R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
         )
 
+    def _says_where(self, msg: str) -> None:
+        self.assertIn('CARGO_TARGET_DIR=$HOME/build-target', msg)
+        self.assertIn('20 GB', msg)
+        self.assertIn('coverage', msg)
 
-class TestReviewersAddNoHostWorktrees(_Base):
-    """A reviewer builds on its VM's disk, so a cache adds no host
-    worktree to the disk preflight."""
+    def test_an_implementer_is_told(self) -> None:
+        r = self._runner(_TDD_FULL)
+        self._says_where(r._writer_instruction(r._stage_by_id['build']))
 
-    def _trees_in_refusal(self, text: str) -> str:
-        with self.assertRaises(click.ClickException) as caught:
-            R.preflight_disk(self._cfg(text), usage=lambda _p: _Usage(0))
-        return caught.exception.format_message()
+    def test_a_test_writer_is_told(self) -> None:
+        r = self._runner(_TDD_FULL)
+        self._says_where(r._writer_instruction(r._stage_by_id['tests']))
 
-    def test_a_cache_adds_none(self) -> None:
-        self.assertIn('1 host worktree(s)', self._trees_in_refusal(_LINEAR))
-        self.assertIn(
-            '1 host worktree(s)', self._trees_in_refusal(_with_cache(_LINEAR))
+    def test_a_refactorer_is_told(self) -> None:
+        r = self._runner(_JUDGE_REFACTOR)
+        self._says_where(
+            r._writer_instruction(r._stage_by_id['refactor'])
         )
 
+    def test_a_fix_turn_is_told(self) -> None:
+        r = self._runner(_TDD_FULL)
+        self._says_where(r._fix_instruction('- a blocking finding'))
 
-class TestNoBuildCacheFlag(_Base):
-    """--no-build-cache turns the pipeline's build cache off for one
-    run, so every VM builds from clean without editing the file."""
+    def test_a_tests_only_redrive_is_told(self) -> None:
+        r = self._runner(_TDD_FULL)
+        self._says_where(r._tests_only_instruction('  - src/lib.rs'))
 
-    def _main(self, text: str, *flags: str):
-        cfg_path = self.root / 'pipeline.yaml'
-        cfg_path.write_text(text, encoding='utf-8')
-        with mock.patch.object(R, 'preflight_sbx'), \
-                mock.patch.object(R, 'preflight_disk') as disk, \
-                mock.patch.object(R, 'preflight_codex_auth'), \
-                mock.patch.object(R, 'preflight_codex_login'), \
-                mock.patch.object(R, '_drive') as drive:
-            res = CliRunner().invoke(
-                R.main,
-                [
-                    '-c', str(cfg_path),
-                    '--canonical-root', str(self.root / 'c'),
-                    '--worktree-root', str(self.root / 'w'),
-                    '--skip-agy-check',
-                    *flags,
-                ],
-            )
-        self.assertEqual(res.exit_code, 0, res.output)
-        return res, disk.call_args.args[0], drive.call_args.args[0]
-
-    def test_the_flag_turns_the_cache_off(self) -> None:
-        _res, _disk, driven = self._main(
-            _with_cache(_LINEAR), '--no-build-cache'
+    def test_a_reviewer_is_not(self) -> None:
+        # A reviewer has its own note, building in /tmp/review-target.
+        r = self._runner(_JUDGE_REFACTOR)
+        r._nodes['refactor'] = R.NodeResult(
+            'refactor', 'writer', branch='b/refactor'
         )
-        self.assertEqual(driven.build_cache, ())
+        msg = r._review_instruction(r._stage_by_id['review-r'])
+        self.assertNotIn('build-target', msg)
 
-    def test_the_disk_preflight_sees_it_off_too(self) -> None:
-        _res, checked, _driven = self._main(
-            _with_cache(_LINEAR), '--no-build-cache'
-        )
-        self.assertEqual(checked.build_cache, ())
-
-    def test_it_says_so(self) -> None:
-        res, _disk, _driven = self._main(
-            _with_cache(_LINEAR), '--no-build-cache'
-        )
-        self.assertIn('--no-build-cache', res.output)
-        self.assertIn('builds from clean', res.output)
-
-    def test_without_it_the_pipelines_cache_stands(self) -> None:
-        _res, _disk, driven = self._main(_with_cache(_LINEAR))
-        self.assertEqual(driven.build_cache, ('target',))
-
-    def test_with_no_cache_to_turn_off_it_is_silent(self) -> None:
-        res, _disk, driven = self._main(_LINEAR, '--no-build-cache')
-        self.assertEqual(driven.build_cache, ())
-        self.assertNotIn('--no-build-cache', res.output)
-
+    def test_a_reader_is_not(self) -> None:
+        r = self._runner(_TDD_FULL)
+        msg = r._reader_instruction(r._stage_by_id['plan'])
+        self.assertNotIn('build-target', msg)
 
 
 class TestTheGateHonoursTheOperatorsAllowlist(_Base):
