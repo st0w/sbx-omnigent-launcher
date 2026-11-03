@@ -7612,12 +7612,22 @@ class PipelineRunner:
         A fresh clone each round: a re-check after the human settled a
         dispute must not read a tree the last round's agent touched.
 
+        The clone is cut from the planner's own seed, so the check reads
+        exactly the tree the plan was written against: in every module,
+        every round, and on a resume that runs only the check. Its own
+        seed would be wrong in a campaign: a check is not seeded from
+        the campaign tip, and its only need is a planner, which has no
+        branch, so it fell back to the base branch. Live, a later
+        module's check then reported the earlier modules' work missing.
+
         :param check: The check stage.
         :param plan: The plan to check.
         :returns: Its disputes; empty when it found none.
         """
+        assert check.checks is not None
+        planner = self._stage_by_id[check.checks]
         wt = self._wt.create_node_worktree(
-            self._run_id, check.id, from_node=self._seed_from(check),
+            self._run_id, check.id, from_node=self._seed_from(planner),
             replace=True,
         )
         session = self._create_session(check.run[0], wt, 'ro', check.id)
