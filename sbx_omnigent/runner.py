@@ -36,10 +36,12 @@ import concurrent.futures
 import contextlib
 import fnmatch
 import functools
+import os
 import re
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -1264,6 +1266,19 @@ _FROZEN_TESTS_CONTRACT = (
 
 class PipelineRunError(Exception):
     """A pipeline run failed (setup, a turn, or a git step)."""
+
+
+class RunInterrupted(KeyboardInterrupt):
+    """
+    The run was interrupted (Ctrl-C), so nothing new may start.
+
+    Raised in a worker thread that tries to boot a VM or drive a turn
+    after the human pressed Ctrl-C. A :exc:`KeyboardInterrupt`, so the
+    retry handlers, which catch :class:`PipelineRunError` and
+    :class:`SwarmSessionError`, let it through: a worker whose session
+    teardown just disposed must not read that as a lost turn and boot a
+    fresh VM to try again.
+    """
 
 
 class LostTurn(PipelineRunError):
@@ -3660,6 +3675,13 @@ class PipelineRunner:
         #: is re-driven twice does not overwrite its own first record.
         self._captures: dict[str, int] = {}
         self._driven: set[str] = set()
+        #: Set on Ctrl-C. Only the main thread sees the interrupt; the
+        #: workers of a parallel stage read this before booting a VM or
+        #: driving a turn, and stop instead.
+        self._interrupted = threading.Event()
+        #: Sessions with a turn running now, so an interrupt can keep
+        #: what each one was doing before teardown deletes it.
+        self._in_turn: set[str] = set()
         self._bindings: list[dict[str, str]] = []
         self._last_branch_node: str | None = None
         #: The approved, consolidated plan of record (planner's final
@@ -6542,10 +6564,12 @@ class PipelineRunner:
             f'{", ".join(n for n, _ in nodes)} at the same time.'
         )
         failures: list[tuple[str, BaseException]] = []
-        with concurrent.futures.ThreadPoolExecutor(
+        pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=min(len(nodes), _MAX_PARALLEL_NODES),
             thread_name_prefix=f'node-{label}',
-        ) as pool:
+        )
+        interrupted = False
+        try:
             futures = {
                 pool.submit(run): node_id
                 for node_id, run in nodes
@@ -6555,11 +6579,55 @@ class PipelineRunner:
                     future.result()
                 except BaseException as exc:
                     failures.append((futures[future], exc))
+        except KeyboardInterrupt:
+            # Only this thread sees Ctrl-C. Waiting for the workers here
+            # meant waiting out every turn in the stage, up to the turn
+            # timeout, before anything stopped. Stop now: keep what each
+            # turn was doing, start nothing new, and leave the VMs to
+            # teardown, which runs as this propagates.
+            interrupted = True
+            self._interrupted.set()
+            click.echo(
+                f'[interrupt] {label}: stopping now, without waiting for '
+                f'the turns still running.',
+                err=True,
+            )
+            self._capture_interrupted_turns()
+            raise
+        finally:
+            pool.shutdown(wait=not interrupted, cancel_futures=interrupted)
         if not failures:
             return
         for node_id, exc in failures[1:]:
             click.echo(f'[parallel] {label}: {node_id} also failed: {exc}')
         raise failures[0][1]
+
+    def _capture_interrupted_turns(self) -> None:
+        """
+        Keep the record of every turn still running at Ctrl-C.
+
+        The workers driving them never see the interrupt, so their own
+        capture never runs, and teardown is about to delete the
+        sessions. A second Ctrl-C stops this too.
+        """
+        with self._lock:
+            running = sorted(self._in_turn)
+        for session in running:
+            self._capture_turn(
+                session, 'interrupted (Ctrl-C) mid-turn', with_pane=True
+            )
+
+    def _refuse_if_interrupted(self, label: str) -> None:
+        """
+        Start nothing once the run has been interrupted.
+
+        :param label: The node about to boot a VM or drive a turn.
+        :raises RunInterrupted: When Ctrl-C has been pressed.
+        """
+        if self._interrupted.is_set():
+            raise RunInterrupted(
+                f'{label}: the run was interrupted, so nothing new starts'
+            )
 
     def _forfeit_blocked_reviews(
         self,
@@ -9832,6 +9900,7 @@ class PipelineRunner:
         mode: str,
         label: str,
     ) -> str:
+        self._refuse_if_interrupted(label)
         agent = self._config.agents[agent_name]
         is_agy = agent.harness in agy.AGY_HARNESSES
         session = self._sc.create(
@@ -9888,6 +9957,9 @@ class PipelineRunner:
         :returns: The assistant's reply.
         :raises PipelineRunError: If the turn failed.
         """
+        self._refuse_if_interrupted(
+            self._session_label.get(session, session)
+        )
         is_agy = session in self._agy_sessions
         # agy drops a multi-line paste before it renders AND collapses
         # an over-long paste into an unsubmittable placeholder — so an
@@ -9907,6 +9979,8 @@ class PipelineRunner:
             )
         first_turn = session not in self._driven
         self._driven.add(session)
+        with self._lock:
+            self._in_turn.add(session)
         try:
             result = self._sc.send_and_wait(
                 session,
@@ -9943,6 +10017,9 @@ class PipelineRunner:
                 with_pane=True,
             )
             raise
+        finally:
+            with self._lock:
+                self._in_turn.discard(session)
         if first_turn and result.ok:
             # AFTER the first turn, not at create: the TUI has not
             # finished drawing when a session is created, so the pane
@@ -12387,8 +12464,34 @@ def main(
             no_auto_approve=no_auto_approve,
             gate_egress=operator_egress,
         )
+    except KeyboardInterrupt:
+        interrupted = True
+    else:
+        interrupted = False
     finally:
         stop_harvester(harvester)
+    if interrupted:
+        # Teardown has run and the harvester is stopped. A worker of a
+        # parallel stage can still be inside a turn's HTTP wait, and the
+        # interpreter would join it before exiting, which is the wait
+        # Ctrl-C is meant to skip.
+        click.echo(
+            '[interrupt] stopped. --resume continues from the last '
+            'completed stage.',
+            err=True,
+        )
+        _exit_now(130)
+
+
+def _exit_now(code: int) -> None:
+    """
+    End the process without waiting for any thread.
+
+    :param code: The exit status; 130 for Ctrl-C, by shell convention.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
 
 
 def _worktree_manager(
