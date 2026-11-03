@@ -662,7 +662,7 @@ All keys live under `sandbox:` in your server config.
 | --- | --- | --- |
 | `provider` | yes | Must be `sbx`. |
 | `server_url` | yes | URL the microVM dials back to. Local server → `http://host.docker.internal:<port>`. |
-| `sbx.image` | no | Boot image. Default `ghcr.io/omnigent-ai/omnigent-host:latest`. **Pin to match your server version.** |
+| `sbx.image` | no | Boot image. Default `ghcr.io/omnigent-ai/omnigent-host:latest`. **Pin to match your server version.** A server started with `--pipeline` for a pipeline with `image:` boots that pipeline's image instead (see [docs/PIPELINES.md](docs/PIPELINES.md#a-prebuilt-toolchain-image)). |
 | `sbx.profile` | no | `sbx` governance profile (least privilege). Manage with `sbx policy`. |
 | `sbx.cpus` | no | CPU cap per sandbox (positive int). |
 | `sbx.memory` | no | Memory cap per sandbox, e.g. `8g`. |

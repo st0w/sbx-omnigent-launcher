@@ -548,6 +548,16 @@ class TestSandboxResources(unittest.TestCase):
         self.assertEqual(argv[argv.index('--cpus') + 1], '4')
         self.assertEqual(argv[argv.index('--memory') + 1], '8g')
 
+    def test_a_local_template_is_not_pulled(self) -> None:
+        argv = create_command('v', '/ws', image='localhost/omni-sbx-p:01')
+        self.assertEqual(
+            argv[argv.index('--pull'):argv.index('--pull') + 2],
+            ['--pull', 'never'],
+        )
+
+    def test_a_registry_image_is_pulled_as_before(self) -> None:
+        self.assertNotIn('--pull', create_command('v', '/ws', image='img'))
+
     def test_unset_leaves_sbx_defaults_alone(self) -> None:
         argv = create_command('v', '/ws', image='img')
         self.assertNotIn('--cpus', argv)

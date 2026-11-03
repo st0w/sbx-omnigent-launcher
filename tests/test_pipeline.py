@@ -802,6 +802,132 @@ _CHECK_STAGES = """\
 """
 
 
+_IMAGE = """\
+image:
+  from: ghcr.io/omnigent-ai/omnigent-host:v0.20.0
+  setup: |
+    apt-get update
+    apt-get install -y build-essential
+"""
+
+
+class TestAPipelineImage(_Base):
+    """`image:` declares the toolchain once, built into a local template
+    every agent sandbox and the gate boot from (#38)."""
+
+    def _with(self, block: str) -> P.PipelineConfig:
+        return self._load(_FULL + block)
+
+    def _refused(self, block: str) -> str:
+        with self.assertRaises(P.PipelineError) as caught:
+            self._with(block)
+        return str(caught.exception)
+
+    def test_absent_means_no_image(self) -> None:
+        cfg = self._load(_FULL)
+        self.assertIsNone(cfg.image)
+        self.assertIsNone(P.image_tag(cfg))
+
+    def test_from_and_setup_parse(self) -> None:
+        image = self._with(_IMAGE).image
+        assert image is not None
+        self.assertEqual(
+            image.base, 'ghcr.io/omnigent-ai/omnigent-host:v0.20.0'
+        )
+        self.assertIn('apt-get install -y build-essential', image.setup)
+
+    def test_resources_are_optional(self) -> None:
+        image = self._with(_IMAGE).image
+        assert image is not None
+        self.assertIsNone(image.cpus)
+        self.assertIsNone(image.memory)
+        self.assertEqual(image.timeout_s, 3600.0)
+
+    def test_resources_parse(self) -> None:
+        image = self._with(
+            _IMAGE + '  cpus: 4\n  memory: 8g\n  timeout: 2400\n'
+        ).image
+        assert image is not None
+        self.assertEqual(
+            (image.cpus, image.memory, image.timeout_s), (4, '8g', 2400.0)
+        )
+
+    def test_not_a_mapping_is_refused(self) -> None:
+        self.assertIn('image', self._refused('image: some-image:tag\n'))
+
+    def test_from_is_required(self) -> None:
+        message = self._refused('image:\n  setup: apt-get update\n')
+        self.assertIn('image.from', message)
+
+    def test_setup_is_required(self) -> None:
+        for setup in ('', '"   "'):
+            with self.subTest(setup=setup):
+                message = self._refused(
+                    'image:\n  from: base:1\n  setup: ' + setup + '\n'
+                )
+                self.assertIn('image.setup', message)
+
+    def test_an_unknown_key_is_refused(self) -> None:
+        # `base:` for `from:` would otherwise leave a recipe that
+        # silently has no base.
+        message = self._refused(_IMAGE + '  base: other:1\n')
+        self.assertIn("'base'", message)
+
+    def test_bad_resources_are_refused(self) -> None:
+        for extra, key in (
+            ('  cpus: 0\n', 'image.cpus'),
+            ('  cpus: true\n', 'image.cpus'),
+            ('  memory: ""\n', 'image.memory'),
+            ('  timeout: 0\n', 'image.timeout'),
+            ('  timeout: soon\n', 'image.timeout'),
+        ):
+            with self.subTest(extra=extra):
+                self.assertIn(key, self._refused(_IMAGE + extra))
+
+    def test_verify_image_beside_it_is_refused(self) -> None:
+        # Two images for the gate: which one it boots would be a guess.
+        text = _FULL.replace(
+            'stages:\n',
+            'verify:\n  command: make test\n  image: other:1\n'
+            'stages:\n',
+        ) + _IMAGE
+        with self.assertRaises(P.PipelineError) as caught:
+            self._load(text)
+        self.assertIn('verify.image', str(caught.exception))
+
+    # ── the tag ───────────────────────────────────────────────────
+
+    def test_the_tag_is_a_local_template_name(self) -> None:
+        tag = P.image_tag(self._with(_IMAGE))
+        assert tag is not None
+        self.assertRegex(
+            tag, r'^localhost/omni-sbx-mixed-models:[0-9a-f]{16}$'
+        )
+
+    def test_the_tag_is_stable(self) -> None:
+        self.assertEqual(
+            P.image_tag(self._with(_IMAGE)), P.image_tag(self._with(_IMAGE))
+        )
+
+    def test_the_tag_changes_with_the_recipe(self) -> None:
+        base = P.image_tag(self._with(_IMAGE))
+        for old, new in (
+            ('v0.20.0', 'v0.19.1'),
+            ('build-essential', 'build-essential jq'),
+        ):
+            with self.subTest(change=new):
+                self.assertNotEqual(
+                    P.image_tag(self._with(_IMAGE.replace(old, new))), base
+                )
+
+    def test_the_tag_ignores_build_resources(self) -> None:
+        # How much CPU the build gets does not change what it builds.
+        self.assertEqual(
+            P.image_tag(self._with(_IMAGE + '  cpus: 8\n  timeout: 900\n')),
+            P.image_tag(self._with(_IMAGE)),
+        )
+
+
 class TestAContractCheckStage(_Base):
     """`checks:` declares a read-only check of a tests stage (#50).
 

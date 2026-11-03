@@ -413,7 +413,8 @@ def create_command(
     """
     argv = [
         'sbx', 'create', 'shell', workspace,
-        '--template', image, '--name', name, '--quiet',
+        '--template', image, *sbx_cli.pull_args(image),
+        '--name', name, '--quiet',
     ]
     if cpus is not None:
         argv += ['--cpus', str(cpus)]

@@ -152,6 +152,16 @@ class TestCreateSandboxCommand(unittest.TestCase):
             ],
         )
 
+    def test_a_local_template_is_not_pulled(self) -> None:
+        cmd = SbxLauncher(
+            image='localhost/omni-sbx-p:0123456789abcdef'
+        )._create_sandbox_command('box', ['/w'])
+        self.assertEqual(
+            cmd[4:8],
+            ['--template', 'localhost/omni-sbx-p:0123456789abcdef',
+             '--pull', 'never'],
+        )
+
     def test_reviewer_ro_suffix_is_literal_arg(self) -> None:
         cmd = SbxLauncher(image='img:1')._create_sandbox_command(
             'box', ['/scratch', '/srv/worktrees/a:ro']

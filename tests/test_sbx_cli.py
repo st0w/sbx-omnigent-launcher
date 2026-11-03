@@ -231,5 +231,25 @@ class TestRequireResponsive(unittest.TestCase):
         self.assertIn('sbx login', message)
 
 
+class TestLocalTemplatesAreNeverPulled(unittest.TestCase):
+    """A ``localhost/`` template exists only in sbx's local store; the
+    default pull policy would go looking for it in a registry (#38)."""
+
+    def test_a_local_template_is_booted_without_pulling(self) -> None:
+        self.assertEqual(
+            sbx_cli.pull_args('localhost/omni-sbx-demo:0123'),
+            ['--pull', 'never'],
+        )
+
+    def test_a_registry_image_keeps_sbxs_policy(self) -> None:
+        for ref in (
+            'ghcr.io/omnigent-ai/omnigent-host:v0.20.0',
+            'img:1',
+            'docker.io/localhost/x:1',
+        ):
+            with self.subTest(ref=ref):
+                self.assertEqual(sbx_cli.pull_args(ref), [])
+
+
 if __name__ == '__main__':
     unittest.main()
