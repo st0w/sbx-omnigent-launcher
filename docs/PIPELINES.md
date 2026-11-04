@@ -1384,9 +1384,30 @@ who raised each one. They are never filed as issues or added to the findings
 ledger. If a check needs a refused host, add the host to
 `sandbox.sbx.egress_allow` and declare it under `egress:`.
 
-The block is never for the build or the test suite. A reviewer that couldn't
-run those couldn't verify, and still has to return `VERDICT: BLOCKING`. A check
-listed there wasn't run, so no approval rests on it.
+The block is never for the build or the test suite. A check listed there wasn't
+run, so no approval rests on it.
+
+**When the environment stops the build or the tests, the reviewer can't
+verify, and says so with `VERDICT: UNVERIFIED`.** That's for a toolchain it
+couldn't install, a dependency failing to build before any of the branch's own
+code compiles, or a host the sandbox refuses, with no defect found in the code.
+A compile error in the branch's own code is a defect, and still
+`VERDICT: BLOCKING`.
+
+These used to be `BLOCKING`, and every block re-drives the writer. Live,
+reviewers blocked because cargo was unavailable or a cached dependency object
+was empty. The coder, handed that, found nothing to fix and changed a deferred
+item instead, and the next round found a defect in that change.
+
+`UNVERIFIED` is handled like a reviewer that states no verdict. It never
+approves:
+- **If nobody blocked,** the reviewers run again on fresh VMs, and the writer
+  isn't driven.
+- **If a review still can't verify after the retries,** the run stops, and the
+  console prints what stopped each reviewer. Fix the environment (toolchain,
+  image, egress), then `--resume`.
+- **Beside a `BLOCKING` reviewer,** only the blocker's report goes to the
+  writer.
 
 ### Polyglot repos: delegate to the repo
 
