@@ -1035,6 +1035,95 @@ stages:
 """
 
 
+class TestAnUnverifiedReviewGoesBackToTheReviewers(_Base):
+    """
+    A review the environment stopped is not a finding for the writer.
+
+    Live (k8s-clusters-1, k1), reviewers blocked because cargo was
+    unavailable, or a dependency object from the build cache was empty,
+    and named no defect in the code. Every block re-drives the writer,
+    so the coder found nothing to fix and changed a deferred item
+    instead, and the next round found a defect in that change.
+    """
+
+    _UNVERIFIED = (
+        'The build failed in aws-smithy-http before any of this branch '
+        'compiled: memory map must have a non-zero length. No defect '
+        'found in the code I could read.\n\nVERDICT: UNVERIFIED'
+    )
+    _BLOCKED = (
+        'providers/k8s/src/lib.rs:537 formats two edges to one id.\n\n'
+        'VERDICT: BLOCKING'
+    )
+
+    def _go(self, text, replies):
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            result, sc, wt = self._run(text, replies)
+        printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
+        return result, sc, wt, printed
+
+    def test_it_is_parsed(self) -> None:
+        self.assertEqual(
+            R.parse_verdict('VERDICT: UNVERIFIED'), 'UNVERIFIED'
+        )
+        self.assertEqual(
+            R.parse_verdict('VERDICT: UNVERIFIED\nVERDICT: BLOCKING'),
+            'BLOCKING',
+        )
+
+    def test_the_reviewers_run_again_not_the_writer(self) -> None:
+        result, sc, _wt, _p = self._go(_LINEAR, {
+            'plan': 'PLAN', 'build': 'b',
+            'review-sec': [self._UNVERIFIED, 'VERDICT: APPROVED'],
+        })
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(len(_messages_for(sc, 'build')), 1)
+        self.assertEqual(len(_messages_for(sc, 'review-sec')), 2)
+
+    def test_it_never_approves(self) -> None:
+        result, sc, _wt, printed = self._go(_LINEAR, {
+            'plan': 'PLAN', 'build': 'b', 'review-sec': self._UNVERIFIED,
+        })
+        self.assertEqual(result.status, 'blocked')
+        self.assertEqual(len(_messages_for(sc, 'build')), 1)
+        self.assertIn('could not verify', printed)
+        self.assertIn('memory map must have a non-zero length', printed)
+
+    def test_beside_a_blocker_only_the_blockers_report_goes(self) -> None:
+        _r, sc, _wt, _p = self._go(_TWO_REVIEWERS, {
+            'build': 'b',
+            'review-sec': [self._BLOCKED, 'VERDICT: APPROVED'],
+            'review-bugs': [self._UNVERIFIED, 'VERDICT: APPROVED'],
+        })
+        fix = _messages_for(sc, 'build')[1]
+        self.assertIn('formats two edges to one id', fix)
+        self.assertNotIn('aws-smithy-http', fix)
+
+    def test_every_review_turn_offers_it(self) -> None:
+        _r, sc, _wt, _p = self._go(_LINEAR, {
+            'plan': 'PLAN', 'build': 'b', 'review-sec': 'VERDICT: APPROVED',
+        })
+        self.assertIn(
+            'VERDICT: UNVERIFIED', sc.message_for_label('review-sec')
+        )
+
+    def test_a_refactor_review_offers_it(self) -> None:
+        cfg = self._cfg(_JUDGE_REFACTOR)
+        r = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        r._nodes['refactor'] = R.NodeResult(
+            'refactor', 'writer', branch='b/refactor'
+        )
+        msg = r._review_instruction(r._stage_by_id['review-r'])
+        self.assertIn('VERDICT: UNVERIFIED', msg)
+
+    def test_the_verdict_nudge_offers_it(self) -> None:
+        self.assertIn('VERDICT: UNVERIFIED', R._VERDICT_NUDGE)
+
+
 class TestCoverageCannotBeSuppressed(_Base):
     """
     A writer may not buy the coverage gate with exclusion markers.

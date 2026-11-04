@@ -198,6 +198,11 @@ _BLOCK_WORDS = frozenset({
     'REJECT', 'REJECTED',
 })
 
+#: A reviewer the ENVIRONMENT stopped from building or running the
+#: tests, with no defect found in the code. Never an approval; it goes
+#: back to the reviewers, not the writer, who cannot fix the sandbox.
+_UNVERIFIED = 'UNVERIFIED'
+
 #: Default max review rounds before a gate gives up (blocked).
 _DEFAULT_MAX_ROUNDS = 3
 
@@ -688,10 +693,12 @@ _LAUNCH_ATTEMPTS = 3
 _VERDICT_NUDGE = (
     'You ended your turn without a verdict line. Reply with NOTHING but '
     'your verdict now, on one line: `VERDICT: APPROVED` if the change '
-    'meets the contract and you verified it, or `VERDICT: BLOCKING` '
+    'meets the contract and you verified it; `VERDICT: BLOCKING` '
     'followed by the specific findings — including "I could not finish '
-    'verifying", if that is what happened. Do not resume reviewing; just '
-    'state where you got to.'
+    'verifying", if that is what happened; or `VERDICT: UNVERIFIED` '
+    'followed by what stopped you, if the environment, not the code, '
+    'stopped the build or the tests and you found no defect. Do not '
+    'resume reviewing; just state where you got to.'
 )
 
 
@@ -912,9 +919,10 @@ _ENVIRONMENT_ASK = (
     'if one was refused. Each is recorded once for this review stage and '
     'shown on the pull request; it is not filed as a finding, so do not '
     'repeat it under `DEFECTS:`. This block is NEVER for the build or the '
-    'test suite: if those could not run, you could not verify, and your '
-    'verdict is `VERDICT: BLOCKING`. A check listed here was not run, so '
-    'nothing in your verdict may rest on it.'
+    'test suite: if the environment stopped those, you could not '
+    'verify, and your verdict is `VERDICT: UNVERIFIED`, never an '
+    'approval. A check listed here was not run, so nothing in your '
+    'verdict may rest on it.'
 )
 
 #: What a reviewer must NOT re-run, and why it is not its job.
@@ -958,9 +966,17 @@ _REVIEW_VERIFY = (
     'return `VERDICT: '
     'APPROVED` on a change you could not execute, and "the code looks '
     'correct" is not a substitute for running it. If you could not '
-    'verify, return `VERDICT: BLOCKING` and say exactly what stopped '
-    'you. An empty or placeholder implementation that merely '
-    'compiles-by-absence is a BLOCKING finding.'
+    'verify, say exactly what stopped you, and pick the verdict by WHAT '
+    'stopped you. A defect in this branch, including its own code '
+    'failing to compile, is `VERDICT: BLOCKING`. The ENVIRONMENT — a '
+    'toolchain you could not install, a dependency failing to build '
+    "before any of this branch's code compiles, a host the sandbox "
+    'refuses — with no defect found in the code, is `VERDICT: '
+    'UNVERIFIED`. That is never an approval: the review runs again on a '
+    'fresh VM, and the run stops for a human if it still cannot verify. '
+    'It is not sent to the writer, who cannot fix the sandbox. An empty '
+    'or placeholder implementation that merely compiles-by-absence is a '
+    'BLOCKING finding.'
 )
 
 #: A verdict is a release decision, not a weighted opinion.
@@ -1012,9 +1028,11 @@ _REVIEW_SETTLED = (
 
 _REVIEW_VERDICT_LINE = (
     '\n\nEnd your reply with a single verdict line, using one of these '
-    'two exact tokens: `VERDICT: APPROVED` (the change meets the '
-    'contract, and you verified it) or `VERDICT: BLOCKING` (it does '
-    'not, or you could not verify).'
+    'three exact tokens: `VERDICT: APPROVED` (the change meets the '
+    'contract, and you verified it), `VERDICT: BLOCKING` (it does not, '
+    'or you could not finish verifying it), or `VERDICT: UNVERIFIED` '
+    '(the environment stopped the build or the tests, and you found no '
+    'defect in the code).'
 )
 
 #: How a REVIEWER reports a contract that cannot be satisfied.
@@ -1395,6 +1413,18 @@ def _single_line(text: str) -> str:
     return ' '.join(text.split())
 
 
+def _excerpt(text: str, limit: int = 600) -> str:
+    """
+    One line of *text*, its whitespace collapsed, cut to *limit*.
+
+    :param text: A report.
+    :param limit: Most characters kept.
+    :returns: The excerpt, ``…``-terminated when cut.
+    """
+    flat = ' '.join(text.split())
+    return flat if len(flat) <= limit else f'{flat[: limit - 1]}…'
+
+
 def parse_verdict(text: str | None) -> str | None:
     """
     Return the LAST recognized ``VERDICT:`` value, normalized, or None.
@@ -1402,14 +1432,15 @@ def parse_verdict(text: str | None) -> str | None:
     Each token after a ``VERDICT:`` marker is mapped to the canonical
     ``'APPROVED'`` / ``'BLOCKING'`` via :data:`_APPROVE_WORDS` /
     :data:`_BLOCK_WORDS`, so a paraphrased ``VERDICT: PASS`` reads as an
-    approval. The last *recognized* token wins; an unknown token (e.g.
-    a stray ``verdict:`` mention) is ignored rather than clobbering a
-    real verdict. No recognized verdict yields ``None`` — the caller
+    approval. ``UNVERIFIED`` stays itself (see :data:`_UNVERIFIED`).
+    The last *recognized* token wins; an unknown token (e.g. a stray
+    ``verdict:`` mention) is ignored rather than clobbering a real
+    verdict. No recognized verdict yields ``None`` — the caller
     treats that as blocking (safe).
 
     :param text: An agent reply.
-    :returns: ``'APPROVED'`` / ``'BLOCKING'``, or ``None`` when absent
-        or unrecognized.
+    :returns: ``'APPROVED'`` / ``'BLOCKING'`` / ``'UNVERIFIED'``, or
+        ``None`` when absent or unrecognized.
     """
     result: str | None = None
     for token in _VERDICT_RE.findall(text or ''):
@@ -1418,6 +1449,8 @@ def parse_verdict(text: str | None) -> str | None:
             result = 'APPROVED'
         elif upper in _BLOCK_WORDS:
             result = 'BLOCKING'
+        elif upper == _UNVERIFIED:
+            result = _UNVERIFIED
     return result
 
 
@@ -8833,7 +8866,7 @@ class PipelineRunner:
         # reads as six independent first rounds rather than one block
         # and the re-reviews that followed — and collided the run-dir
         # filenames, so each re-review overwrote the last.
-        silent_rounds = 0
+        inconclusive_rounds = 0
         while True:
             outputs: dict[str, str] = {}
             verdicts: dict[str, str | None] = {}
@@ -8890,7 +8923,14 @@ class PipelineRunner:
             # and was right.
             blocking = [r for r, v in verdicts.items() if v == 'BLOCKING']
             silent = [r for r, v in verdicts.items() if v is None]
-            if not blocking and not silent:
+            # The environment stopped these, not the code. Like
+            # silence, it is no finding the writer can act on: live, a
+            # coder handed "cargo is unavailable" changed a deferred
+            # item instead, and the next round found a defect in it.
+            unverified = [
+                r for r, v in verdicts.items() if v == _UNVERIFIED
+            ]
+            if not blocking and not silent and not unverified:
                 self._nodes[stage.id] = NodeResult(
                     stage.id, 'review', verdict='APPROVED'
                 )
@@ -8902,31 +8942,56 @@ class PipelineRunner:
             if not blocking:
                 # Nobody objected; the review simply did not conclude.
                 # Retry the REVIEWERS, not the writer.
-                silent_rounds += 1
-                if silent_rounds <= _MAX_SILENT_REVIEW_ROUNDS:
+                inconclusive_rounds += 1
+                if inconclusive_rounds <= _MAX_SILENT_REVIEW_ROUNDS:
+                    why = '; '.join(
+                        part for part in (
+                            f'{", ".join(silent)} stated no verdict'
+                            if silent else '',
+                            f'{", ".join(unverified)} could not verify '
+                            f'(the environment, not the code)'
+                            if unverified else '',
+                        ) if part
+                    )
                     click.echo(
-                        f'[review] {stage.id}: {", ".join(silent)} '
-                        f'stated no verdict and nobody blocked — '
-                        f're-running the review rather than re-driving '
-                        f'{stage.on_block or "the writer"} over findings '
-                        f'that do not exist '
-                        f'({silent_rounds}/{_MAX_SILENT_REVIEW_ROUNDS}).'
+                        f'[review] {stage.id}: {why}, and nobody blocked '
+                        f'— re-running the review on fresh VMs rather '
+                        f'than re-driving {stage.on_block or "the writer"} '
+                        f'over findings that do not exist '
+                        f'({inconclusive_rounds}/'
+                        f'{_MAX_SILENT_REVIEW_ROUNDS}).'
                     )
                     continue
+                if unverified:
+                    reasons = '\n'.join(
+                        f'  {r}: {_excerpt(outputs.get(r, ""))}'
+                        for r in unverified
+                    )
+                    click.echo(
+                        f'[review] {stage.id}: {", ".join(unverified)} '
+                        f'could not verify the branch, across '
+                        f'{_MAX_SILENT_REVIEW_ROUNDS + 1} attempts: the '
+                        f'environment stopped the build or the tests, '
+                        f'and no defect was found. Blocking the run — the '
+                        f'writer cannot fix the sandbox. Fix the '
+                        f'environment (toolchain, image, egress) and '
+                        f'--resume. What stopped them:\n{reasons}'
+                    )
                 # Out of retries. Silence is still BLOCKING — the
                 # safe default is intact — but it blocks the RUN. It
                 # must never re-drive the writer, because there is
                 # nothing to hand it: relaying narration that names no
                 # defect, file, line or assertion is precisely the harm
                 # this separation exists to stop.
-                click.echo(
-                    f'[review] {stage.id}: {", ".join(silent)} never '
-                    f'stated a verdict, across '
-                    f'{_MAX_SILENT_REVIEW_ROUNDS + 1} attempts. Blocking '
-                    f'— a review that did not conclude is not a finding '
-                    f'anyone can act on. Their reports are in the run '
-                    f'directory.'
-                )
+                if silent:
+                    click.echo(
+                        f'[review] {stage.id}: {", ".join(silent)} never '
+                        f'stated a verdict, across '
+                        f'{_MAX_SILENT_REVIEW_ROUNDS + 1} attempts. '
+                        f'Blocking — a review that did not conclude is '
+                        f'not a finding anyone can act on. Their reports '
+                        f'are in the run directory.'
+                    )
                 self._nodes[stage.id] = NodeResult(
                     stage.id, 'review', verdict='BLOCKING'
                 )

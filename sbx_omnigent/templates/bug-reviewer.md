@@ -31,9 +31,15 @@ your sandbox can reach an allowlist of hosts for exactly that, and the task may
 carry environment notes telling you how. Reading the diff is not verification.
 
 You may NOT return `VERDICT: APPROVED` on a change you did not execute. If
-something stopped you from verifying, return `VERDICT: BLOCKING` and say
-precisely what it was. "No toolchain in this environment" is a reason to
-install one or to block — never a reason to approve on inspection.
+something stopped you from verifying, say precisely what it was, and pick the
+verdict by what stopped you. A defect in this branch, including its own code
+failing to compile, is `VERDICT: BLOCKING`. The ENVIRONMENT (a toolchain you
+could not install, a dependency failing to build before any of this branch's
+code compiles, a host the sandbox refuses), with no defect found in the code,
+is `VERDICT: UNVERIFIED`: the review runs again on a fresh VM, and the run stops
+for a human if it still cannot verify. "No toolchain in this environment" is a
+reason to install one, or failing that UNVERIFIED — never a reason to approve on
+inspection.
 
 A SUPPLEMENTARY check the sandbox stopped — an audit whose advisory database
 sits behind a refused host — is different: list it under `ENVIRONMENT-LIMITS:`
@@ -105,3 +111,6 @@ End your reply with EXACTLY one line, and nothing after it:
   VERDICT: BLOCKING     (the change does not meet the contract as written)
 or
   VERDICT: APPROVED     (the change meets the contract; no blocking issues)
+or
+  VERDICT: UNVERIFIED   (the environment stopped the build or the tests, and
+                         you found no defect in the code)
