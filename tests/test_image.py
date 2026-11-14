@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import tempfile
@@ -12,7 +14,7 @@ import unittest
 from collections.abc import Sequence
 from unittest import mock
 
-from sbx_omnigent import image, sbx_cli
+from sbx_omnigent import claude_plugins, image, sbx_cli
 from sbx_omnigent.pipeline import ImageSpec
 
 _TAG = 'localhost/omni-sbx-demo:0123456789abcdef'
@@ -255,6 +257,86 @@ class TestTheServerPublishesItsAgentImage(unittest.TestCase):
                     fh.write(text)
                 with self.assertRaises(image.ImageError):
                     image.read_agent_image(self.root)
+
+
+class TestPluginsAreInstalledFromTheHost(unittest.TestCase):
+    """``image.claude_plugins`` are copied from the host's install and
+    installed from a local marketplace, after the setup, with no
+    network access (the VMs can't reach the marketplaces' hosts)."""
+
+    _ID = 'claude-security@claude-plugins-official'
+
+    def setUp(self) -> None:
+        self.home = tempfile.mkdtemp(prefix='img-plugin-home-')
+        self.addCleanup(shutil.rmtree, self.home, True)
+        plugins = os.path.join(self.home, '.claude', 'plugins')
+        install = os.path.join(
+            plugins, 'cache', 'claude-plugins-official', 'claude-security',
+            '0.12.0',
+        )
+        os.makedirs(os.path.join(install, 'skills'))
+        with open(os.path.join(install, 'skills', 'SKILL.md'), 'w') as fh:
+            fh.write('scan things\n')
+        with open(os.path.join(plugins, 'installed_plugins.json'), 'w') as fh:
+            json.dump({'version': 2, 'plugins': {self._ID: [
+                {'installPath': install, 'version': '0.12.0'},
+            ]}}, fh)
+        patcher = mock.patch(
+            'pathlib.Path.home', return_value=pathlib.Path(self.home)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.spec = dataclasses.replace(_SPEC, claude_plugins=(self._ID,))
+
+    def test_they_are_copied_added_and_installed_after_setup(self) -> None:
+        sbx = _FakeSbx()
+        _build(sbx, egress=(), spec=self.spec)
+        setup = next(
+            i for i, c in enumerate(sbx.calls)
+            if c[1] == 'exec' and any('set -e' in a for a in c)
+        )
+        staged = f'/root/{claude_plugins.STAGED_MARKETPLACE}'
+        copy = sbx.calls[setup + 1]
+        self.assertEqual(copy[:2], ['sbx', 'cp'])
+        self.assertTrue(copy[2].endswith(claude_plugins.STAGED_MARKETPLACE))
+        self.assertEqual(copy[3], f'{_BOX}:/root/')
+        self.assertEqual(
+            sbx.calls[setup + 2],
+            ['sbx', 'exec', _BOX, '--', 'claude', 'plugin', 'marketplace',
+             'add', staged],
+        )
+        self.assertEqual(
+            sbx.calls[setup + 3],
+            ['sbx', 'exec', _BOX, '--', 'claude', 'plugin', 'install',
+             f'claude-security@{claude_plugins.STAGED_MARKETPLACE}'],
+        )
+        self.assertEqual(sbx.calls[setup + 4][:2], ['sbx', 'stop'])
+
+    def test_a_failed_install_fails_the_build_and_saves_nothing(
+        self,
+    ) -> None:
+        sbx = _FakePluginInstallFails()
+        with self.assertRaises(image.ImageError) as caught:
+            _build(sbx, egress=(), spec=self.spec)
+        self.assertIn('claude-security', str(caught.exception))
+        self.assertNotIn(['template', 'save'], [c[1:3] for c in sbx.calls])
+        self.assertEqual(sbx.calls[-1], ['sbx', 'rm', '--force', _BOX])
+
+    def test_without_plugins_nothing_is_copied(self) -> None:
+        sbx = _FakeSbx()
+        _build(sbx, egress=())
+        self.assertNotIn('cp', [c[1] for c in sbx.calls])
+
+
+class _FakePluginInstallFails(_FakeSbx):
+    """An ``sbx`` whose ``claude plugin install`` exits non-zero."""
+
+    def __call__(self, argv, **kwargs):
+        command = list(argv)
+        if command[1] == 'exec' and 'install' in command:
+            self.calls.append(command)
+            return subprocess.CompletedProcess(command, 1, '', 'not found')
+        return super().__call__(argv, **kwargs)
 
 
 class _Builds:

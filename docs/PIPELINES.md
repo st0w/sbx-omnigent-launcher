@@ -859,7 +859,27 @@ image:
   cpus: 4                      # optional — the build sandbox's size
   memory: 8g                   # optional
   timeout: 3600                # optional — seconds the setup may run (default 3600)
+  claude_plugins:              # optional — Claude Code plugins installed on this
+    - claude-security@claude-plugins-official  #   host, copied in (see below)
 ```
+
+**Claude Code plugins come from the host, not the network.** The VMs can't reach
+the plugin marketplaces' hosts, so `claude_plugins` names plugins already
+installed on the host where the server and runner run (`claude plugin install
+<name>@<marketplace>`). For each one, the build copies the host's installed
+copy (recorded in `~/.claude/plugins/installed_plugins.json`) into a local
+marketplace, `omni-sbx-plugins`, copies that into the build sandbox, and runs
+`claude plugin marketplace add` and `claude plugin install` there, after the
+setup. Nothing is downloaded. Inside the VM the plugin is
+`<name>@omni-sbx-plugins`, and its commands keep their names (for example
+`/claude-security:claude-security`).
+
+A plugin that isn't installed on the host, is installed outside
+`~/.claude/plugins/`, or holds a symlink is refused, by name, when the image is
+named. Each plugin's version and files are part of the image's fingerprint, so
+updating a plugin on the host builds a new image; restart the server so it uses
+it. Claude Code's `.in_use` markers are left out, so a running session doesn't
+change the image.
 
 **What goes where.** `image.setup` is everything that doesn't depend on the
 branch: system packages, compilers, and tools like coverage and audit commands.
