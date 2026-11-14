@@ -35,6 +35,19 @@ class TestSeedBuilders(unittest.TestCase):
         self.assertTrue(tok['token']['access_token'])
         self.assertIn('PLACEHOLDER', agy.PLACEHOLDER_TOKEN)
 
+    def test_the_placeholder_does_not_look_like_a_google_token(self) -> None:
+        # A ya29. prefix made secret scanners report the inert
+        # placeholder as a leaked Google access token. Nothing that
+        # reads it needs the prefix: Omnigent's gate wants it non-empty,
+        # and the proxy matches the exact string.
+        self.assertFalse(agy.PLACEHOLDER_TOKEN.startswith('ya29.'))
+        self.assertNotRegex(agy.PLACEHOLDER_TOKEN, r'ya29\.')
+
+    def test_the_placeholder_survives_a_header_unchanged(self) -> None:
+        # The proxy finds it in an Authorization header: no whitespace,
+        # nothing a client would escape or fold.
+        self.assertRegex(agy.PLACEHOLDER_TOKEN, r'\A[A-Za-z0-9._-]+\Z')
+
     def test_auth_method_tracks_account_type(self) -> None:
         # Enterprise (GCP) accounts need "gcp"; consumer needs "oauth".
         # A mismatch makes agy reject the token ("Please sign in").

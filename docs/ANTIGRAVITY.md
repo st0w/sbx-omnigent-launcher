@@ -60,9 +60,11 @@ Three planes, so the durable refresh credential never touches an untrusted agent
    └─────────────────────────┘        └──────────────────────────────┘
 ```
 
-1. **Agent VM** carries only a **placeholder** access token (looks like a real
-   `ya29.…` token, far-future expiry, dummy refresh token), so `agy` emits it
-   verbatim and never tries to refresh. Omnigent's `harness_is_configured` gate
+1. **Agent VM** carries only a **placeholder** access token
+   (`omni-sbx-agy-PROXY-SWAP-PLACEHOLDER-…`, far-future expiry, dummy refresh
+   token), so `agy` emits it verbatim and never tries to refresh. It's
+   deliberately not shaped like a real `ya29.…` Google token, so secret
+   scanners don't report it as a leaked credential. Omnigent's `harness_is_configured` gate
    passes (it only checks for a non-empty token).
 2. The **sbx proxy** MITMs the googleapis hosts and swaps the placeholder for the
    real token **in the outbound header, on the wire** — the agent never sees a
