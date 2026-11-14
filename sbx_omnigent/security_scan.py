@@ -99,6 +99,8 @@ class ScanFinding:
     :param exploit_scenario: How it is exploited.
     :param recommendation: How to fix it.
     :param cwe_id: e.g. ``"CWE-89"``.
+    :param plugin_id: The plugin's ``claudeSecurityPluginFindingId``,
+        meant to stay the same from scan to scan; ``''`` if absent.
     """
 
     id: str
@@ -111,6 +113,7 @@ class ScanFinding:
     exploit_scenario: str
     recommendation: str
     cwe_id: str
+    plugin_id: str = ''
 
     @property
     def blocks(self) -> bool:
@@ -303,6 +306,7 @@ def parse_report(text: str) -> tuple[ScanFinding, ...]:
             exploit_scenario=str(raw.get('exploit_scenario') or ''),
             recommendation=str(raw.get('recommendation') or ''),
             cwe_id=str(raw.get('cwe_id') or ''),
+            plugin_id=str(raw.get('claudeSecurityPluginFindingId') or ''),
         ))
     return tuple(out)
 

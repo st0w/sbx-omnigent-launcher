@@ -717,11 +717,34 @@ directory under `security/<stage>/r<round>-<timestamp>/`. At publish they're
 committed beside the plan and its reviews record, one folder per round:
 
 ```text
+docs/plans/<name>-security/README.md
 docs/plans/<name>-security/r1-<timestamp>/CLAUDE-SECURITY-RESULTS.md
 docs/plans/<name>-security/r1-<timestamp>/CLAUDE-SECURITY-RESULTS.jsonl
 docs/plans/<name>-security/r1-<timestamp>/CLAUDE-SECURITY-RESULTS.sarif
 docs/plans/<name>-security/r1-<timestamp>/CLAUDE-SECURITY-REVISION-<sha12>.json
 ```
+
+**The summary.** `README.md` in that folder, which GitHub shows when you open
+it, is written after the module's findings are filed, so it can link the
+issues. The pull request links it. It has:
+
+- **Every round:** passed or blocked, the count at each severity, and a link
+  to the round's report folder.
+- **Every Critical and High finding:** where it is, the rounds that reported
+  it, and the round from which it was no longer reported. Under that, what
+  triage concluded when it re-checked each blocking round against the code
+  that shipped: each claim's verdict with the issue it became, "no
+  conclusion", or "not re-checked" when the pipeline has no `verifies:`
+  stage.
+- **Every Medium and Low finding of the final round** and what became of it:
+  filed (the issue link), withheld by triage (its verdict and reason),
+  already tracked by an earlier run, or recorded in the findings ledger when
+  the pipeline doesn't publish a pull request. A Medium or Low reported only
+  by earlier rounds is listed as not filed.
+
+A finding is followed from round to round by the plugin's own finding id,
+which it keeps the same from scan to scan, or by file and title when a finding
+has none.
 
 In a per-module campaign the folder is `<name>-<module>-security/`, beside
 that module's plan. The plugin's own `.gitignore` in the folder (`*`) isn't
