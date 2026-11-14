@@ -489,11 +489,12 @@ template, so a checker given its own `prompt` still stops on a contract that
 can't be met.
 
 **A pass has to be said.** A check's report must end with a line reading exactly
-`CHECK COMPLETE`, and the check is told not to end its turn while a command it
-started is still running. A reply with no `DISPUTED:` line and no
-`CHECK COMPLETE` is unfinished, not a pass. Seen live: a checker ended its turn
-to wait for a background `cargo test`, and that waiting message was recorded as
-a pass. An unfinished check is asked once to finish. If its answer still has
+`CHECK COMPLETE`. A reply with no `DISPUTED:` line and no `CHECK COMPLETE` is
+unfinished, not a pass. Seen live: a checker ended its turn to wait for a
+background `cargo test`, and that waiting message was recorded as a pass. A
+check that ends its turn on background work it started is waited for, not
+asked (see [Background work](#background-work)). An unfinished check with
+nothing left running is asked once to finish. If its answer still has
 neither, a contract check stops the run, and `--resume` runs it again. A reply
 with a dispute is never asked again, finished or not, because the claim stops the
 run either way. On `--resume`, a contract check recorded as complete whose reply
@@ -883,6 +884,44 @@ differ.
 adds one. List them with `sbx template ls`. Remove an old one with
 `sbx template rm <name>` once no run uses it.
 
+## Background work
+
+**An agent may run long commands in the background, and the runner waits for
+them.** Claude Code is built to start a long command (a toolchain install, a
+build, a test run) in the background, or watch one with its Monitor tool, then
+end its turn and be woken when it finishes. Ending the turn there used to look
+like an unfinished reply: the agent was asked to finish, ended its turn again,
+and was stopped. Forbidding background work instead would serialise every
+install, build and test run.
+
+When a turn ends, the runner reads the session's own record:
+
+- **It returns at once** when the reply is already finished (a check's
+  `CHECK COMPLETE`, a writer's `WORK COMPLETE`, a reviewer's verdict, or a
+  `DISPUTED:` claim), or when the turn started nothing in the background. A
+  server an agent leaves running never holds up a finished reply.
+- **Otherwise it waits for the agent to be woken.** A launch is recorded as
+  `Command running in background with ID: <id>` or `Monitor started (task <id>,
+  ...)`, and its end as a task notification naming that id. When the
+  notification arrives, the agent takes another turn and replies. The runner
+  waits for that turn to settle, adds its reply to the first, and checks again.
+  It prints `[background] <node>: ... waiting for it to be woken` when it starts
+  waiting.
+- **The wait shares the turn's own timeout.** If the turn's time runs out, or
+  the session fails, the reply is handled as it stands: an unfinished one is
+  asked once to finish, as before.
+- **Ctrl-C stops the wait at once.** The session counts as mid-turn, so its
+  record is kept.
+
+The launch and end text is Claude Code's own, not a published interface. If a
+version changes it, nothing reads as a launch and the runner stops waiting,
+which is the behaviour it had before. Codex doesn't run commands in the
+background, so its turns are unaffected.
+
+**A [pipeline image](#a-prebuilt-toolchain-image) removes the longest wait.**
+Most background work in a fresh VM is the toolchain install, which an image
+does once per recipe instead of in every VM.
+
 ## Where builds happen
 
 **Every stage builds on its sandbox's own disk, never through the host mount.**
@@ -932,12 +971,13 @@ Four things close that gap.
 
 **A writer has to say it finished (automatic).** Every writer turn, the first
 and every re-drive, must end its reply with a line reading exactly
-`WORK COMPLETE`, and the writer is told not to end its turn while a command it
-started is still running. Its work is committed the moment its turn ends, so a
-reply without that line is unfinished. Seen live: a test writer twice ended its
-turn saying it was waiting for a background compile, and both times the runner
-committed what was there, temporary stubs in production code included. An
-unfinished writer is asked once to finish before anything is committed. If its
+`WORK COMPLETE`, and nothing is committed until it does. Seen live: a test
+writer twice ended its turn saying it was waiting for a background compile, and
+both times the runner committed what was there, temporary stubs in production
+code included. A writer that ends its turn on background work it started is
+waited for (see [Background work](#background-work)). An unfinished writer
+with nothing left running is asked once to finish before anything is
+committed. If its
 answer still doesn't say it finished, the runner keeps its turn record, commits
 the tree as partial work, and stops the run, rather than send a tree that may be
 mid-change to review. `--resume` runs the stage again from that commit. A reply

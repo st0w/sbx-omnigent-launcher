@@ -52,9 +52,9 @@ Then list anything you could not check under a line reading exactly
 
 ## When you are done
 
-Your reply is read the moment your turn ends. So do not end your turn while a
-command you started is still running, in the background or anywhere else: wait
-for it, or run it in the foreground. End your report with a line reading
-exactly `CHECK COMPLETE`. A reply without that line is treated as unfinished,
-never as a pass: you are asked once to finish it, and after that the check
-counts as not passed.
+Run long commands in the background if you like: if you end your turn while one
+is still running, the pipeline waits for it to finish and for the reply you give
+when you are woken. Your report is final only when it ends with a line reading
+exactly `CHECK COMPLETE`. A reply without that line, with nothing left running,
+is treated as unfinished, never as a pass: you are asked once to finish it, and
+after that the check counts as not passed.

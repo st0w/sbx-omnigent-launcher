@@ -53,6 +53,7 @@ import click
 
 from sbx_omnigent import (
     agy,
+    background,
     claude,
     codex,
     disk_metrics,
@@ -1078,13 +1079,14 @@ _CHECK_COMPLETE = 'CHECK COMPLETE'
 #: finish the report afterwards; the runner read that as the report,
 #: found no dispute, and recorded a pass. A pass must now be said.
 _CHECK_FINISH = (
-    '\n\nWHEN YOU ARE DONE. Your reply is read the moment your turn '
-    'ends, so do not end your turn while a command you started is still '
-    'running, in the background or anywhere else: wait for it, or run '
-    'it in the foreground. End your report with a line reading exactly '
-    f'`{_CHECK_COMPLETE}`. A reply without that line is treated as '
-    'unfinished, never as a pass: you are asked once to finish it, and '
-    'after that the check counts as not passed.'
+    '\n\nWHEN YOU ARE DONE. Run long commands in the background if you '
+    'like: if you end your turn while one is still running, the pipeline '
+    'waits for it to finish and for the reply you give when you are '
+    'woken. Your report is final only when it ends with a line reading '
+    f'exactly `{_CHECK_COMPLETE}`. A reply without that line, with '
+    'nothing left running, is treated as unfinished, never as a pass: '
+    'you are asked once to finish it, and after that the check counts as '
+    'not passed.'
 )
 
 #: Sent once to a check whose reply neither disputed nor said it was
@@ -1092,10 +1094,9 @@ _CHECK_FINISH = (
 _CHECK_FINISH_ASK = (
     f'Your reply did not end with a line reading exactly '
     f'`{_CHECK_COMPLETE}`, so the check is not finished and cannot count '
-    f'as a pass. If a command you started is still running, wait for it '
-    f'to finish. Then reply with your complete report, every dispute and '
-    f'finding included, ending with a line reading exactly '
-    f'`{_CHECK_COMPLETE}`.'
+    f'as a pass. Finish the check, then reply with your complete report, '
+    f'every dispute and finding included, ending with a line reading '
+    f'exactly `{_CHECK_COMPLETE}`.'
 )
 
 #: The line a writer's reply must end with to count as finished.
@@ -1108,14 +1109,15 @@ _WORK_COMPLETE = 'WORK COMPLETE'
 #: production code, then with them still there. Finished must now be
 #: said, as a check's pass must (#143).
 _WRITER_FINISH = (
-    '\n\nWHEN YOU ARE DONE. Your work is committed the moment your turn '
-    'ends, so do not end it while a command you started is still '
-    'running, in the background or anywhere else: wait for it, or run '
-    'it in the foreground. Finish the work, including removing anything '
-    'temporary you added, then end your reply with a line reading '
-    f'exactly `{_WORK_COMPLETE}`. A reply without that line is treated '
-    'as unfinished: you are asked once to finish, and after that the run '
-    'stops. A reply raising a `DISPUTED:` line needs no finish line.'
+    '\n\nWHEN YOU ARE DONE. Run long commands in the background if you '
+    'like: if you end your turn while one is still running, the pipeline '
+    'waits for it to finish and for the reply you give when you are '
+    'woken. Your work is committed once your reply ends with a line '
+    f'reading exactly `{_WORK_COMPLETE}`, so finish the work first, '
+    'including removing anything temporary you added. A reply without '
+    'that line, with nothing left running, is treated as unfinished: you '
+    'are asked once to finish, and after that the run stops. A reply '
+    'raising a `DISPUTED:` line needs no finish line.'
 )
 
 #: Sent once to a writer whose reply neither disputed nor said it was
@@ -1123,9 +1125,8 @@ _WRITER_FINISH = (
 _WRITER_FINISH_ASK = (
     f'Your reply did not end with a line reading exactly '
     f'`{_WORK_COMPLETE}`, so your turn is not finished and nothing has '
-    f'been committed. If a command you started is still running, wait '
-    f'for it to finish. Then finish the work, remove anything temporary '
-    f'you added, and end your reply with a line reading exactly '
+    f'been committed. Finish the work, remove anything temporary you '
+    f'added, and end your reply with a line reading exactly '
     f'`{_WORK_COMPLETE}`.'
 )
 
@@ -1706,6 +1707,21 @@ def work_finished(text: str | None) -> bool:
     :returns: ``True`` when some line is exactly the marker.
     """
     return _has_marker_line(text, _WORK_COMPLETE)
+
+
+def _check_done(text: str) -> bool:
+    """A check's reply needs nothing more: it finished or disputed."""
+    return check_finished(text) or bool(parse_disputes(text))
+
+
+def _writer_done(text: str) -> bool:
+    """A writer's reply needs nothing more: it finished or disputed."""
+    return work_finished(text) or bool(parse_disputes(text))
+
+
+def _review_done(text: str) -> bool:
+    """A reviewer's reply needs nothing more: it states a verdict."""
+    return parse_verdict(text) is not None
 
 
 def parse_disputes(text: str | None) -> tuple[str, ...]:
@@ -6635,6 +6651,49 @@ class PipelineRunner:
             click.echo(f'[parallel] {label}: {node_id} also failed: {exc}')
         raise failures[0][1]
 
+    def _await_background(
+        self,
+        session: str,
+        since: str | None,
+        reply: str,
+        done: Callable[[str], bool] | None,
+        deadline: float,
+    ) -> str:
+        """
+        Wait out the background work a turn ended on.
+
+        See :mod:`sbx_omnigent.background`.
+
+        :param session: The session whose turn just ended.
+        :param since: Its newest item before the turn.
+        :param reply: The turn's reply.
+        :param done: Whether a reply is finished; ``None`` waits until
+            no background work this turn started is left.
+        :param deadline: When the turn's own timeout runs out.
+        :returns: The reply, with any woken replies appended.
+        """
+        label = self._session_label.get(session, session)
+        try:
+            return background.await_background(
+                self._sc,
+                session,
+                since=since,
+                reply=reply,
+                done=done or (lambda _reply: False),
+                deadline=deadline,
+                label=label,
+                stop=lambda: self._refuse_if_interrupted(label),
+                poll_s=background.POLL_S,
+            )
+        except SwarmSessionError as exc:
+            # Following the work is best-effort: without it the reply is
+            # handled exactly as it was before this wait existed.
+            click.echo(
+                f'[background] {label}: could not follow its background '
+                f'work ({exc}); using the reply as it stands.'
+            )
+            return reply
+
     def _capture_interrupted_turns(self) -> None:
         """
         Keep the record of every turn still running at Ctrl-C.
@@ -7424,7 +7483,9 @@ class PipelineRunner:
             replace=self._resume,
         )
         session = self._create_session(stage.run[0], wt, 'ro', stage.id)
-        first = self._drive(session, self._check_instruction(stage))
+        first = self._drive(
+            session, self._check_instruction(stage), done=_check_done
+        )
         out = self._finish_check(stage.id, session, first)
         self._nodes[stage.id] = NodeResult(
             stage.id, 'check', worktree=wt, session=session, output=out
@@ -7713,7 +7774,11 @@ class PipelineRunner:
         session = self._create_session(check.run[0], wt, 'ro', check.id)
         out = self._finish_check(
             check.id, session,
-            self._drive(session, self._plan_check_instruction(check, plan)),
+            self._drive(
+                session,
+                self._plan_check_instruction(check, plan),
+                done=_check_done,
+            ),
         )
         claims = parse_disputes(out)
         if not claims and not check_finished(out):
@@ -7758,7 +7823,7 @@ class PipelineRunner:
             f'ended with {_CHECK_COMPLETE}, so it has not finished; '
             f'asking it once to finish.'
         )
-        return self._drive(session, _CHECK_FINISH_ASK)
+        return self._drive(session, _CHECK_FINISH_ASK, done=_check_done)
 
     def _halt_on_unfinished_check(
         self, stage: pipeline.PipelineStage, session: str, out: str
@@ -8101,6 +8166,7 @@ class PipelineRunner:
                     self._drive(
                         node.session,
                         self._writer_instruction(stage) + _WRITER_FINISH,
+                        done=_writer_done,
                     ),
                 )
                 return
@@ -8551,7 +8617,7 @@ class PipelineRunner:
             f'{_WORK_COMPLETE}, so it has not finished; asking it once to '
             f'finish before anything is committed.'
         )
-        return self._drive(session, _WRITER_FINISH_ASK)
+        return self._drive(session, _WRITER_FINISH_ASK, done=_writer_done)
 
     def _halt_on_unfinished_writer(
         self, stage_id: str, session: str, out: str
@@ -8677,7 +8743,9 @@ class PipelineRunner:
             turn = f'{_FROZEN_TESTS_CONTRACT}\n\n{turn}'
         node.output = self._finish_writer(
             stage_id, node.session,
-            self._drive(node.session, turn + _WRITER_FINISH),
+            self._drive(
+                node.session, turn + _WRITER_FINISH, done=_writer_done
+            ),
         )
         # Kept even on success: this session is disposed at publish, and
         # what a writer did with a reviewer's findings is exactly what
@@ -8779,7 +8847,8 @@ class PipelineRunner:
                 created.append(session)
             try:
                 return session, self._drive(
-                    session, self._review_instruction(stage)
+                    session, self._review_instruction(stage),
+                    done=_review_done,
                 )
             except SwarmRunnerUnavailable as exc:
                 # No turn ran, so this spends a launch, not an attempt.
@@ -9475,7 +9544,9 @@ class PipelineRunner:
             # inline: an agy reviewer would otherwise get this as a
             # pointer to a file it must choose to re-read — which is
             # exactly what it does not do when it thinks it is mid-work.
-            nudged = self._drive(session, _VERDICT_NUDGE, inline=True)
+            nudged = self._drive(
+                session, _VERDICT_NUDGE, inline=True, done=_review_done
+            )
         except PipelineRunError:
             self._log_verdict(label, None, 'none')
             return None, text
@@ -10008,10 +10079,20 @@ class PipelineRunner:
         return session
 
     def _drive(
-        self, session: str, instruction: str, *, inline: bool = False
+        self,
+        session: str,
+        instruction: str,
+        *,
+        inline: bool = False,
+        done: Callable[[str], bool] | None = None,
     ) -> str:
         """
         Run one turn on *session* and return its reply.
+
+        A turn the agent ended on background work it started is
+        followed until the agent is woken and replies (see
+        :mod:`sbx_omnigent.background`), so the reply returned is the
+        one it gave once that work finished.
 
         :param session: The session to drive.
         :param instruction: The turn text.
@@ -10019,6 +10100,9 @@ class PipelineRunner:
             a file for an agy session. For SHORT, urgent turns whose
             whole point is that the agent acts on them right now: the
             file indirection buries them. See :data:`_VERDICT_NUDGE`.
+        :param done: Whether a reply is finished, so a finished reply
+            never waits on a server the agent left running. ``None``
+            waits until no background work this turn started is left.
         :returns: The assistant's reply.
         :raises PipelineRunError: If the turn failed.
         """
@@ -10044,6 +10128,8 @@ class PipelineRunner:
             )
         first_turn = session not in self._driven
         self._driven.add(session)
+        since = self._newest_item_id(session)
+        deadline = time.monotonic() + self._turn_timeout
         with self._lock:
             self._in_turn.add(session)
         try:
@@ -10058,6 +10144,14 @@ class PipelineRunner:
                     _FIRST_TURN_REDELIVER_DELAY_S if first_turn else 0.0
                 ),
             )
+            # Inside the try, so the session stays "in turn" for Ctrl-C
+            # while the agent's background work runs.
+            if result.ok and not claude.api_error_reply(result.reply):
+                waited = self._await_background(
+                    session, since, result.reply or '', done, deadline
+                )
+                if waited != (result.reply or ''):
+                    result = replace(result, reply=waited)
         except SwarmSessionError as exc:
             # The turn never came back. Teardown is seconds away and
             # will delete this session, so capture NOW or the only
