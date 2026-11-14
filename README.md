@@ -276,6 +276,7 @@ inferred from its keys:
 | **review** | `gate:` / `on_block:` | `:ro` on the target writer's branch | One or more reviewers vote via `VERDICT:`; a block loops findings back to `on_block`. |
 | **judge** | `selects:` | `:ro` compare tree | Reads competing writer branches side by side and picks a winner via `SELECT:`. |
 | **check** | `checks: <tests stage>` or `checks: <plan stage>` | `:ro` | Checks the frozen suite before the writers start, or the plan's claims inside your approval; `DISPUTED:` stops the run or reopens approval. See [docs/PIPELINES.md](docs/PIPELINES.md#a-contract-check-before-the-writers). |
+| **scan** | `scans: <writer>` | fresh `rw` clone | Runs the `claude-security` plugin over the module's changes; Critical or High goes back to `on_block`. See [docs/PIPELINES.md](docs/PIPELINES.md#a-security-scan-before-publishing). |
 
 Edges are `needs:` (and the explicit `from:` seed override). **Branches are the
 artifacts**: a writer's worktree is *cut from* its upstream branch (a coder

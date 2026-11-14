@@ -11,7 +11,9 @@ Run: .venv/bin/python -m unittest tests.test_runner
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
+import json
 import shutil
 import subprocess
 import tempfile
@@ -290,6 +292,9 @@ class FakeWT:
             return f'https://github.com/org/proj/pull/{number}'
         return f'Pushed {dst} ({node_id})'
 
+    def hub_ref_tip(self, run_id, ref):
+        return f'{zlib.crc32(ref.encode()):08x}' * 5
+
     def hub_branch_tip(self, run_id, node_id):
         if node_id in self.tip_overrides:
             return self.tip_overrides[node_id]
@@ -336,6 +341,9 @@ class FakeWT:
             return False
         self.artifacts[relpath] = content
         return True
+
+    def read_run_artifact(self, run_id, relpath):
+        return self.artifacts.get(relpath)
 
 
 class FakeSC:
@@ -9206,6 +9214,412 @@ class TestAClaudeSessionCarriesItsModel(_Base):
 
     def test_an_agy_agents_does_not(self) -> None:
         self.assertTrue(self._workspaces()['plan'].endswith('#ro-agy'))
+
+
+#: A writer, a bugs-only review, then a security scan of the writer.
+_SCANNED_PIPELINE = """\
+name: demo
+repo: ./proj
+publish: local
+task: |
+  add parse_ports
+acceptance: |
+  handles ranges
+agents:
+  build: {template: coder, model: claude-sonnet-5}
+  bugs: {template: bug-reviewer, model: claude-sonnet-5}
+  sec: {template: security-reviewer, model: claude-mythos-5-2}
+stages:
+  - {id: build, run: build, write: true}
+  - {id: review, run: [bugs], needs: [build], gate: consensus, on_block: build}
+  - {id: scan, run: sec, scans: build, needs: [review], on_block: build}
+image:
+  from: ghcr.io/omnigent-ai/omnigent-host:v0.20.0
+  setup: apt-get install -y jq
+  claude_plugins: [claude-security@claude-plugins-official]
+"""
+
+_SCAN_REPLIES = {
+    'build': 'built\n\nWORK COMPLETE', 'review-bugs': 'VERDICT: APPROVED',
+    'scan': 'Scan finished.',
+}
+
+
+def _scan_jsonl(*severities: str) -> str:
+    return ''.join(
+        json.dumps({
+            'id': f'F{i}', 'title': f'{sev.title()} problem', 'file': 'a.py',
+            'line': 10 + i, 'severity': sev, 'category': 'SQL Injection',
+            'description': 'the input reaches the query.',
+            'exploit_scenario': "name=' OR 1=1", 'cwe_id': 'CWE-89',
+            'recommendation': 'bind it.',
+        }) + '\n'
+        for i, sev in enumerate(severities, start=1)
+    )
+
+
+#: The files a report folder holds that are kept.
+_KEPT = (
+    'CLAUDE-SECURITY-RESULTS.jsonl', 'CLAUDE-SECURITY-RESULTS.md',
+    'CLAUDE-SECURITY-RESULTS.sarif',
+    'CLAUDE-SECURITY-REVISION-0123456789ab.json',
+)
+
+
+def _scan_report(jsonl, stamp):
+    """A collected report folder holding *jsonl*, or ``None``."""
+    if jsonl is None:
+        return None
+    return R.security_scan.ScanReport(
+        name=f'CLAUDE-SECURITY-{stamp}',
+        files=(
+            (_KEPT[0], jsonl),
+            (_KEPT[1], f'# report {stamp}\n'),
+            (_KEPT[2], f'{{"run": "{stamp}"}}\n'),
+            (_KEPT[3], f'{{"stamp": "{stamp}"}}'),
+        ),
+    )
+
+
+class _ScanBase(_Base):
+    """Runs the scan pipeline with the plugin's report faked."""
+
+    def _go(self, reports, *, replies=None, wt=None):
+        sc = FakeSC(dict(replies or _SCAN_REPLIES))
+        sc.raw_writer_replies = True
+        wt = wt or FakeWT()
+        queue = [
+            _scan_report(text, f'20261114-12000{i}')
+            for i, text in enumerate(reports, start=1)
+        ]
+
+        def read(_worktree):
+            return queue.pop(0) if len(queue) > 1 else queue[0]
+
+        with mock.patch.object(
+            R.security_scan, 'collect_report', side_effect=read
+        ) as reader, mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            try:
+                result = self._run(_SCANNED_PIPELINE, {}, sc=sc, wt=wt)[0]
+            except R.PipelineRunError as exc:
+                result = exc
+        printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
+        return result, sc, wt, reader, printed
+
+
+class TestASecurityScanStage(_ScanBase):
+    """
+    A ``scans:`` stage runs the claude-security plugin over the writer's
+    branch once per module, after the bugs review. Critical and High
+    findings go back to the writer; the bugs review and the scan then
+    run again. Medium and Low are recorded for triage and filing.
+    """
+
+    def test_the_turn_runs_the_plugin_on_the_modules_changes(self) -> None:
+        _r, sc, wt, _reader, _p = self._go([''])
+        turn = sc.message_for_label('scan')
+        base = wt.hub_ref_tip('r1', 'main')
+        self.assertTrue(
+            turn.startswith('/claude-security:claude-security scan changes')
+        )
+        self.assertIn(f'--base {base}', turn)
+        self.assertIn('at medium effort', turn)
+        self.assertIn('time and tokens', turn)
+
+    def test_it_scans_a_writable_clone_of_the_writer(self) -> None:
+        _r, sc, wt, reader, _p = self._go([''])
+        self.assertEqual(wt.node_from['scan'], 'build')
+        self.assertTrue(wt.replaced['scan'])
+        created = next(
+            c for c in sc.creates if sc.label_of(c['sid']) == 'scan'
+        )
+        self.assertIn('#rw', created['workspace'])
+        self.assertEqual(reader.call_args.args, ('/wt/r1/nodes/scan',))
+
+    def test_a_clean_scan_lets_the_module_through(self) -> None:
+        result, sc, _wt, _reader, _p = self._go([''])
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(len(_messages_for(sc, 'build')), 1)
+
+    def test_its_session_is_freed_after_the_scan(self) -> None:
+        _r, sc, _wt, _reader, _p = self._go([''])
+        scan_sessions = [
+            c['sid'] for c in sc.creates if sc.label_of(c['sid']) == 'scan'
+        ]
+        self.assertTrue(set(scan_sessions) <= set(sc.disposed))
+
+    def test_medium_and_low_do_not_block(self) -> None:
+        result, sc, wt, _reader, _p = self._go(
+            [_scan_jsonl('MEDIUM', 'LOW')]
+        )
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(len(_messages_for(sc, 'build')), 1)
+        self.assertIn('Medium problem', wt.artifacts['reviews/scan-sec-r1.md'])
+
+    def test_medium_and_low_become_tagged_findings_to_file(self) -> None:
+        cfg = self._cfg(_SCANNED_PIPELINE)
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        findings = R.security_scan.parse_report(
+            _scan_jsonl('HIGH', 'MEDIUM', 'LOW')
+        )
+        runner._record_scan(
+            runner._stage_by_id['scan'], 1, findings, 'a' * 40, ()
+        )
+        record = runner._reviews[-1]
+        self.assertEqual(record.verdict, 'BLOCKING')
+        self.assertEqual(
+            [text.split(']')[0] for _i, text in record.filed_findings()],
+            ['[security-medium', '[security-low'],
+        )
+        self.assertIn('High problem', record.blocking_report)
+        self.assertNotIn('Medium problem', record.blocking_report)
+
+    def test_critical_goes_back_to_the_writer(self) -> None:
+        result, sc, _wt, _reader, _p = self._go(
+            [_scan_jsonl('CRITICAL', 'LOW'), '']
+        )
+        self.assertEqual(result.status, 'completed')
+        fix = _messages_for(sc, 'build')[1]
+        self.assertIn('Critical problem', fix)
+        self.assertIn('a.py:11', fix)
+        self.assertNotIn('Low problem', fix)
+
+    def test_after_a_fix_the_bugs_review_then_the_scan_run_again(
+        self,
+    ) -> None:
+        _r, sc, _wt, reader, _p = self._go([_scan_jsonl('HIGH'), ''])
+        order = [
+            sc._label[s] for s, _m in sc.sent
+            if sc._label[s] in ('build', 'review-bugs', 'scan')
+        ]
+        self.assertEqual(
+            order,
+            ['build', 'review-bugs', 'scan', 'build', 'review-bugs', 'scan'],
+        )
+        self.assertEqual(reader.call_count, 2)
+
+    def test_the_blocking_round_is_recorded(self) -> None:
+        wt = FakeWT()
+        self._go([_scan_jsonl('HIGH'), ''], wt=wt)
+        first = wt.artifacts['reviews/scan-sec-r1.md']
+        self.assertIn('BLOCKING', first)
+        self.assertIn('High problem', first)
+        self.assertIn('APPROVED', wt.artifacts['reviews/scan-sec-r2.md'])
+
+    def test_it_holds_no_slot_while_the_review_runs_again(self) -> None:
+        # One slot: a scan that kept it while re-running the bugs review
+        # would wait forever for the review's turn.
+        with mock.patch.object(R, '_MAX_PARALLEL_NODES', 1):
+            result, _sc, _wt, _reader, _p = self._go(
+                [_scan_jsonl('HIGH'), '']
+            )
+        self.assertEqual(result.status, 'completed')
+
+    def test_a_scan_that_keeps_blocking_stops_the_run(self) -> None:
+        result, _sc, _wt, _reader, _p = self._go([_scan_jsonl('HIGH')])
+        self.assertEqual(result.status, 'blocked')
+        self.assertEqual(result.blocked_stage, 'scan')
+
+    def test_no_report_fails_the_stage(self) -> None:
+        result, _sc, _wt, _reader, _p = self._go([None])
+        self.assertIsInstance(result, R.PipelineRunError)
+        self.assertIn('no report', str(result))
+
+    def test_a_malformed_report_fails_the_stage(self) -> None:
+        result, _sc, _wt, _reader, _p = self._go(['not json\n'])
+        self.assertIsInstance(result, R.PipelineRunError)
+        self.assertIn('could not read', str(result))
+
+    def test_the_effort_comes_from_the_stage(self) -> None:
+        text = _SCANNED_PIPELINE.replace(
+            'scans: build, needs: [review], on_block: build}',
+            'scans: build, needs: [review], on_block: build, '
+            'scan_effort: high}',
+        )
+        sc = FakeSC(dict(_SCAN_REPLIES))
+        sc.raw_writer_replies = True
+        with mock.patch.object(
+            R.security_scan, 'collect_report',
+            return_value=_scan_report('', '20261114-120001'),
+        ), mock.patch('sbx_omnigent.runner.click.echo'):
+            self._run(text, {}, sc=sc)
+        self.assertIn('at high effort', sc.message_for_label('scan'))
+
+
+class TestTheScanReportsAreKept(_ScanBase):
+    """Each round's report folder (Markdown, JSONL, SARIF and the
+    revision stamp) is saved to the run directory as soon as it is read,
+    and committed beside the reviews record at publish, one folder per
+    round."""
+
+    def test_each_round_is_saved_to_the_run_directory(self) -> None:
+        _r, _sc, wt, _reader, _p = self._go([_scan_jsonl('HIGH'), ''])
+        for folder in ('r1-20261114-120001', 'r2-20261114-120002'):
+            for name in _KEPT:
+                with self.subTest(folder=folder, name=name):
+                    self.assertIn(
+                        f'security/scan/{folder}/{name}', wt.artifacts
+                    )
+
+    def test_each_round_is_committed_beside_the_reviews(self) -> None:
+        _r, _sc, wt, _reader, _p = self._go([_scan_jsonl('HIGH'), ''])
+        tracked = {rel: text for _tree, rel, text in wt.tracked_files}
+        self.assertIn('docs/plans/demo-reviews.md', tracked)
+        for folder in ('r1-20261114-120001', 'r2-20261114-120002'):
+            for name in _KEPT:
+                with self.subTest(folder=folder, name=name):
+                    rel = f'docs/plans/demo-security/{folder}/{name}'
+                    self.assertEqual(
+                        tracked.get(rel),
+                        wt.artifacts[f'security/scan/{folder}/{name}'],
+                    )
+        self.assertIn(
+            'docs: add security scan reports',
+            [message for _node, message, _author in wt.commits],
+        )
+
+    def test_the_plugins_gitignore_is_not_committed(self) -> None:
+        _r, _sc, wt, _reader, _p = self._go([''])
+        self.assertFalse(any(
+            rel.endswith('.gitignore') for _t, rel, _c in wt.tracked_files
+        ))
+
+    def test_the_record_names_its_folder(self) -> None:
+        _r, _sc, wt, _reader, _p = self._go([''])
+        self.assertIn(
+            'demo-security/r1-20261114-120001/',
+            wt.artifacts['reviews/scan-sec-r1.md'],
+        )
+
+    def test_the_saved_paths_survive_a_resume(self) -> None:
+        _r, _sc, wt, _reader, _p = self._go([''])
+        scan = next(r for r in wt.states[-1]['reviews']
+                    if r['stage'] == 'scan')
+        restored = R.ReviewRecord.from_dict(scan)
+        assert restored is not None
+        self.assertEqual(
+            sorted(restored.attachments),
+            sorted(f'security/scan/r1-20261114-120001/{n}' for n in _KEPT),
+        )
+
+    def test_a_report_that_cannot_be_saved_stops_the_stage(self) -> None:
+        wt = FakeWT()
+        wt.artifact_writes_fail = True
+        result, _sc, _wt, _reader, _p = self._go([''], wt=wt)
+        self.assertIsInstance(result, R.PipelineRunError)
+        self.assertIn('could not save', str(result))
+
+    def test_a_refused_report_stops_the_stage(self) -> None:
+        sc = FakeSC(dict(_SCAN_REPLIES))
+        sc.raw_writer_replies = True
+        with mock.patch.object(
+            R.security_scan, 'collect_report',
+            side_effect=R.security_scan.ScanReportError('x is a symlink'),
+        ), mock.patch('sbx_omnigent.runner.click.echo'):
+            with self.assertRaises(R.PipelineRunError) as caught:
+                self._run(_SCANNED_PIPELINE, {}, sc=sc)
+        self.assertIn('x is a symlink', str(caught.exception))
+        scan = [
+            c['sid'] for c in sc.creates if sc.label_of(c['sid']) == 'scan'
+        ]
+        self.assertTrue(set(scan) <= set(sc.disposed))
+
+    def test_a_saved_file_gone_at_publish_is_reported(self) -> None:
+        cfg = self._cfg(_SCANNED_PIPELINE)
+        wt = FakeWT()
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=wt,
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        wt.artifacts['security/scan/r1-1/CLAUDE-SECURITY-RESULTS.md'] = 'md'
+        runner._reviews.append(R.ReviewRecord(
+            chunk=None, stage='scan', reviewer='sec', round_no=1,
+            verdict='APPROVED', attachments=(
+                'security/scan/r1-1/CLAUDE-SECURITY-RESULTS.md',
+                'security/scan/r1-1/CLAUDE-SECURITY-RESULTS.sarif',
+            ),
+        ))
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            path = runner._commit_security_reports(
+                'build', 'docs/plans/demo.md'
+            )
+        printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
+        self.assertEqual(path, 'docs/plans/demo-security')
+        self.assertIn('CLAUDE-SECURITY-RESULTS.sarif', printed)
+        self.assertIn('missing', printed)
+        self.assertEqual(
+            [rel for _t, rel, _c in wt.tracked_files],
+            ['docs/plans/demo-security/r1-1/CLAUDE-SECURITY-RESULTS.md'],
+        )
+
+    def test_nothing_is_committed_without_a_scan(self) -> None:
+        cfg = self._cfg(_SCANNED_PIPELINE)
+        wt = FakeWT()
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=wt,
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        self.assertIsNone(
+            runner._commit_security_reports('build', 'docs/plans/demo.md')
+        )
+        self.assertEqual(wt.commits, [])
+
+
+class TestAScanInACampaign(_Base):
+    """In a campaign a module's scan diffs from the campaign tip, the
+    commit the module was built on; the first module from the base."""
+
+    def _runner(self, *, subtask: bool, campaign_tip: str | None):
+        cfg = self._cfg(_SCANNED_PIPELINE)
+        wt = FakeWT()
+        wt.tip_overrides['campaign'] = campaign_tip
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=wt,
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        if subtask:
+            runner._active_subtask = pipeline.Subtask(id='m1', title='two')
+        return runner, wt
+
+    def test_a_later_module_starts_at_the_campaign_tip(self) -> None:
+        runner, _wt = self._runner(subtask=True, campaign_tip='a' * 40)
+        self.assertEqual(runner._module_start(), 'a' * 40)
+
+    def test_the_first_module_starts_at_the_base(self) -> None:
+        runner, wt = self._runner(subtask=True, campaign_tip=None)
+        self.assertEqual(runner._module_start(), wt.hub_ref_tip('r1', 'main'))
+
+    def test_outside_a_campaign_it_starts_at_the_base(self) -> None:
+        runner, wt = self._runner(subtask=False, campaign_tip='a' * 40)
+        self.assertEqual(runner._module_start(), wt.hub_ref_tip('r1', 'main'))
+
+    def test_a_module_cites_its_own_security_folder(self) -> None:
+        runner, _wt = self._runner(subtask=True, campaign_tip=None)
+        runner._config = dataclasses.replace(
+            runner._config,
+            subtasks=(pipeline.Subtask(id='m1', title='two'),),
+        )
+        self.assertEqual(runner._security_folder_name(), 'demo-m1-security')
+
+    def test_outside_a_campaign_it_cites_the_runs_folder(self) -> None:
+        runner, _wt = self._runner(subtask=False, campaign_tip=None)
+        self.assertEqual(runner._security_folder_name(), 'demo-security')
+
+    def test_scans_is_namespaced_per_module(self) -> None:
+        runner, _wt = self._runner(subtask=False, campaign_tip=None)
+        stage = runner._stage_by_id['scan']
+        spaced = runner._namespace_one(
+            'm1', stage, set(), {'build'}, seed_campaign=False
+        )
+        self.assertEqual((spaced.scans, spaced.on_block), ('m1-build',
+                                                          'm1-build'))
 
 
 class TestPlanArtifact(_Base):

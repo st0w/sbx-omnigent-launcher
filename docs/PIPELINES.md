@@ -167,6 +167,7 @@ inferred from its keys:
 | **review** | `gate:` / `on_block:` | `:ro` on the target writer's branch | One or more reviewers vote via a `VERDICT:` line; a block loops findings back to `on_block`. |
 | **judge** | `selects:` | `:ro` compare tree | Reads competing writer branches side by side and picks a winner via a `SELECT:` line. |
 | **check** | `checks: <tests stage>` or `checks: <plan stage>` | `:ro` on the tests branch, or the base tree | Checks the frozen suite before the writers start, or the plan's claims before the plan is final; a `DISPUTED:` line stops the run or reopens approval. See [A contract check before the writers](#a-contract-check-before-the-writers) and [A plan check inside approval](#a-plan-check-inside-approval). |
+| **scan** | `scans: <writer>` | a fresh `rw` clone of the writer's branch | Runs the `claude-security` plugin over the module's changes; a Critical or High finding goes back to `on_block`, then the review in its `needs` and the scan run again. See [A security scan before publishing](#a-security-scan-before-publishing). |
 
 Stage keys:
 
@@ -186,6 +187,9 @@ Stage keys:
   publishes its winner as its **own** branch (`pl/<run>/<judge-id>`), so a later
   stage can build on the outcome — a writer can seed `from: <judge-id>` (e.g. a
   `refactoring` pass on the winner) and a review can gate it before publish.
+- **`scans: <writer-id>`** (+ optional **`scan_effort: low|medium|high`**) — a
+  security scan of that writer's branch with the `claude-security` plugin. See
+  [A security scan before publishing](#a-security-scan-before-publishing).
 - **`parallel: [ <stage>, ... ]`** — concurrent isolated sub-nodes (competing
   writers).
 
@@ -625,6 +629,110 @@ does. One that still hasn't after being asked once counts as a problem
 ("did not finish"): approval reopens with that in front of you, or, unattended,
 the run stops. A plan check recorded as complete is never re-run on `--resume`,
 because you accepted that plan.
+
+## A security scan before publishing
+
+A `scans:` stage runs Anthropic's `claude-security` Claude Code plugin over
+the branch about to ship, once per module, after that branch's review:
+
+```yaml
+- { id: refactor, run: refactorer, write: true, from: judge, needs: [judge] }
+- { id: review-r, run: [bugs], needs: [refactor], gate: consensus, on_block: refactor }
+- { id: scan, run: sec, scans: refactor, needs: [review-r], on_block: refactor }
+```
+
+```yaml
+image:
+  from: ghcr.io/omnigent-ai/omnigent-host:v0.20.0
+  setup: |
+    ...
+  claude_plugins:
+    - claude-security@claude-plugins-official
+```
+
+Its agent must be a Claude agent, and the pipeline's image must install the
+plugin (see [A prebuilt toolchain image](#a-prebuilt-toolchain-image)). The
+scan is the plugin's own: inventory, threat model, research, then a panel that
+votes on each candidate finding. It isn't a reviewer's reading of the diff.
+With a scan doing that job, the review before it can be the bugs reviewer
+alone.
+
+Each round gets a fresh writable clone of the writer's branch, because the
+plugin writes its report into the checkout. The agent's turn asks for:
+
+```text
+/claude-security:claude-security scan changes --base <commit> at <effort> effort and do not prompt me. I know that it may use a lot of time and tokens and I approve that.
+```
+
+`<commit>` is where the module started: the base branch, or in a campaign the
+campaign branch's tip when the module began (the previous module's winner).
+The scan covers only this module's changes. `<effort>` is the stage's
+`scan_effort`: `low`, `medium` (the default) or `high`. The plugin doesn't ask
+before a scan when the request names the cost, as this one does. An
+unattended session can't answer a question.
+
+The stage acts on the plugin's results file,
+`CLAUDE-SECURITY-<timestamp>/CLAUDE-SECURITY-RESULTS.jsonl` in the clone, not
+on the agent's reply. The reply a session captures can be the plugin's
+opening note rather than its summary.
+
+- **Critical or High** blocks. Those findings go to the `on_block` writer
+  with the file and line, the exploit, and the recommended fix. Then every
+  review stage in the scan's `needs` runs again, since the fix changed code
+  they approved, and then the scan. Past the round cap the run stops for you.
+  Triage then re-checks each one against the shipping branch, as it does a
+  reviewer's blocking report: a fix that made the symptom go away rather
+  than the cause passes a re-scan just the same.
+- **Medium and Low** don't block. They are the scan's findings, one line each
+  tagged `[security-medium]` or `[security-low]`, and go where a reviewer's
+  findings go: triage (a `verifies:` stage) checks them against the
+  shipping code, and the reviews record and the findings ledger on the
+  published branch keep them.
+
+Every round is recorded in the run directory under `reviews/` as
+`<stage>-<agent>-r<round>.md`, with every finding it reported, and in the
+reviews record committed on the published branch. So a Critical the writer
+fixed in round 1 stays on record beside the clean round 2 that followed.
+
+**The plugin's own report is kept too.** Each round's report folder holds the
+results as Markdown, JSONL and SARIF (SARIF 2.1.0, which GitHub code scanning
+and SARIF viewers read), plus a revision stamp naming the commit scanned, the
+effort and the severity counts. Those four files are copied out of the clone as
+soon as the round ends, before the next round replaces it, into the run
+directory under `security/<stage>/r<round>-<timestamp>/`. At publish they're
+committed beside the plan and its reviews record, one folder per round:
+
+```text
+docs/plans/<name>-security/r1-<timestamp>/CLAUDE-SECURITY-RESULTS.md
+docs/plans/<name>-security/r1-<timestamp>/CLAUDE-SECURITY-RESULTS.jsonl
+docs/plans/<name>-security/r1-<timestamp>/CLAUDE-SECURITY-RESULTS.sarif
+docs/plans/<name>-security/r1-<timestamp>/CLAUDE-SECURITY-REVISION-<sha12>.json
+```
+
+In a per-module campaign the folder is `<name>-<module>-security/`, beside
+that module's plan. The plugin's own `.gitignore` in the folder (`*`) isn't
+copied, or the files would never be committed. The plugin replaces any
+credential it finds in these files with `[REDACTED]`, but it calls that a best
+effort, so read them in the pull request before merging, and keep them out of
+a public repo: an unfixed Medium or Low finding is committed with its exploit.
+
+The clone belongs to the agent, so nothing in it is taken on trust. A report
+folder or file that's a symlink, a file that isn't a regular file, one over
+16 MiB, or one that isn't UTF-8 stops the run instead of being read. A link
+could point at any file on the host, which would then be committed. A scan
+that writes no results file, or one that can't be read, also stops the run,
+and its turn is in the run directory under `turns/`. The scan's VM is freed
+as soon as each round's report is read.
+
+Loading the pipeline refuses a scan that couldn't do its job. That's one that:
+- names a stage that isn't a writer, or doesn't reach that writer through
+  `needs` (it could scan before anything was written);
+- sets `on_block` to any writer other than the one it scans;
+- runs more than one agent, or an agent that isn't Claude;
+- also sets `write`, `gate`, `selects`, `verifies` or `checks`;
+- sets `scan_effort` to anything but `low`, `medium` or `high`, or sets it on
+  a stage that doesn't scan;
+- or is in a pipeline whose image doesn't install `claude-security`.
 
 ## Campaigns — build in sequence, one chunk at a time
 

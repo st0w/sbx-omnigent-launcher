@@ -916,6 +916,27 @@ class TestRunArtifact(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertFalse(self.mgr.write_run_artifact('r1', bad, 'x'))
 
+    def test_it_reads_back(self) -> None:
+        self.mgr.write_run_artifact('r1', 'security/s/r1-1/a.sarif', '{}')
+        self.assertEqual(
+            self.mgr.read_run_artifact('r1', 'security/s/r1-1/a.sarif'), '{}'
+        )
+
+    def test_a_missing_one_reads_as_none(self) -> None:
+        self.assertIsNone(self.mgr.read_run_artifact('r1', 'nope.md'))
+
+    def test_reading_an_escaping_path_is_refused(self) -> None:
+        # Beside the run dir, where '../' from inside it lands.
+        os.makedirs(self.mgr.run_dir('r1'), exist_ok=True)
+        outside = os.path.join(
+            os.path.dirname(self.mgr.run_dir('r1')), 'outside.md'
+        )
+        with open(outside, 'w', encoding='utf-8') as fh:
+            fh.write('host file')
+        for bad in ('../outside.md', outside, 'a/../../outside.md', ''):
+            with self.subTest(bad=bad):
+                self.assertIsNone(self.mgr.read_run_artifact('r1', bad))
+
     def test_an_unwritable_location_fails_quietly(self) -> None:
         # Recording something must never fail a run that is succeeding.
         blocked = os.path.join(self.tmp, 'worktrees', 'r3')
