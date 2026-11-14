@@ -383,6 +383,10 @@ class FakeSC:
         #: reviewer that is still working (installing a toolchain,
         #: running a build), as opposed to one that has gone quiet.
         self.busy_labels: set[str] = set()
+        #: label -> successive item lists, one per read (the last
+        #: repeats): a session's transcript as it grows, for tests of
+        #: background work the agent ended its turn on.
+        self.items_for_label: dict[str, list[list[dict]]] = {}
         self._ticks: dict[str, int] = {}
         #: Labels whose turn is interrupted by a human pressing Ctrl-C.
         #: KeyboardInterrupt is a BaseException, so an `except
@@ -516,6 +520,10 @@ class FakeSC:
         # producing output — a reviewer mid-build, which must not be
         # mistaken for a silent one.
         label = self._label.get(session, '')
+        seq = self.items_for_label.get(label)
+        if seq:
+            items = seq.pop(0) if len(seq) > 1 else seq[0]
+            return list(items[-tail:]) if tail else list(items)
         if label in self.busy_labels:
             self._ticks[label] = self._ticks.get(label, 0) + 1
             return [{'id': f'{label}-{self._ticks[label]}'}]
@@ -1459,6 +1467,104 @@ _CHECKS_TESTS_REPLIES = {
     'check': 'checker-report: the contract holds\nCHECK COMPLETE',
     'build': 'b',
 }
+
+
+def _bg_launch(n: int, task: str = 'bonptkorp') -> dict:
+    return {
+        'id': f'bg{n}', 'type': 'function_call_output',
+        'output': f'Command running in background with ID: {task}. Output '
+                  f'is being written to: /tmp/x/{task}.output.',
+    }
+
+
+def _bg_done(n: int, task: str = 'bonptkorp') -> dict:
+    return {
+        'id': f'bg{n}', 'type': 'message', 'role': 'user', 'is_meta': True,
+        'content': [{'type': 'input_text', 'text': (
+            f'<task-notification>\n<task-id>{task}</task-id>\n'
+            f'<status>completed</status>\n</task-notification>'
+        )}],
+    }
+
+
+def _bg_say(n: int, text: str) -> dict:
+    return {
+        'id': f'bg{n}', 'type': 'message', 'role': 'assistant',
+        'content': [{'type': 'output_text', 'text': text}],
+    }
+
+
+class TestTheRunnerWaitsForBackgroundWork(_Base):
+    """
+    An agent that ends its turn on background work is waited for.
+
+    Claude Code starts a long command in the background, ends the turn,
+    and is woken when it finishes. Live (identity-diff-1), a contract
+    check did that while its toolchain installed. The runner read the
+    reply at once, asked it to finish, and stopped it as unfinished.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        poll = mock.patch.object(R.background, 'POLL_S', 0.0)
+        poll.start()
+        self.addCleanup(poll.stop)
+
+    def _check(self, items):
+        sc = FakeSC(dict(
+            _CHECKS_TESTS_REPLIES,
+            check='Installing the toolchain in the background.',
+        ))
+        sc.items_for_label['check'] = items
+        sc.status_for_label['check'] = {'status': 'idle'}
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            result, sc, wt = self._run(_CHECKS_TESTS, {}, sc=sc)
+        printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
+        return result, sc, wt, printed
+
+    def test_a_check_is_woken_not_asked_to_finish(self) -> None:
+        started = [_bg_launch(1), _bg_say(2, 'Installing the toolchain.')]
+        woke = [
+            *started, _bg_done(3),
+            _bg_say(4, 'The contract holds.\nCHECK COMPLETE'),
+        ]
+        result, sc, _wt, printed = self._check(
+            [[], started, woke, woke]
+        )
+        self.assertEqual(result.status, 'completed')
+        self.assertNotIn(R._CHECK_FINISH_ASK, _messages_for(sc, 'check'))
+        self.assertIn('[background] check', printed)
+        self.assertIn('The contract holds.', result.nodes['check'].output)
+
+    def test_a_finished_reply_does_not_wait_on_a_server(self) -> None:
+        sc = FakeSC(dict(_CHECKS_TESTS_REPLIES))
+        sc.items_for_label['check'] = [[], [_bg_launch(1)]]
+        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+            result, _sc, _wt = self._run(_CHECKS_TESTS, {}, sc=sc)
+        printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
+        self.assertEqual(result.status, 'completed')
+        self.assertNotIn('[background]', printed)
+
+    def test_a_writer_is_woken_before_its_work_is_committed(self) -> None:
+        started = [_bg_launch(1), _bg_say(2, 'Building in the background.')]
+        woke = [*started, _bg_done(3), _bg_say(4, 'Built.\nWORK COMPLETE')]
+        sc = FakeSC({'plan': 'PLAN', 'build': 'Building in the background.'})
+        sc.raw_writer_replies = True
+        sc.items_for_label['build'] = [[], started, woke, woke]
+        sc.status_for_label['build'] = {'status': 'idle'}
+        with mock.patch('sbx_omnigent.runner.click.echo'):
+            result, sc, wt = self._run(_LINEAR, {}, sc=sc)
+        self.assertEqual(result.status, 'completed')
+        self.assertNotIn(R._WRITER_FINISH_ASK, _messages_for(sc, 'build'))
+        self.assertIn(
+            'build: implement', [m for n, m, _a in wt.commits if n == 'build']
+        )
+
+    def test_the_finish_rules_allow_background_work(self) -> None:
+        for rule in (R._CHECK_FINISH, R._WRITER_FINISH):
+            with self.subTest(rule=rule[:40]):
+                self.assertIn('background', rule)
+                self.assertNotIn('do not end your turn while', rule)
 
 
 class TestAContractCheck(_Base):
