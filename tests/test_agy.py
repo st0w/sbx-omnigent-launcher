@@ -558,10 +558,10 @@ class TestDetail(unittest.TestCase):
         self.assertLess(len(out), 5000)
         self.assertIn('more characters', out)
 
-    def test_the_placeholder_token_is_masked(self) -> None:
+    def test_a_google_access_token_is_masked(self) -> None:
         # The real shape: 'ya29.' + 255 chars.
-        out = detail(f'agy: refusing token {PLACEHOLDER_TOKEN}')
-        self.assertNotIn(PLACEHOLDER_TOKEN, out)
+        out = detail(f'agy: refusing token {_REAL_TOKEN}')
+        self.assertNotIn(_REAL_TOKEN[5:], out)
         self.assertIn('ya29.***', out)
 
     def test_other_credential_shapes_are_masked(self) -> None:
@@ -582,8 +582,8 @@ class TestDetail(unittest.TestCase):
     def test_a_secret_inside_kept_text_is_still_masked(self) -> None:
         # Scrub happens BEFORE the cap, so raising the cap cannot widen
         # the leak window — which is the whole reason the scrub exists.
-        out = detail(f'{PLACEHOLDER_TOKEN} then ' + 'y' * 5000)
-        self.assertNotIn(PLACEHOLDER_TOKEN, out)
+        out = detail(f'{_REAL_TOKEN} then ' + 'y' * 5000)
+        self.assertNotIn(_REAL_TOKEN[5:], out)
         self.assertIn('ya29.***', out)
 
     def test_empty_input_is_empty(self) -> None:

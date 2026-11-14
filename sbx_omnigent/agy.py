@@ -54,12 +54,17 @@ TRUSTED_BOX_DEFAULT = 'agy-auth-trusted'
 TOKEN_FILE = '~/.gemini/antigravity-cli/antigravity-oauth-token'
 
 #: The **placeholder** access token that every agy *agent* VM emits and
-#: that the swap secret matches on the wire. It must look like a real
-#: access token (``ya29.`` prefix) so any format check passes, yet be
-#: unmistakably inert. Stage 3 injects this SAME value into agent VM
-#: token files — keep the two in sync by importing this constant.
+#: that the swap secret matches on the wire. Unmistakably inert, and
+#: deliberately NOT shaped like a Google access token: it used to carry
+#: the ``ya29.`` prefix, which made secret scanners report it as a
+#: leaked credential. Nothing needs the prefix: Omnigent's gate wants a
+#: non-empty token, and the proxy matches this exact string. The agent
+#: VM's token file and metadata stand-in serve this SAME value, so keep
+#: them in sync by importing this constant. Changing it registers a new
+#: swap secret beside the old one; remove the old one with
+#: ``sbx secret rm``.
 PLACEHOLDER_TOKEN = (
-    'ya29.a0-AGY-HARVEST-PROXY-SWAP-PLACEHOLDER-DO-NOT-USE-'
+    'omni-sbx-agy-PROXY-SWAP-PLACEHOLDER-DO-NOT-USE-'
     '0000000000000000000000000000'
 )
 
