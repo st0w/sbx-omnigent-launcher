@@ -1106,6 +1106,27 @@ class WorktreeManager:
             return None
         return out.strip() or None
 
+    def hub_ref_tip(self, run_id: str, ref: str) -> str | None:
+        """
+        The commit a branch that is not a node's points at ON THE HUB.
+
+        :param run_id: Pipeline run id.
+        :param ref: A branch name on the hub, e.g. the base branch.
+        :returns: The commit sha, or ``None`` when it does not resolve.
+        """
+        if ref.startswith('-'):
+            return None
+        try:
+            out = self._run(
+                [
+                    'git', '-C', self._run_repo(run_id), 'rev-parse',
+                    '--verify', '--quiet', f'{ref}^{{commit}}',
+                ]
+            )
+        except click.ClickException:
+            return None
+        return out.strip() or None
+
     def branch_contains(
         self, run_id: str, node_id: str, *, ancestor: str
     ) -> bool:
@@ -1382,6 +1403,28 @@ class WorktreeManager:
                 if existing and not existing.endswith('\n'):
                     fh.write('\n')
                 fh.write(f'{pattern}\n')
+
+    def read_run_artifact(self, run_id: str, relpath: str) -> str | None:
+        """
+        Read back a text artifact written by :meth:`write_run_artifact`.
+
+        :param run_id: Pipeline run id.
+        :param relpath: Its path under the run dir. Rejected if absolute
+            or escaping the run dir.
+        :returns: Its text, or ``None`` if it is missing, unreadable or
+            outside the run dir.
+        """
+        if not relpath or os.path.isabs(relpath):
+            return None
+        try:
+            root = os.path.realpath(self.run_dir(run_id))
+            full = os.path.realpath(os.path.join(root, relpath))
+            if full == root or os.path.commonpath([full, root]) != root:
+                return None
+            with open(full, encoding='utf-8') as handle:
+                return handle.read()
+        except (OSError, ValueError):
+            return None
 
     def write_tracked_file(
         self, worktree_path: str, relpath: str, content: str

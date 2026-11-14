@@ -340,6 +340,11 @@ class PipelineStage:
         when they cannot all be satisfied (#50). Naming a planner stage,
         it checks the plan's claims about existing code inside that
         stage's approval loop, before the plan is final (#49).
+    :param scans: When set, the stage's agent runs the claude-security
+        plugin over the named writer's branch, once per module, and
+        blocks on a Critical or High finding.
+    :param scan_effort: The scan's tier: ``low``, ``medium`` (the
+        default for a scan) or ``high``; ``None`` for any other stage.
     :param parallel: Concurrent sub-stages (each a full PipelineStage),
         for competing isolated writers.
     """
@@ -354,6 +359,8 @@ class PipelineStage:
     selects: str | None = None
     verifies: str | None = None
     checks: str | None = None
+    scans: str | None = None
+    scan_effort: str | None = None
     #: Hold this writer to TEST code only — every path it changes must
     #: match ``test_paths`` (or ``generated``). Declared per stage
     #: rather than inferred from the template: a pipeline may run the
@@ -618,7 +625,36 @@ def _parse_stage(raw: object, *, index: int) -> PipelineStage:
             entry.get('verifies'), f'stage {sid!r} verifies'
         ),
         checks=_opt_str(entry.get('checks'), f'stage {sid!r} checks'),
+        **_parse_scan_keys(entry, sid),
     )
+
+
+def _parse_scan_keys(
+    entry: dict[str, object], sid: str
+) -> dict[str, str | None]:
+    """
+    Parse a stage's ``scans`` and ``scan_effort``.
+
+    :param entry: The stage mapping.
+    :param sid: The stage id, for errors.
+    :returns: ``{'scans': ..., 'scan_effort': ...}``; the effort is
+        ``medium`` for a scan when unset, ``None`` for any other stage.
+    :raises PipelineError: On an unknown tier, or a tier without a scan.
+    """
+    scans = _opt_str(entry.get('scans'), f'stage {sid!r} scans')
+    effort = _opt_str(entry.get('scan_effort'), f'stage {sid!r} scan_effort')
+    if effort is not None and scans is None:
+        raise PipelineError(
+            f'stage {sid!r}: scan_effort is only for a stage that scans:'
+        )
+    if effort is not None and effort not in SCAN_EFFORTS:
+        raise PipelineError(
+            f'stage {sid!r}: scan_effort {effort!r} must be one of '
+            f'{", ".join(SCAN_EFFORTS)}'
+        )
+    if scans is not None and effort is None:
+        effort = 'medium'
+    return {'scans': scans, 'scan_effort': effort}
 
 
 def _parse_publish(raw: object) -> PublishSpec:
@@ -711,6 +747,7 @@ def _validate(config: PipelineConfig) -> None:
     seen_ids = _validate_stage_ids(config)
     _validate_stage_refs(config, seen_ids)
     _validate_contract_checks(config)
+    _validate_scans(config)
     _validate_model_families(config)
     _validate_codex_efforts(config)
     _validate_agy_efforts(config)
@@ -762,6 +799,7 @@ def _validate_stage_refs(
             *([(stage.on_block, 'on_block')] if stage.on_block else []),
             *([(stage.from_branch, 'from')] if stage.from_branch else []),
             *([(stage.checks, 'checks')] if stage.checks else []),
+            *([(stage.scans, 'scans')] if stage.scans else []),
         ):
             if ref not in seen_ids:
                 raise PipelineError(
@@ -901,7 +939,21 @@ def _validate_launch_sizes(config: PipelineConfig) -> None:
 
 
 #: The keys that declare a stage kind other than a contract check.
-_OTHER_KIND_KEYS = ('write', 'gate', 'on_block', 'selects', 'verifies')
+_OTHER_KIND_KEYS = (
+    'write', 'gate', 'on_block', 'selects', 'verifies', 'scans',
+)
+
+#: The claude-security plugin's tiers a scan stage may use. ``high`` is
+#: the most thorough and the most expensive.
+SCAN_EFFORTS = ('low', 'medium', 'high')
+
+#: The Claude Code plugin a scan stage runs; the pipeline's image must
+#: install it (``image.claude_plugins``).
+SCAN_PLUGIN = 'claude-security'
+
+#: What a scan stage may not also be: it is its own kind of stage. It
+#: may set ``on_block``, the writer that fixes what it finds.
+_SCAN_EXCLUDES = ('write', 'gate', 'selects', 'verifies', 'checks')
 
 
 def _is_tests_stage(config: PipelineConfig, stage: PipelineStage) -> bool:
@@ -993,6 +1045,85 @@ def _validate_contract_checks(config: PipelineConfig) -> None:
                 f'build. Add {sid!r} to the needs of each writer that '
                 f'builds against {target!r}.'
             )
+
+
+def _validate_scans(config: PipelineConfig) -> None:
+    """
+    Refuse a ``scans:`` stage that cannot scan what ships.
+
+    :param config: The assembled config, its references already
+        checked by :func:`_validate_stage_refs`.
+    :raises PipelineError: On a scan combined with another kind's key,
+        run by more than one agent or by an agent that is not Claude,
+        aimed at a stage that is not a writer or that it does not reach
+        through ``needs``, blocking back to a different writer, or in
+        a pipeline whose image does not install the plugin.
+    """
+    stages = _iter_stages(config.stages)
+    by_id = {stage.id: stage for stage in stages}
+    for stage in stages:
+        if stage.scans is None:
+            continue
+        sid, target = stage.id, stage.scans
+        other = [key for key in _SCAN_EXCLUDES if getattr(stage, key)]
+        if other:
+            raise PipelineError(
+                f'stage {sid!r}: scans cannot be combined with '
+                f'{", ".join(other)}. A scan is its own kind of stage.'
+            )
+        if len(stage.run) != 1:
+            raise PipelineError(
+                f'stage {sid!r}: a scan runs one agent, not '
+                f'{len(stage.run)}.'
+            )
+        agent = config.agents[stage.run[0]]
+        if agent.harness in agy.AGY_HARNESSES or (
+            agent.harness in codex.CODEX_HARNESSES
+        ):
+            raise PipelineError(
+                f'stage {sid!r}: a scan runs the claude-security plugin, '
+                f'so its agent must be a Claude agent, not '
+                f'{agent.harness!r}.'
+            )
+        if not by_id[target].write:
+            raise PipelineError(
+                f'stage {sid!r} scans {target!r}, which is not a writer. '
+                f'It must name the writer whose branch ships.'
+            )
+        if target not in _upstream(by_id, sid):
+            raise PipelineError(
+                f'stage {sid!r} scans {target!r} but does not reach it '
+                f'through needs, so it could scan before {target!r} has '
+                f'written anything. List the review of {target!r} in its '
+                f'needs.'
+            )
+        if stage.on_block not in (None, target):
+            raise PipelineError(
+                f'stage {sid!r}: on_block must be {target!r}, the writer '
+                f'it scans and the one that can fix what it finds.'
+            )
+        plugins = config.image.claude_plugins if config.image else ()
+        if not any(
+            p.split('@', 1)[0] == SCAN_PLUGIN for p in plugins
+        ):
+            raise PipelineError(
+                f'stage {sid!r} runs the {SCAN_PLUGIN} plugin, which the '
+                f'pipeline image does not install. Add it to the image: '
+                f'claude_plugins: [{SCAN_PLUGIN}@claude-plugins-official]'
+            )
+
+
+def _upstream(by_id: dict[str, PipelineStage], sid: str) -> set[str]:
+    """Every stage *sid* depends on through ``needs``, transitively."""
+    seen: set[str] = set()
+    pending = list(by_id[sid].needs)
+    while pending:
+        current = pending.pop()
+        if current in seen or current not in by_id:
+            continue
+        seen.add(current)
+        pending.extend(by_id[current].needs)
+    return seen
 
 
 def _iter_stages(

@@ -66,6 +66,7 @@ from sbx_omnigent import (
     pipeline,
     readback,
     sbx_cli,
+    security_scan,
     verify,
 )
 from sbx_omnigent.defaults import DEFAULT_EGRESS_ALLOW, DEFAULT_HOST_IMAGE
@@ -2451,6 +2452,10 @@ class ReviewRecord:
     #: lossy. Additive with an empty default, so state written before
     #: it restores as "no report" and RUN_STATE_VERSION does not move.
     blocking_report: str = ''
+    #: Files saved under the run directory with this record, committed
+    #: beside the reviews record at publish: a security scan's own
+    #: report folder. Additive with an empty default, like the above.
+    attachments: tuple[str, ...] = ()
 
     def filed_findings(self) -> list[tuple[int, str]]:
         """
@@ -2510,6 +2515,7 @@ class ReviewRecord:
             'environment': list(self.environment),
             'target': self.target,
             'blocking_report': self.blocking_report,
+            'attachments': list(self.attachments),
         }
 
     @classmethod
@@ -2556,6 +2562,7 @@ class ReviewRecord:
                 if isinstance(raw.get('blocking_report'), str)
                 else ''
             ),
+            attachments=_strings(raw.get('attachments')),
         )
 
 
@@ -4833,6 +4840,7 @@ class PipelineRunner:
             from_branch=new_from,
             on_block=ns(stage.on_block) if stage.on_block else None,
             checks=ns(stage.checks) if stage.checks else None,
+            scans=ns(stage.scans) if stage.scans else None,
         )
 
     def _resolve_campaign_winner(self, chunk_id: str) -> str:
@@ -4881,6 +4889,7 @@ class PipelineRunner:
         if self._config.subtasks or first:
             self._commit_planning_session(winner, plan_path)
         review_doc = self._commit_review_records(winner, plan_path)
+        self._commit_security_reports(winner, plan_path)
         self._publish_findings(winner, review_doc)
         pick_doc = self._commit_judge_record(winner, plan_path)
         open_pr = self._config.publish.mode == 'pr'
@@ -5441,6 +5450,81 @@ class PipelineRunner:
         )
         return path
 
+    def _commit_security_reports(
+        self, winner: str, plan_path: str
+    ) -> str | None:
+        """
+        Commit the publishing chunk's scan reports beside its reviews.
+
+        One folder per round, ``<plan>-security/r<N>-<timestamp>/``,
+        holding the files saved when the round's report was read. A
+        saved file that has gone missing is reported and the rest are
+        committed: the findings themselves are in the reviews record.
+
+        :param winner: The node being published.
+        :param plan_path: The plan artifact path, whose name the folder
+            follows.
+        :returns: The committed folder, or ``None``.
+        """
+        saved = [
+            relpath
+            for record in self._chunk_reviews()
+            for relpath in record.attachments
+        ]
+        if not saved:
+            return None
+        folder = self._security_artifact_path(plan_path)
+        tree = self._wt.node_worktree_path(self._run_id, winner)
+        written = 0
+        try:
+            for relpath in saved:
+                text = self._wt.read_run_artifact(self._run_id, relpath)
+                round_dir = PurePosixPath(relpath).parent.name
+                name = PurePosixPath(relpath).name
+                if text is None:
+                    click.echo(
+                        f'[security] WARNING: {relpath} is missing from the '
+                        f'run directory; it is not committed.'
+                    )
+                    continue
+                self._wt.write_tracked_file(
+                    tree, f'{folder}/{round_dir}/{name}', text
+                )
+                written += 1
+            if not written:
+                return None
+            committed = self._wt.commit_node(
+                self._run_id, winner,
+                message='docs: add security scan reports',
+                author='security-scan <security-scan@pipeline.local>',
+            )
+        except click.ClickException as exc:
+            click.echo(
+                f'[security] WARNING: could not commit the security scan '
+                f'reports to {folder}: {exc}'
+            )
+            return None
+        if not committed:
+            return None
+        click.echo(
+            f'[security] committed {written} security scan report '
+            f'file(s) to {folder}/.'
+        )
+        return folder
+
+    def _security_artifact_path(self, plan_path: str) -> str:
+        """The scan reports' folder: ``<plan>-security`` beside it."""
+        p = PurePosixPath(plan_path)
+        return str(p.with_name(f'{p.stem}-security'))
+
+    def _security_folder_name(self) -> str:
+        """The scan reports' folder name, for the record to cite."""
+        return PurePosixPath(
+            self._security_artifact_path(
+                self._chunk_plan_path(self._active_subtask)
+            )
+        ).name
+
     def _commit_judge_record(
         self, winner: str, plan_path: str
     ) -> str | None:
@@ -5843,10 +5927,22 @@ class PipelineRunner:
         if self._config.subtasks:
             node = self._nodes.get(f'{sub.id}-plan')
             plan = node.output if node else None
-            p = PurePosixPath(self._plan_artifact_path())
-            return plan, str(p.with_name(f'{p.stem}-{sub.id}{p.suffix}'))
+            return plan, self._chunk_plan_path(sub)
         plan = self._plan_of_record if first else None
-        return plan, self._plan_artifact_path()
+        return plan, self._chunk_plan_path(sub)
+
+    def _chunk_plan_path(self, sub: pipeline.Subtask | None) -> str:
+        """
+        The repo path a chunk's plan of record is committed to.
+
+        :param sub: The chunk, or ``None`` outside a campaign.
+        :returns: ``…-<module>.md`` in per-module mode, otherwise the
+            run's own plan path.
+        """
+        if sub is not None and self._config.subtasks:
+            p = PurePosixPath(self._plan_artifact_path())
+            return str(p.with_name(f'{p.stem}-{sub.id}{p.suffix}'))
+        return self._plan_artifact_path()
 
     def _record_decisions(self, plan: str | None) -> None:
         """
@@ -6900,9 +6996,12 @@ class PipelineRunner:
         # running together would leave only half of it for the four
         # reviewers. It also keeps the cap deadlock-free at any nesting
         # depth: only leaves acquire, and a leaf never waits on
-        # another leaf's slot.
+        # another leaf's slot. A scan is charged the same way: it runs
+        # the review stages in its needs again after a fix, and each of
+        # their turns takes a slot, so the scan takes one only for its
+        # own turn (_scan_round).
         slot: contextlib.AbstractContextManager[object] = (
-            contextlib.nullcontext() if kind == 'review'
+            contextlib.nullcontext() if kind in ('review', 'scan')
             else self._node_slots
         )
         # Spans the release below so a node that DOES hand its guest
@@ -6910,19 +7009,16 @@ class PipelineRunner:
         # let in. A writer's guest deliberately outlives its slot: a
         # review block may re-drive it, and re-booting costs more than
         # an idle VM.
+        run = {
+            'writer': self._run_writer,
+            'judge': self._run_judge,
+            'verify': self._run_verify,
+            'check': self._run_check,
+            'scan': self._run_scan,
+            'review': self._run_review,
+        }.get(kind, self._run_reader)
         with slot:
-            if kind == 'writer':
-                self._run_writer(stage)
-            elif kind == 'judge':
-                self._run_judge(stage)
-            elif kind == 'verify':
-                self._run_verify(stage)
-            elif kind == 'check':
-                self._run_check(stage)
-            elif kind == 'review':
-                self._run_review(stage)
-            else:
-                self._run_reader(stage)
+            run(stage)
             with self._lock:
                 self._completed.add(stage.id)
             # BEFORE the session release, so the sample sees the
@@ -6977,6 +7073,9 @@ class PipelineRunner:
             return 'verify'
         if stage.checks:
             return 'check'
+        # Before review: a scan also names the writer it blocks back to.
+        if stage.scans:
+            return 'scan'
         if stage.gate or stage.on_block:
             return 'review'
         return 'reader'
@@ -7022,6 +7121,10 @@ class PipelineRunner:
             self._provision_node(stage, 'reader', 'ro')
         elif kind == 'check':
             self._provision_node(stage, 'check', 'ro')
+        elif kind == 'scan':
+            # A scan runs on a fresh clone of what ships, cut when the
+            # scan runs; there is nothing to stand up in advance.
+            return
         elif kind == 'review':
             target_wt = self._nodes[self._review_target(stage)].worktree
             assert target_wt is not None
@@ -7440,6 +7543,241 @@ class PipelineRunner:
                 # beyond its own module is the decisions it settled that
                 # bind later ones.
                 self._record_decisions(node.output)
+
+    def _run_scan(self, stage: pipeline.PipelineStage) -> None:
+        """
+        Scan the branch about to ship with the claude-security plugin.
+
+        Once per module, after the review in its ``needs``: a writable
+        clone of the writer it names, the plugin run over the changes
+        since the module started, and the plugin's own results file
+        read. Critical and High findings go back to the ``on_block``
+        writer; then every review stage in the scan's ``needs`` runs
+        again (the fix changed code they approved), then the scan. Past
+        the round cap the run blocks for a human. Medium and Low are
+        recorded as the scan's findings, so triage checks them against
+        the shipping code and files what reproduces.
+
+        :param stage: The ``scans:`` stage.
+        :raises PipelineRunError: If the scan writes no report, or one
+            that cannot be read.
+        :raises _Blocked: If it still blocks after the round cap, or
+            blocks with no writer to send its findings to.
+        """
+        assert stage.scans is not None and stage.scan_effort is not None
+        while True:
+            round_no = self._next_review_round(stage.id)
+            findings = self._scan_round(stage, round_no)
+            blocking = [f for f in findings if f.blocks]
+            if not blocking:
+                self._nodes[stage.id] = NodeResult(
+                    stage.id, 'scan', verdict='APPROVED'
+                )
+                return
+            rounds = self._spend_review_round(stage.id)
+            if rounds > self._max_rounds or not stage.on_block:
+                self._nodes[stage.id] = NodeResult(
+                    stage.id, 'scan', verdict='BLOCKING'
+                )
+                raise _Blocked(stage.id, rounds)
+            click.echo(
+                f'[scan] {stage.id}: {len(blocking)} Critical/High '
+                f'finding(s); sending them to {stage.on_block}, then '
+                f'reviewing and scanning again.'
+            )
+            self._redrive_writer(
+                stage.on_block, security_scan.render_blocking(blocking)
+            )
+            for need in stage.needs:
+                review = self._stage_by_id.get(need)
+                if review is not None and self._stage_kind(review) == 'review':
+                    self._run_review(review)
+
+    def _scan_round(
+        self, stage: pipeline.PipelineStage, round_no: int
+    ) -> tuple[security_scan.ScanFinding, ...]:
+        """
+        One scan: clone, drive the plugin, read and record its results.
+
+        :param stage: The ``scans:`` stage.
+        :param round_no: Which scan round this is.
+        :returns: Every finding the scan reported.
+        :raises PipelineRunError: If it wrote no report, or one that
+            cannot be read.
+        """
+        assert stage.scans is not None and stage.scan_effort is not None
+        base = self._module_start()
+        worktree = self._wt.create_node_worktree(
+            self._run_id, stage.id, from_node=stage.scans, replace=True
+        )
+        try:
+            with self._node_slots:
+                report = self._drive_scan(stage, worktree, base)
+            if report is None:
+                raise PipelineRunError(
+                    f'{stage.id}: the security scan wrote no report (no '
+                    f'CLAUDE-SECURITY-*/{security_scan.RESULTS_NAME} in '
+                    f'{worktree}). Its turn is in the run directory under '
+                    f'turns/.'
+                )
+            findings = security_scan.parse_report(report.results)
+        except security_scan.ScanReportError as exc:
+            raise PipelineRunError(
+                f'{stage.id}: could not read the report the security '
+                f'scan wrote: {exc}'
+            ) from exc
+        saved = self._save_scan_report(stage, round_no, report)
+        self._record_scan(stage, round_no, findings, base, saved)
+        return findings
+
+    def _save_scan_report(
+        self,
+        stage: pipeline.PipelineStage,
+        round_no: int,
+        report: security_scan.ScanReport,
+    ) -> tuple[str, ...]:
+        """
+        Save a round's report folder to the run directory, at once.
+
+        The clone it was read from is replaced by the next round and
+        removed with the run, so this copy is the one committed at
+        publish.
+
+        :param stage: The ``scans:`` stage.
+        :param round_no: Which scan round this was.
+        :param report: The folder read out of the clone.
+        :returns: Each saved file's path under the run directory.
+        :raises PipelineRunError: If a file cannot be saved.
+        """
+        folder = f'security/{stage.id}/r{round_no}-{report.stamp}'
+        saved = []
+        for name, text in report.files:
+            relpath = f'{folder}/{name}'
+            if not self._wt.write_run_artifact(self._run_id, relpath, text):
+                raise PipelineRunError(
+                    f'{stage.id}: could not save the security scan report '
+                    f'{relpath} to the run directory'
+                )
+            saved.append(relpath)
+        return tuple(saved)
+
+    def _drive_scan(
+        self, stage: pipeline.PipelineStage, worktree: str, base: str
+    ) -> security_scan.ScanReport | None:
+        """
+        Run the plugin in a session of its own, then hand the VM back.
+
+        :param stage: The ``scans:`` stage.
+        :param worktree: The writable clone to scan.
+        :param base: The commit to scan from.
+        :returns: The report folder, or ``None`` if it wrote none (its
+            turn is then kept in the run directory).
+        :raises security_scan.ScanReportError: If the folder holds a
+            file that cannot be read safely.
+        """
+        assert stage.scan_effort is not None
+        session = self._create_session(stage.run[0], worktree, 'rw', stage.id)
+        try:
+            self._drive(
+                session,
+                security_scan.instruction(base=base, effort=stage.scan_effort),
+            )
+            report = security_scan.collect_report(worktree)
+            if report is None:
+                self._capture_turn(session, 'the scan wrote no report')
+            return report
+        finally:
+            self._free_session(
+                session, f'{stage.id}: the scan is done with its VM.'
+            )
+
+    def _record_scan(
+        self,
+        stage: pipeline.PipelineStage,
+        round_no: int,
+        findings: tuple[security_scan.ScanFinding, ...],
+        base: str,
+        saved: tuple[str, ...],
+    ) -> None:
+        """
+        Record a scan as a vote, so reports, triage and filing take it.
+
+        BLOCKING with its Critical and High findings as the blocking
+        report, APPROVED otherwise; Medium and Low are its findings,
+        each one line tagged with its ``security-<severity>`` label.
+
+        :param stage: The ``scans:`` stage.
+        :param round_no: Which scan round this was.
+        :param findings: Everything the scan reported.
+        :param base: The commit it scanned from.
+        :param saved: The round's report files under the run directory,
+            committed beside the reviews record at publish.
+        """
+        assert stage.scan_effort is not None
+        blocking = [f for f in findings if f.blocks]
+        defects = tuple(
+            security_scan.render_defect(f) for f in findings if not f.blocks
+        )
+        report = security_scan.render_report(
+            findings, base=base, effort=stage.scan_effort, round_no=round_no
+        )
+        if saved:
+            folder = PurePosixPath(saved[0]).parent.name
+            report += (
+                f'\n\nThe plugin report for this round (Markdown, JSONL, '
+                f'SARIF and the revision stamp) is committed beside this '
+                f'record in `{self._security_folder_name()}/{folder}/`.'
+            )
+        verdict = 'BLOCKING' if blocking else 'APPROVED'
+        record = ReviewRecord(
+            chunk=self._active_subtask.id if self._active_subtask else None,
+            stage=stage.id,
+            reviewer=stage.run[0],
+            round_no=round_no,
+            verdict=verdict,
+            turns=(('assistant', f'{report}\n\nVERDICT: {verdict}'),),
+            findings=defects,
+            defects=defects,
+            target=stage.scans,
+            blocking_report=(
+                security_scan.render_blocking(blocking) if blocking else ''
+            ),
+            attachments=saved,
+        )
+        with self._lock:
+            self._reviews.append(record)
+        self._wt.write_run_artifact(
+            self._run_id,
+            f'reviews/{record.slug}.md',
+            render_review_records(
+                [record], title=f'Review — {record.label}'
+            ),
+        )
+        self._save_state()
+
+    def _module_start(self) -> str:
+        """
+        The commit the module being built started from.
+
+        In a campaign after its first module, that is the campaign
+        branch's tip: the previous module's winner, which this module's
+        writers were cut from. Otherwise it is the base branch.
+
+        :returns: A commit id on the run's hub.
+        :raises PipelineRunError: If neither resolves.
+        """
+        if self._active_subtask is not None:
+            tip = self._wt.hub_branch_tip(self._run_id, 'campaign')
+            if tip:
+                return tip
+        base = self._config.base_branch or 'main'
+        tip = self._wt.hub_ref_tip(self._run_id, base)
+        if not tip:
+            raise PipelineRunError(
+                f'cannot find the base branch {base!r} on the hub of '
+                f'run {self._run_id} to scan from'
+            )
+        return tip
 
     def _run_check(self, stage: pipeline.PipelineStage) -> None:
         """
@@ -11319,6 +11657,9 @@ class PipelineRunner:
         review_doc = self._commit_review_records(
             branch_node, self._plan_artifact_path()
         )
+        self._commit_security_reports(
+            branch_node, self._plan_artifact_path()
+        )
         self._publish_findings(branch_node, review_doc)
         pick_doc = self._commit_judge_record(
             branch_node, self._plan_artifact_path()
@@ -11470,7 +11811,7 @@ Only WRITERS now sum. Everything else is freed before the peak:
             else:
                 total += len(stage.run)
         elif reclaim and (
-            kind in ('reader', 'judge', 'check')
+            kind in ('reader', 'judge', 'check', 'scan')
             or (kind == 'writer' and writer_is_terminal(config, stage.id))
         ):
             continue  # freed at stage completion, never re-driven

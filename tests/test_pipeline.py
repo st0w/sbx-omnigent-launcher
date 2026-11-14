@@ -1482,6 +1482,114 @@ class TestAClaudeModelTheSentinelCanCarry(_Base):
         self.assertEqual(cfg.agents['plan'].model, 'Gemini-3.5-Flash')
 
 
+#: _FULL with a bugs-only review and a security scan after it.
+_SCANNED = _FULL.replace(
+    '  sec:\n    template: security-reviewer\n    model: claude-fable-5\n',
+    '  sec:\n    template: security-reviewer\n    model: claude-fable-5\n'
+    '  bugs:\n    template: bug-reviewer\n    model: claude-sonnet-5\n',
+).replace(
+    '    run: [sec]\n    needs: [build]\n    gate: consensus\n'
+    '    on_block: build\n',
+    '    run: [bugs]\n    needs: [build]\n    gate: consensus\n'
+    '    on_block: build\n'
+    '  - {id: scan, run: sec, scans: build, needs: [review], '
+    'on_block: build}\n',
+) + _IMAGE + '  claude_plugins: [claude-security@claude-plugins-official]\n'
+
+
+class TestAScanStage(_Base):
+    """A ``scans:`` stage runs the claude-security plugin over the
+    writer it names, once per module, after the review in its needs."""
+
+    def _scan(self, text: str = _SCANNED) -> P.PipelineStage:
+        cfg = self._load(text)
+        return next(s for s in cfg.stages if s.id == 'scan')
+
+    def _refused(self, old: str, new: str) -> str:
+        text = _SCANNED.replace(old, new)
+        self.assertNotEqual(text, _SCANNED)
+        with self.assertRaises(P.PipelineError) as caught:
+            self._load(text)
+        return str(caught.exception)
+
+    def test_it_parses(self) -> None:
+        scan = self._scan()
+        self.assertEqual(
+            (scan.scans, scan.on_block, scan.scan_effort),
+            ('build', 'build', 'medium'),
+        )
+
+    def test_the_effort_can_be_set(self) -> None:
+        text = _SCANNED.replace(
+            'on_block: build}', 'on_block: build, scan_effort: low}'
+        )
+        self.assertEqual(self._scan(text).scan_effort, 'low')
+
+    def test_an_unknown_effort_is_refused(self) -> None:
+        message = self._refused(
+            'on_block: build}', 'on_block: build, scan_effort: max}'
+        )
+        self.assertIn('scan_effort', message)
+
+    def test_an_effort_without_a_scan_is_refused(self) -> None:
+        message = self._refused(
+            '    gate: consensus\n',
+            '    gate: consensus\n    scan_effort: low\n',
+        )
+        self.assertIn('scan_effort', message)
+
+    def test_more_than_one_agent_is_refused(self) -> None:
+        message = self._refused('run: sec, scans', 'run: [sec, bugs], scans')
+        self.assertIn('one agent', message)
+
+    def test_a_target_that_is_not_a_writer_is_refused(self) -> None:
+        message = self._refused('scans: build', 'scans: plan')
+        self.assertIn('writer', message)
+
+    def test_a_target_not_reached_through_needs_is_refused(self) -> None:
+        message = self._refused(
+            'scans: build, needs: [review]', 'scans: build, needs: [plan]'
+        )
+        self.assertIn('needs', message)
+
+    def test_on_block_must_be_the_target(self) -> None:
+        message = self._refused(
+            'needs: [review], on_block: build}',
+            'needs: [review], on_block: plan}',
+        )
+        self.assertIn('on_block', message)
+
+    def test_it_cannot_also_write_or_gate_or_check(self) -> None:
+        for extra in ('write: true', 'gate: consensus', 'checks: build'):
+            with self.subTest(extra=extra):
+                message = self._refused(
+                    'on_block: build}', f'on_block: build, {extra}}}'
+                )
+                self.assertIn('scans', message)
+
+    def test_a_pipeline_without_an_image_is_refused(self) -> None:
+        text = _SCANNED[:_SCANNED.index('image:\n')]
+        with self.assertRaises(P.PipelineError) as caught:
+            self._load(text)
+        self.assertIn('claude-security', str(caught.exception))
+
+    def test_an_image_without_the_plugin_is_refused(self) -> None:
+        message = self._refused(
+            'claude_plugins: [claude-security@claude-plugins-official]',
+            'claude_plugins: [other@claude-plugins-official]',
+        )
+        self.assertIn('claude-security', message)
+
+    def test_a_non_claude_agent_is_refused(self) -> None:
+        message = self._refused(
+            '  sec:\n    template: security-reviewer\n'
+            '    model: claude-fable-5\n',
+            '  sec:\n    template: security-reviewer\n'
+            '    harness: codex-native\n    model: gpt-6-astra\n',
+        )
+        self.assertIn('claude', message.lower())
+
+
 class TestTheBuildCacheIsRetired(_Base):
     """
     ``build_cache`` is refused, so a pipeline that still sets it says so
