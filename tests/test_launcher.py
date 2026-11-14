@@ -308,6 +308,51 @@ class TestStartHostDispatch(unittest.TestCase):
                 )
         cs.assert_not_called()
 
+    def _seeded_model(self, repo_branch: str) -> object:
+        with (
+            mock.patch.object(self.launcher, '_create_sandbox'),
+            mock.patch.object(self.launcher, '_launch_host'),
+            mock.patch.object(
+                self.launcher, '_make_scratch', return_value='/scratch'
+            ),
+            mock.patch.object(self.launcher, '_seed_claude_settings') as seed,
+        ):
+            self._run(repo_url=_sentinel(self.swarm), repo_branch=repo_branch)
+        return seed.call_args.kwargs.get('model')
+
+    def test_a_claude_vms_model_reaches_its_settings(self) -> None:
+        self.assertEqual(
+            self._seeded_model('ro/claude-mythos-5-2'), 'claude-mythos-5-2'
+        )
+
+    def test_the_model_does_not_change_the_mount(self) -> None:
+        with (
+            mock.patch.object(self.launcher, '_create_sandbox') as cs,
+            mock.patch.object(self.launcher, '_launch_host'),
+            mock.patch.object(
+                self.launcher, '_make_scratch', return_value='/scratch'
+            ),
+            mock.patch.object(self.launcher, '_seed_claude_settings'),
+        ):
+            self._run(
+                repo_url=_sentinel(self.swarm),
+                repo_branch='ro/claude-mythos-5-2',
+            )
+        cs.assert_called_once_with('box', ['/scratch', f'{self.real}:ro'])
+
+    def test_without_a_model_nothing_is_put_in_the_slot(self) -> None:
+        self.assertIsNone(self._seeded_model('rw'))
+
+    def test_a_model_on_a_codex_or_agy_sentinel_is_refused(self) -> None:
+        for branch in ('rw-codex/gpt-6', 'ro-agy/gemini-4'):
+            with self.subTest(branch=branch):
+                with self.assertRaises(click.ClickException):
+                    self._seeded_model(branch)
+
+    def test_a_malformed_model_is_refused(self) -> None:
+        with self.assertRaises(click.ClickException):
+            self._seeded_model('rw/claude..x')
+
     def test_non_sentinel_repo_url_delegates(self) -> None:
         with (
             mock.patch.object(self.launcher, '_create_sandbox') as cs,

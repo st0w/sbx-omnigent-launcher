@@ -1369,6 +1369,24 @@ class TestEgressConfig(_Base):
                 self.assertIn('egress[0]', str(caught.exception))
 
 
+class TestAClaudeModelTheSentinelCanCarry(_Base):
+    """A Claude agent's model rides in the mount sentinel to the
+    launcher; one it cannot carry is refused here, not dropped later."""
+
+    def test_a_carriable_model_loads(self) -> None:
+        cfg = self._load(_FULL.replace('claude-fable-5', 'claude-mythos-5-2'))
+        self.assertEqual(cfg.agents['sec'].model, 'claude-mythos-5-2')
+
+    def test_one_it_cannot_carry_is_refused(self) -> None:
+        with self.assertRaises(P.PipelineError) as caught:
+            self._load(_FULL.replace('claude-fable-5', 'claude-opus-4-8[1m]'))
+        self.assertIn("agent 'sec'", str(caught.exception))
+
+    def test_another_harness_is_not_held_to_it(self) -> None:
+        cfg = self._load(_FULL.replace('gemini-3.5-flash', 'Gemini-3.5-Flash'))
+        self.assertEqual(cfg.agents['plan'].model, 'Gemini-3.5-Flash')
+
+
 class TestTheBuildCacheIsRetired(_Base):
     """
     ``build_cache`` is refused, so a pipeline that still sets it says so

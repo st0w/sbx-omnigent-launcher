@@ -878,8 +878,11 @@ class TestLinear(_Base):
         build_wt = by_label['build']['workspace'].split('#')[0]
         sec_ws = by_label['review-sec']['workspace']
         self.assertNotEqual(build_wt, sec_ws.split('#')[0])
-        self.assertTrue(sec_ws.endswith('#ro'), sec_ws)
-        self.assertTrue(by_label['build']['workspace'].endswith('#rw'))
+        # Each sentinel also names the Claude agent's pinned model.
+        self.assertTrue(sec_ws.endswith('#ro/claude-fable-5'), sec_ws)
+        self.assertTrue(
+            by_label['build']['workspace'].endswith('#rw/claude-sonnet-5')
+        )
 
     def test_only_agy_terminals_are_warmed_at_create(self) -> None:
         # An agy terminal auto-creates with the session, so it can be
@@ -9188,6 +9191,23 @@ class TestCtrlCStopsTheRunNow(_Base):
         self.assertEqual(order, ['harvester', 'exit 130'])
 
 
+class TestAClaudeSessionCarriesItsModel(_Base):
+    """The launcher puts a Claude agent's pinned model in the VM's
+    /model picker, so Omnigent launches it rather than the default."""
+
+    def _workspaces(self) -> dict[str, str]:
+        _r, sc, _wt = self._run(_LINEAR, dict(_LINEAR_REPLIES))
+        return {sc.label_of(c['sid']): c['workspace'] for c in sc.creates}
+
+    def test_a_claude_agents_sentinel_names_its_model(self) -> None:
+        self.assertTrue(
+            self._workspaces()['build'].endswith('#rw/claude-sonnet-5')
+        )
+
+    def test_an_agy_agents_does_not(self) -> None:
+        self.assertTrue(self._workspaces()['plan'].endswith('#ro-agy'))
+
+
 class TestPlanArtifact(_Base):
     def test_consolidation_turn_driven_after_approval(self) -> None:
         # After approval the planner is driven ONE more turn to emit a
@@ -15392,7 +15412,8 @@ class TestAReviewerBuildsOnItsOwnDisk(_Base):
 
     def test_without_a_cache_nothing_changes(self) -> None:
         _r, workspace, msg = self._reviewer(_LINEAR)
-        self.assertTrue(workspace.endswith('#ro'), workspace)
+        # Read-only; the suffix is the reviewer's pinned model.
+        self.assertTrue(workspace.endswith('#ro/claude-fable-5'), workspace)
         self.assertIn('CARGO_TARGET_DIR=/tmp/review-target', msg)
 
     def test_a_refactor_reviewer_is_told_too(self) -> None:

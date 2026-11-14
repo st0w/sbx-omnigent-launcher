@@ -86,6 +86,23 @@ SETTINGS_REL_PATH = '.claude/settings.json'
 #: what moves a VM to a new version partway through a run.
 AUTOUPDATER_ENV = 'DISABLE_AUTOUPDATER'
 
+#: Claude Code's one extra ``/model`` picker slot, set in the same
+#: ``env`` block (documented: code.claude.com "Custom model options").
+#: Omnigent launches a session's pinned model only if the picker lists
+#: it, and the picker otherwise lists just the default and the four
+#: family aliases (sonnet, fable, opus, haiku), each resolving to one
+#: id. Live, a reviewer pinned to ``claude-mythos-5-2`` was launched on
+#: ``claude-sonnet-5-5`` with the pin cleared, though the same login
+#: served Mythos when asked by id. A VM runs one session, so its slot
+#: holds that session's model.
+CUSTOM_MODEL_ENV = 'ANTHROPIC_CUSTOM_MODEL_OPTION'
+
+#: A model id the slot can hold and the mount sentinel can carry:
+#: Omnigent lowercases the fragment and holds it to git's branch rules,
+#: so only lowercase letters and digits, joined by single ``.``/``-``.
+_CUSTOM_MODEL_RE = re.compile(r'[a-z0-9]+(?:[.-][a-z0-9]+)*')
+_CUSTOM_MODEL_MAX = 128
+
 #: Printed by :func:`build_version_pin_script` once ``claude --version``
 #: reports the pinned version.
 PIN_OK_MARKER = '__omni_claude_pin_ok__'
@@ -207,7 +224,31 @@ def build_version_pin_script(version: str) -> str:
     )
 
 
-def build_settings_seed_script(*, disable_autoupdater: bool = False) -> str:
+def validate_custom_model(value: object) -> str:
+    """
+    Return *value* if a VM's picker slot can hold it, else raise.
+
+    :param value: A model id, e.g. ``"claude-mythos-5-2"``.
+    :returns: *value*, unchanged.
+    :raises ValueError: If it is not lowercase letters and digits
+        joined by single ``.`` or ``-``, or is over 128 characters.
+    """
+    if (
+        not isinstance(value, str)
+        or len(value) > _CUSTOM_MODEL_MAX
+        or not _CUSTOM_MODEL_RE.fullmatch(value)
+    ):
+        raise ValueError(
+            f'a pinned Claude model must be lowercase letters and digits '
+            f'joined by single "." or "-", like claude-mythos-5-2, to reach '
+            f"the VM's /model picker; got {value!r}"
+        )
+    return value
+
+
+def build_settings_seed_script(
+    *, disable_autoupdater: bool = False, custom_model: str | None = None
+) -> str:
     """
     The in-VM program that pre-accepts the bypass-permissions dialog.
 
@@ -226,8 +267,15 @@ def build_settings_seed_script(*, disable_autoupdater: bool = False) -> str:
         file's ``env`` block, so a VM pinned to a Claude Code version
         stays on it for the whole run. Existing ``env`` entries are
         kept; an ``env`` that is not a mapping fails loud.
+    :param custom_model: Also put this model in the picker's extra slot
+        (:data:`CUSTOM_MODEL_ENV`), replacing any earlier value, so a
+        session pinned to it is launched on it.
     :returns: A ``python3 -c`` program printing :data:`SEED_OK_MARKER`.
+    :raises ValueError: If *custom_model* is not a model the slot can
+        hold (see :func:`validate_custom_model`).
     """
+    if custom_model is not None:
+        validate_custom_model(custom_model)
     return (
         'import json, os, pathlib, sys\n'
         "home = pathlib.Path(os.path.expanduser('~'))\n"
@@ -248,6 +296,13 @@ def build_settings_seed_script(*, disable_autoupdater: bool = False) -> str:
         "        sys.exit('claude settings env is not a mapping: %s' % p)\n"
         f"    if env.get({AUTOUPDATER_ENV!r}) != '1':\n"
         f"        env[{AUTOUPDATER_ENV!r}] = '1'\n"
+        '        changed = True\n'
+        f'if {custom_model!r} is not None:\n'
+        "    env = data.setdefault('env', {})\n"
+        '    if not isinstance(env, dict):\n'
+        "        sys.exit('claude settings env is not a mapping: %s' % p)\n"
+        f'    if env.get({CUSTOM_MODEL_ENV!r}) != {custom_model!r}:\n'
+        f'        env[{CUSTOM_MODEL_ENV!r}] = {custom_model!r}\n'
         '        changed = True\n'
         'if changed:\n'
         '    p.parent.mkdir(parents=True, exist_ok=True)\n'

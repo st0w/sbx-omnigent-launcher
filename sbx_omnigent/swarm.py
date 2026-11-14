@@ -36,7 +36,7 @@ from pathlib import Path
 import click
 import yaml
 
-from sbx_omnigent import agy, codex
+from sbx_omnigent import agy, claude, codex
 from sbx_omnigent._compat import CODEX_EFFORTS
 from sbx_omnigent.launch_args import (
     YOLO_LAUNCH_ARGS,
@@ -158,6 +158,7 @@ def mount_sentinel(
     mode: str,
     *,
     credential: str | None = None,
+    model: str | None = None,
 ) -> str:
     """
     Build the launcher mount sentinel for a worktree + mode.
@@ -169,10 +170,16 @@ def mount_sentinel(
         THIS VM — one of :data:`MOUNT_CREDENTIAL_KINDS`, or ``None`` to
         seed nothing (Claude). Tagged as a ``-<kind>`` suffix on the
         mode fragment, which round-trips Omnigent's branch validation.
+    :param model: For a Claude VM only (no *credential*): the session's
+        pinned model, tagged as ``/<model>`` so the launcher can put it
+        in the VM's ``/model`` picker (see
+        :data:`sbx_omnigent.claude.CUSTOM_MODEL_ENV`).
     :returns: e.g. ``"git@sbxmount:/srv/worktrees/a#ro"``, or
-        ``"…#rw-agy"`` / ``"…#rw-codex"`` when *credential* is set.
-    :raises ValueError: If *mode* is not ``"rw"``/``"ro"``, or
-        *credential* is not a known kind.
+        ``"…#rw-agy"`` / ``"…#rw-codex"`` when *credential* is set, or
+        ``"…#ro/claude-mythos-5-2"`` when *model* is.
+    :raises ValueError: If *mode* is not ``"rw"``/``"ro"``,
+        *credential* is not a known kind, or *model* is given with a
+        credential or is not one the fragment can carry.
     """
     if mode not in ('rw', 'ro'):
         raise ValueError(f"mount mode must be 'rw' or 'ro', got {mode!r}")
@@ -182,6 +189,10 @@ def mount_sentinel(
             f'{", ".join(MOUNT_CREDENTIAL_KINDS)} or None'
         )
     fragment = f'{mode}-{credential}' if credential else mode
+    if model is not None:
+        if credential is not None:
+            raise ValueError('only a Claude VM (no credential) takes a model')
+        fragment = f'{fragment}/{claude.validate_custom_model(model)}'
     return f'git@sbxmount:{worktree_path}#{fragment}'
 
 

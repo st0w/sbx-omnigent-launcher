@@ -10039,11 +10039,16 @@ class PipelineRunner:
         self._refuse_if_interrupted(label)
         agent = self._config.agents[agent_name]
         is_agy = agent.harness in agy.AGY_HARNESSES
+        credential = credential_kind_for(agent.harness)
         session = self._sc.create(
             agent_id=self._agent_ids[agent_name],
             workspace=mount_sentinel(
                 worktree, mode,
-                credential=credential_kind_for(agent.harness),
+                credential=credential,
+                # A Claude VM's /model picker lists only the family
+                # aliases unless told; the launcher adds this model so
+                # Omnigent launches it instead of the default.
+                model=agent.model if credential is None else None,
             ),
             title=f'{self._run_id}/{label}',
             terminal_launch_args=list(

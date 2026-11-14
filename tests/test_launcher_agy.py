@@ -170,8 +170,9 @@ class TestInjectionCallSite(unittest.TestCase):
         # A plain sentinel IS the Claude VM: it gets no credential (the
         # sbx proxy carries that) but it does need the launch-gate
         # pre-acceptance, or `bypassPermissions` stops on a dialog no
-        # one can answer.
-        seed.assert_called_once_with('box')
+        # one can answer. This sentinel names no model, so none is put
+        # in the VM's /model picker.
+        seed.assert_called_once_with('box', model=None)
 
     def test_no_inject_on_non_sentinel(self) -> None:
         inj, seed = self._run(
