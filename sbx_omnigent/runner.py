@@ -12061,8 +12061,15 @@ def ensure_pipeline_image(
             f'started, or the server was not started with this file. '
             f'Restart the server with --pipeline pointing at this file.'
         )
+    held = image.try_build_lock(worktree_root)
+    if held is None:
+        # The server (or another runner) is building it: wait for that
+        # build rather than starting a second one.
+        click.echo(f'[image] {tag} is being built elsewhere; waiting for it.')
+        held = image.acquire_build_lock(worktree_root)
     try:
         if image.image_built(tag):
+            image.release_build_lock(held)
             click.echo(f'[image] using {tag}')
             return
         click.echo(
@@ -12070,11 +12077,13 @@ def ensure_pipeline_image(
             f'image.setup once per recipe (often 10-20 minutes); later '
             f'runs reuse it.'
         )
-        image.build_image(
+        image.ensure_image(
             tag=tag,
             spec=config.image,
             name=image.build_box_name(config.name),
             egress=egress_allow,
+            worktree_root=worktree_root,
+            held=held,
         )
     except image.ImageError as exc:
         raise click.ClickException(

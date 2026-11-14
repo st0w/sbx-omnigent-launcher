@@ -16,11 +16,14 @@ so a changed recipe is a new name and an unchanged one is never rebuilt.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import secrets
 import subprocess
 import tempfile
+import time
+from typing import IO
 
 import click
 
@@ -44,6 +47,22 @@ AGENT_IMAGE_FILE = '.sbx-omnigent-image.json'
 
 #: Bumped when the file's shape changes.
 _AGENT_IMAGE_VERSION = 1
+
+#: Held, exclusively, by whichever process is building the image: the
+#: server or a runner. The other waits on it rather than building twice,
+#: and a session booting the image waits on it rather than failing.
+BUILD_LOCK_FILE = '.sbx-omnigent-image.lock'
+
+#: Why the last build failed, so a waiting session can say so.
+BUILD_FAILURE_FILE = '.sbx-omnigent-image-failure.json'
+
+#: What every pipeline image's name starts with (see
+#: :func:`sbx_omnigent.pipeline.image_tag`).
+_PIPELINE_IMAGE_PREFIX = 'localhost/omni-sbx-'
+
+#: How long a session waits for a build in progress: the setup's
+#: default timeout plus the save.
+WAIT_TIMEOUT_S = 3600.0 + SAVE_TIMEOUT_S
 
 
 class ImageError(Exception):
@@ -120,6 +139,184 @@ def read_agent_image(worktree_root: str) -> str:
             f'the server so it writes a current one.'
         )
     return agent_image
+
+
+def try_build_lock(worktree_root: str) -> IO[str] | None:
+    """
+    Take the build lock if nobody holds it.
+
+    :param worktree_root: The server's ``sbx.worktree_root``.
+    :returns: The open lock file, held until
+        :func:`release_build_lock`; ``None`` when another process holds
+        it.
+    """
+    handle = _open_lock(worktree_root)
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def acquire_build_lock(worktree_root: str) -> IO[str]:
+    """
+    Take the build lock, waiting for whoever holds it.
+
+    :param worktree_root: The server's ``sbx.worktree_root``.
+    :returns: The open lock file, held until :func:`release_build_lock`.
+    """
+    handle = _open_lock(worktree_root)
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    return handle
+
+
+def is_pipeline_image(ref: str) -> bool:
+    """
+    Whether *ref* names a pipeline image this module builds.
+
+    :param ref: A template reference.
+    :returns: ``True`` for
+        ``localhost/omni-sbx-<pipeline>:<fingerprint>``.
+    """
+    return ref.startswith(_PIPELINE_IMAGE_PREFIX)
+
+
+def release_build_lock(handle: IO[str]) -> None:
+    """
+    Release a lock from :func:`try_build_lock`.
+
+    :param handle: The open lock file.
+    """
+    try:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def _open_lock(worktree_root: str) -> IO[str]:
+    os.makedirs(worktree_root, exist_ok=True)
+    # Held across calls and closed by release_build_lock, so not a
+    # `with` block.
+    return open(
+        os.path.join(worktree_root, BUILD_LOCK_FILE), 'a', encoding='utf-8'
+    )
+
+
+def ensure_image(
+    *,
+    tag: str,
+    spec: ImageSpec,
+    name: str,
+    egress: tuple[str, ...],
+    worktree_root: str,
+    held: IO[str] | None = None,
+) -> bool:
+    """
+    Build *tag* unless it exists, one builder at a time.
+
+    Waits for the build lock (or uses *held*, already taken), then
+    checks again: whoever held it may have just built the image. A
+    failed build is recorded for :func:`wait_for_image` to report, and a
+    successful one clears that record.
+
+    :param tag: The template name.
+    :param spec: The pipeline's ``image:`` block.
+    :param name: The build sandbox's name, from :func:`build_box_name`.
+    :param egress: Hosts the build may reach.
+    :param worktree_root: Where the lock and failure record live.
+    :param held: The lock, when the caller already holds it; released
+        here either way.
+    :returns: ``True`` when this call built it, ``False`` when it was
+        already there.
+    :raises ImageError: If the build fails.
+    """
+    handle = held if held is not None else acquire_build_lock(worktree_root)
+    try:
+        if image_built(tag):
+            _clear_failure(worktree_root)
+            return False
+        try:
+            build_image(tag=tag, spec=spec, name=name, egress=egress)
+        except ImageError as exc:
+            _record_failure(worktree_root, tag, str(exc))
+            raise
+        _clear_failure(worktree_root)
+        return True
+    finally:
+        release_build_lock(handle)
+
+
+def wait_for_image(
+    tag: str,
+    worktree_root: str,
+    *,
+    timeout_s: float,
+    poll_s: float = 5.0,
+) -> None:
+    """
+    Return once *tag* exists, waiting out a build in progress.
+
+    :param tag: The template a session is about to boot.
+    :param worktree_root: Where the lock and failure record live.
+    :param timeout_s: How long to wait for a build in progress.
+    :param poll_s: Seconds between looks at the lock.
+    :raises ImageError: If the build failed, no build is running and
+        the image is missing, or the build is still running at
+        *timeout_s*.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if image_built(tag):
+            return
+        handle = try_build_lock(worktree_root)
+        if handle is not None:
+            release_build_lock(handle)
+            if image_built(tag):
+                return
+            failure = _read_failure(worktree_root, tag)
+            if failure is not None:
+                raise ImageError(
+                    f'the pipeline image {tag} failed to build: {failure}'
+                )
+            raise ImageError(
+                f'the pipeline image {tag} is not built, and nothing is '
+                f'building it. Restart the server (omni-sbx server '
+                f'--pipeline <file>) so it builds it.'
+            )
+        if time.monotonic() >= deadline:
+            raise ImageError(
+                f'the pipeline image {tag} is still building after '
+                f'{timeout_s:.0f}s.'
+            )
+        time.sleep(poll_s)
+
+
+def _record_failure(worktree_root: str, tag: str, reason: str) -> None:
+    path = os.path.join(worktree_root, BUILD_FAILURE_FILE)
+    with open(path, 'w', encoding='utf-8') as fh:
+        json.dump({'tag': tag, 'reason': reason}, fh)
+
+
+def _clear_failure(worktree_root: str) -> None:
+    try:
+        os.unlink(os.path.join(worktree_root, BUILD_FAILURE_FILE))
+    except FileNotFoundError:
+        pass
+
+
+def _read_failure(worktree_root: str, tag: str) -> str | None:
+    try:
+        with open(
+            os.path.join(worktree_root, BUILD_FAILURE_FILE), encoding='utf-8'
+        ) as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or raw.get('tag') != tag:
+        return None
+    reason = raw.get('reason')
+    return reason if isinstance(reason, str) else None
 
 
 def build_box_name(pipeline_name: str) -> str:

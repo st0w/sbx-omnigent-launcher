@@ -21,6 +21,7 @@ from unittest import mock
 
 import click
 
+from sbx_omnigent import image
 from sbx_omnigent import launcher as launcher_mod
 from sbx_omnigent._compat import RepoWorkspaceLike, repo_workspace
 from sbx_omnigent.launcher import _MOUNT_SENTINEL_PREFIX, SbxLauncher
@@ -352,6 +353,41 @@ class TestStartHostDispatch(unittest.TestCase):
     def test_a_malformed_model_is_refused(self) -> None:
         with self.assertRaises(click.ClickException):
             self._seeded_model('rw/claude..x')
+
+    def _start_with(self, image_ref: str, wait_error=None):
+        launcher = SbxLauncher(worktree_root=self.root, image=image_ref)
+        self.launcher = launcher
+        with (
+            mock.patch.object(launcher, '_create_sandbox') as cs,
+            mock.patch.object(launcher, '_launch_host'),
+            mock.patch.object(launcher, '_seed_claude_settings'),
+            mock.patch(
+                'sbx_omnigent.launcher.image.wait_for_image',
+                side_effect=wait_error,
+            ) as wait,
+        ):
+            self._run(repo_url=_sentinel(self.swarm), repo_branch='rw')
+        return cs, wait
+
+    def test_a_pipeline_image_is_waited_for_before_the_vm(self) -> None:
+        cs, wait = self._start_with('localhost/omni-sbx-p:0123456789abcdef')
+        self.assertEqual(
+            wait.call_args.args,
+            ('localhost/omni-sbx-p:0123456789abcdef', self.root),
+        )
+        cs.assert_called_once()
+
+    def test_a_registry_image_is_not(self) -> None:
+        _cs, wait = self._start_with('ghcr.io/x/host:1')
+        wait.assert_not_called()
+
+    def test_a_failed_build_fails_the_launch_with_its_reason(self) -> None:
+        with self.assertRaises(click.ClickException) as caught:
+            self._start_with(
+                'localhost/omni-sbx-p:0123456789abcdef',
+                wait_error=image.ImageError('image.setup failed (exit 2)'),
+            )
+        self.assertIn('image.setup failed', caught.exception.format_message())
 
     def test_non_sentinel_repo_url_delegates(self) -> None:
         with (

@@ -10,6 +10,7 @@ import io
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -102,9 +103,8 @@ _IMAGE_BLOCK = (
 _SERVER_URL = 'http://host.docker.internal:6767'
 
 
-class TestThePipelinesImageReachesItsAgents(unittest.TestCase):
-    """A server started with ``--pipeline`` boots its agents from that
-    pipeline's image, and publishes which image it gave them (#38)."""
+class _PipelineImageBase(unittest.TestCase):
+    """A registered ``--pipeline`` file and a temporary worktree."""
 
     def setUp(self) -> None:
         self.root = Path(tempfile.mkdtemp(prefix='ep-img-'))
@@ -113,19 +113,34 @@ class TestThePipelinesImageReachesItsAgents(unittest.TestCase):
         env = mock.patch.dict(os.environ, {}, clear=False)
         env.start()
         self.addCleanup(env.stop)
-        for name in (E._PIPELINE_IMAGE_ENV, E._PIPELINE_IMAGE_BASE_ENV):
+        for name in (
+            E._PIPELINE_IMAGE_ENV,
+            E._PIPELINE_IMAGE_BASE_ENV,
+            E._PIPELINE_PATH_ENV,
+        ):
             os.environ.pop(name, None)
         agents = mock.patch.object(
             E, '_PIPELINE_AGENTS_ROOT', self.root / 'agents'
         )
         agents.start()
         self.addCleanup(agents.stop)
+        built = mock.patch.object(
+            E.image, 'image_built', return_value=True
+        )
+        built.start()
+        self.addCleanup(built.stop)
 
     def _register(self, text: str) -> pipeline.PipelineConfig:
         path = self.root / 'pipeline.yaml'
         path.write_text(text, encoding='utf-8')
         E.register_pipeline_agents(str(path))
         return pipeline.load_pipeline(str(path))
+
+
+
+class TestThePipelinesImageReachesItsAgents(_PipelineImageBase):
+    """A server started with ``--pipeline`` boots its agents from that
+    pipeline's image, and publishes which image it gave them (#38)."""
 
     def _agent_image(self, **sbx: object) -> str:
         deployment = E._build_sbx_config({
@@ -177,6 +192,123 @@ class TestThePipelinesImageReachesItsAgents(unittest.TestCase):
                 image='ghcr.io/omnigent-ai/omnigent-host:v0.20.0'
             )
         self.assertNotIn('image.from', err.getvalue())
+
+
+class TestTheServerBuildsThePipelineImage(_PipelineImageBase):
+    """
+    A server started with ``--pipeline`` builds the pipeline's image in
+    the background when it is missing. The server starts at once; a
+    session booting the image waits for the build instead of failing.
+
+    Live, on a fresh recipe every session failed to launch ("image ...
+    is not cached locally and pull_policy=never") until a runner
+    happened to build it, and a session whose launch failed kept
+    failing after.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.release = threading.Event()
+        self.addCleanup(self.release.set)
+        self.builds: list[dict[str, object]] = []
+        self.error: Exception | None = None
+
+    def _build(self, **kwargs: object) -> None:
+        self.builds.append(kwargs)
+        self.release.wait(10)
+        if self.error is not None:
+            raise self.error
+
+    def _start(self, *, built: bool, text: str = _PIPE + _IMAGE_BLOCK,
+               **sbx: object) -> str:
+        self._register(text)
+        err = io.StringIO()
+        with mock.patch.object(
+            E.image, 'image_built', return_value=built
+        ), mock.patch.object(
+            E.image, 'build_image', side_effect=self._build
+        ), contextlib.redirect_stderr(err):
+            E._build_sbx_config({
+                'server_url': _SERVER_URL,
+                'sbx': {'worktree_root': self.wt, **sbx},
+            })
+            started = self._wait_for_build_start()
+            self.release.set()
+            self._join_builder()
+        return err.getvalue() if started else ''
+
+    def _wait_for_build_start(self) -> bool:
+        for _ in range(200):
+            if self.builds:
+                return True
+            threading.Event().wait(0.01)
+        return False
+
+    def _join_builder(self) -> None:
+        for thread in threading.enumerate():
+            if thread.name == E._IMAGE_BUILD_THREAD:
+                thread.join(10)
+
+    def test_the_server_starts_before_the_build_ends(self) -> None:
+        self._register(_PIPE + _IMAGE_BLOCK)
+        with mock.patch.object(
+            E.image, 'image_built', return_value=False
+        ), mock.patch.object(
+            E.image, 'build_image', side_effect=self._build
+        ), contextlib.redirect_stderr(io.StringIO()):
+            E._build_sbx_config({
+                'server_url': _SERVER_URL,
+                'sbx': {'worktree_root': self.wt},
+            })
+            # Returned while the build is still blocked.
+            self.assertTrue(self._wait_for_build_start())
+            self.assertIsNone(image.try_build_lock(self.wt))
+            self.release.set()
+            self._join_builder()
+
+    def test_a_missing_image_is_built_with_the_servers_egress(self) -> None:
+        err = self._start(built=False, egress_allow=['pypi.org'])
+        kwargs = self.builds[0]
+        self.assertEqual(
+            kwargs['tag'],
+            pipeline.image_tag(
+                pipeline.load_pipeline(str(self.root / 'pipeline.yaml'))
+            ),
+        )
+        spec = kwargs['spec']
+        assert isinstance(spec, pipeline.ImageSpec)
+        self.assertEqual(spec.setup, 'apt-get install -y jq')
+        self.assertEqual(kwargs['egress'], ('pypi.org',))
+        self.assertIn('building', err)
+
+    def test_an_existing_image_is_not_rebuilt(self) -> None:
+        self._start(built=True)
+        self.assertEqual(self.builds, [])
+
+    def test_a_failed_build_is_printed_not_raised(self) -> None:
+        self.error = image.ImageError('image.setup failed (exit 2)')
+        err = self._start(built=False)
+        self.assertIn('image.setup failed', err)
+
+    def test_a_build_already_running_elsewhere_is_left_alone(self) -> None:
+        held = image.try_build_lock(self.wt)
+        assert held is not None
+        self.addCleanup(image.release_build_lock, held)
+        self._start(built=False)
+        self.assertEqual(self.builds, [])
+
+    def test_a_pipeline_without_one_builds_nothing(self) -> None:
+        self._start(built=False, text=_PIPE)
+        self.assertEqual(self.builds, [])
+
+    def test_without_a_pipeline_nothing_is_built(self) -> None:
+        with mock.patch.object(E.image, 'build_image') as build, \
+                contextlib.redirect_stderr(io.StringIO()):
+            E._build_sbx_config({
+                'server_url': _SERVER_URL,
+                'sbx': {'worktree_root': self.wt},
+            })
+        build.assert_not_called()
 
 
 if __name__ == '__main__':

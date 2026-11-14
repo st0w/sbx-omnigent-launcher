@@ -32,6 +32,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -77,6 +78,9 @@ _PIPELINE_AGENTS_ROOT = Path.home() / '.sbx-swarm' / 'pipeline-agents'
 #: server parses its sandbox config so that parse can boot agents from
 #: it: the template name, and the base it is built from.
 _PIPELINE_IMAGE_ENV = 'OMNI_SBX_PIPELINE_IMAGE'
+#: The ``--pipeline`` file itself, so the sandbox config parse can build
+#: its image when it is missing.
+_PIPELINE_PATH_ENV = 'OMNI_SBX_PIPELINE_PATH'
 _PIPELINE_IMAGE_BASE_ENV = 'OMNI_SBX_PIPELINE_IMAGE_BASE'
 
 
@@ -551,6 +555,102 @@ def _pipeline_agent_image(configured: str) -> str:
     return tag
 
 
+#: The background thread that builds a missing pipeline image.
+_IMAGE_BUILD_THREAD = 'sbx-omnigent-image-build'
+
+
+def _ensure_pipeline_image(
+    egress_allow: tuple[str, ...], worktree_root: str | None
+) -> None:
+    """
+    Start building the ``--pipeline`` file's image if it is missing.
+
+    Every agent sandbox boots it with ``--pull never``, so until it
+    exists no session can launch. Live, on a fresh recipe every session
+    failed ("image ... is not cached locally") until a runner happened
+    to build it, and a session whose launch failed kept failing after.
+
+    The build runs in a background thread so the server starts at once:
+    a session booting the image waits for it (the launcher waits on the
+    build lock), and a runner that finds it missing waits for this build
+    instead of starting another. When another process already holds the
+    lock, it is the builder, and nothing is started here. A failed build
+    is printed, recorded for the sessions waiting on it, and does not
+    stop the server.
+
+    :param egress_allow: Hosts the build may reach: the per-VM list.
+    :param worktree_root: ``sbx.worktree_root``, where the build lock
+        lives; ``None`` builds nothing.
+    :raises ValueError: If the pipeline file cannot be read.
+    """
+    path = os.environ.get(_PIPELINE_PATH_ENV)
+    if not path or not os.environ.get(_PIPELINE_IMAGE_ENV):
+        return
+    try:
+        config = pipeline.load_pipeline(path)
+    except pipeline.PipelineError as exc:
+        raise ValueError(f'pipeline error: {exc}') from exc
+    tag = pipeline.image_tag(config)
+    spec = config.image
+    if tag is None or spec is None or worktree_root is None:
+        return
+    held = image.try_build_lock(worktree_root)
+    if held is None:
+        print(
+            f'[sbx-omnigent] the pipeline image {tag} is being built by '
+            f'another process; sessions wait for it.',
+            file=sys.stderr,
+        )
+        return
+    try:
+        built = image.image_built(tag)
+    except image.ImageError as exc:
+        image.release_build_lock(held)
+        print(
+            f'[sbx-omnigent] could not check for the pipeline image {tag}: '
+            f'{exc}',
+            file=sys.stderr,
+        )
+        return
+    if built:
+        image.release_build_lock(held)
+        return
+    print(
+        f'[sbx-omnigent] building the pipeline image {tag} from {spec.base} '
+        f'in the background (often 10-20 minutes, once per recipe). The '
+        f'server is up; sessions that boot the image wait for it.',
+        file=sys.stderr,
+    )
+
+    def build() -> None:
+        try:
+            image.ensure_image(
+                tag=tag,
+                spec=spec,
+                name=image.build_box_name(config.name),
+                egress=egress_allow,
+                worktree_root=worktree_root,
+                held=held,
+            )
+        except image.ImageError as exc:
+            print(
+                f'[sbx-omnigent] could not build the pipeline image {tag}: '
+                f'{exc}',
+                file=sys.stderr,
+            )
+            return
+        print(
+            f'[sbx-omnigent] built the pipeline image {tag}', file=sys.stderr
+        )
+
+    # A daemon, so stopping the server never waits on a build. A build
+    # cut short leaves its build sandbox behind, and the next start
+    # builds again.
+    threading.Thread(
+        target=build, name=_IMAGE_BUILD_THREAD, daemon=True
+    ).start()
+
+
 def _publish_agent_image(worktree_root: str, agent_image: str) -> None:
     """
     Publish the image agents boot, for the pipeline runner to check.
@@ -646,6 +746,7 @@ def _build_sbx_config(raw: dict[str, Any]) -> ManagedSandboxConfig:
 
     host_config = _parse_host_config(raw)
     warn_on_inert_providers(host_config)
+    _ensure_pipeline_image(egress_allow, worktree_root)
     if worktree_root is not None:
         _publish_egress_policy(worktree_root, egress_allow)
         _publish_agent_image(worktree_root, agent_image)
@@ -920,9 +1021,11 @@ def register_pipeline_agents(pipeline_path: str) -> dict[str, str]:
     if tag is not None and config.image is not None:
         os.environ[_PIPELINE_IMAGE_ENV] = tag
         os.environ[_PIPELINE_IMAGE_BASE_ENV] = config.image.base
+        os.environ[_PIPELINE_PATH_ENV] = os.path.abspath(pipeline_path)
     else:
         os.environ.pop(_PIPELINE_IMAGE_ENV, None)
         os.environ.pop(_PIPELINE_IMAGE_BASE_ENV, None)
+        os.environ.pop(_PIPELINE_PATH_ENV, None)
     _append_builtin_agent_dirs(
         sorted(str(dest / spec) for spec in mapping.values())
     )

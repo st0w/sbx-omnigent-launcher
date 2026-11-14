@@ -15817,6 +15817,26 @@ class TestThePipelineImageIsReadyBeforeTheRun(_Base):
         is_built.assert_not_called()
         build.assert_not_called()
 
+    def test_a_build_in_progress_is_waited_for_not_repeated(self) -> None:
+        self._serve()
+        held = R.image.try_build_lock(self.wt)
+        assert held is not None
+        state = {'built': False}
+
+        def finish() -> None:
+            state['built'] = True
+            R.image.release_build_lock(held)
+
+        timer = threading.Timer(0.3, finish)
+        with mock.patch.object(
+            R.image, 'image_built', side_effect=lambda _t: state['built']
+        ), mock.patch.object(R.image, 'build_image') as build, \
+                contextlib.redirect_stdout(io.StringIO()):
+            timer.start()
+            R.ensure_pipeline_image(self._cfg(_WITH_IMAGE), self.wt, ())
+        timer.join()
+        build.assert_not_called()
+
     def test_an_image_alone_reads_the_operators_list(self) -> None:
         egress.publish_policy(self.wt, ('pypi.org',))
         self.assertEqual(
