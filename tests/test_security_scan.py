@@ -58,6 +58,15 @@ class TestTheReportIsParsed(unittest.TestCase):
             [('F1', 'CRITICAL', 'app.py', 16), ('F2', 'LOW', 'app.py', 16)],
         )
 
+    def test_the_plugins_own_id_is_kept(self) -> None:
+        found = ss.parse_report(_jsonl(_finding('F1', 'LOW')))
+        self.assertEqual(found[0].plugin_id, 'abc-F1')
+
+    def test_a_missing_plugin_id_is_empty(self) -> None:
+        raw = _finding('F1', 'LOW')
+        del raw['claudeSecurityPluginFindingId']
+        self.assertEqual(ss.parse_report(_jsonl(raw))[0].plugin_id, '')
+
     def test_an_empty_report_is_no_findings(self) -> None:
         self.assertEqual(ss.parse_report(''), ())
 

@@ -9725,6 +9725,217 @@ class TestScanFindingsAreLabelled(_Base):
         self.assertNotIn('Low problem', ledger)
 
 
+class TestTheSecuritySummary(_Base):
+    """
+    After filing, the module's security summary is committed as the
+    ``README.md`` of its ``-security`` folder: every round, and what
+    became of each finding, with issue links.
+    """
+
+    _PR = _SCANNED_PIPELINE.replace(
+        'publish: local', 'base_branch: main\npublish: pr'
+    )
+    _PATH = 'docs/plans/demo-security/README.md'
+
+    def _runner(self, wt, *, text=None):
+        cfg = self._cfg(text or self._PR)
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=wt,
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0, publish_repo='https://gh/org/proj',
+        )
+        runner._reviews = [
+            self._round(runner, wt, 1, _scan_jsonl('HIGH', 'MEDIUM', 'LOW')),
+            self._round(runner, wt, 2, _scan_jsonl('MEDIUM')),
+        ]
+        return runner
+
+    def _round(self, runner, wt, round_no, jsonl):
+        report = _scan_report(jsonl, f'20261114-12000{round_no}')
+        saved = runner._save_scan_report(
+            runner._stage_by_id['scan'], round_no, report
+        )
+        findings = R.security_scan.parse_report(jsonl)
+        with mock.patch('sbx_omnigent.runner.click.echo'):
+            runner._record_scan(
+                runner._stage_by_id['scan'], round_no, findings,
+                'a' * 40, saved,
+            )
+        return runner._reviews.pop()
+
+    def _summary(self, runner, wt):
+        with mock.patch('sbx_omnigent.runner.click.echo'):
+            runner._publish_findings('build', 'docs/plans/demo-reviews.md')
+            path = runner._commit_security_summary(
+                'build', 'docs/plans/demo.md'
+            )
+        tracked = {rel: text for _t, rel, text in wt.tracked_files}
+        return path, tracked.get(self._PATH)
+
+    def test_it_is_committed_in_the_security_folder(self) -> None:
+        wt = FakeWT()
+        path, text = self._summary(self._runner(wt), wt)
+        self.assertEqual(path, self._PATH)
+        self.assertIsNotNone(text)
+        self.assertIn(
+            'docs: add security scan summary',
+            [message for _node, message, _author in wt.commits],
+        )
+
+    def test_it_links_each_rounds_report_folder(self) -> None:
+        wt = FakeWT()
+        _path, text = self._summary(self._runner(wt), wt)
+        self.assertIn('(r1-20261114-120001/)', text)
+        self.assertIn('(r2-20261114-120002/)', text)
+
+    def test_a_filed_finding_links_its_issue(self) -> None:
+        wt = FakeWT()
+        _path, text = self._summary(self._runner(wt), wt)
+        url = next(
+            i for i in range(len(wt.issues))
+            if 'Medium problem' in wt.issues[i]['body']
+        ) + 1
+        row = next(line for line in text.splitlines()
+                   if 'Medium problem' in line and 'rounds 1 to 2' in line)
+        self.assertIn(f'https://github.com/org/proj/issues/{url}', row)
+
+    def test_a_withheld_finding_gives_triages_verdict_and_reason(
+        self,
+    ) -> None:
+        wt = FakeWT()
+        runner = self._runner(wt)
+        final = runner._reviews[-1]
+        runner._dispositions[R.finding_id(final, 1)] = R.Disposition(
+            R.DISPOSITION_RECORDED, 'already tracked as a known limit'
+        )
+        _path, text = self._summary(runner, wt)
+        row = next(line for line in text.splitlines()
+                   if 'Medium problem' in line and 'rounds 1 to 2' in line)
+        self.assertIn('Withheld by triage', row)
+        self.assertIn('recorded', row)
+        self.assertIn('already tracked as a known limit', row)
+
+    def test_one_already_in_the_tracker_says_so(self) -> None:
+        wt = FakeWT()
+        runner = self._runner(wt)
+        final = runner._reviews[-1]
+        wt.issue_bodies = R.finding_marker(R.finding_id(final, 1))
+        _path, text = self._summary(runner, wt)
+        row = next(line for line in text.splitlines()
+                   if 'Medium problem' in line and 'rounds 1 to 2' in line)
+        self.assertIn('Already tracked', row)
+
+    def test_without_pull_requests_it_names_the_ledger(self) -> None:
+        wt = FakeWT()
+        runner = self._runner(wt, text=_SCANNED_PIPELINE)
+        _path, text = self._summary(runner, wt)
+        row = next(line for line in text.splitlines()
+                   if 'Medium problem' in line and 'rounds 1 to 2' in line)
+        self.assertIn('findings ledger', row)
+
+    def test_a_blocking_round_without_triage_says_so(self) -> None:
+        wt = FakeWT()
+        _path, text = self._summary(self._runner(wt), wt)
+        self.assertIn("Triage's re-check of round 1", text)
+        self.assertIn('no triage stage', text)
+
+    def test_a_reproducing_claim_shows_its_verdict_and_issue(self) -> None:
+        wt = FakeWT()
+        runner = self._runner(wt)
+        ident = R.blocking_finding_id(runner._reviews[0], 1)
+        runner._dispositions[ident] = R.Disposition(
+            R.DISPOSITION_FILED, 'the query still interpolates name'
+        )
+        runner._blocking_claims[ident] = 'the query still interpolates name'
+        _path, text = self._summary(runner, wt)
+        line = next(line for line in text.splitlines()
+                    if "Triage's re-check of round 1" in line)
+        self.assertIn('the query still interpolates name', line)
+        self.assertIn('https://github.com/org/proj/issues/', line)
+
+    def test_an_unreadable_report_is_said_so(self) -> None:
+        wt = FakeWT()
+        runner = self._runner(wt)
+        del wt.artifacts[
+            'security/scan/r1-20261114-120001/CLAUDE-SECURITY-RESULTS.jsonl'
+        ]
+        _path, text = self._summary(runner, wt)
+        self.assertIn('could not be read', text)
+
+    def test_no_scan_no_summary(self) -> None:
+        wt = FakeWT()
+        runner = self._runner(wt)
+        runner._reviews = []
+        path, text = self._summary(runner, wt)
+        self.assertIsNone(path)
+        self.assertIsNone(text)
+        self.assertNotIn(
+            'docs: add security scan summary',
+            [message for _node, message, _author in wt.commits],
+        )
+
+    def _published(self, text, replies):
+        sc = FakeSC(dict(replies))
+        sc.raw_writer_replies = True
+        with mock.patch.object(
+            R.security_scan, 'collect_report',
+            return_value=_scan_report(
+                _scan_jsonl('MEDIUM'), '20261114-120001'
+            ),
+        ), mock.patch('sbx_omnigent.runner.click.echo'):
+            result, _sc, wt = self._run(
+                text, {}, sc=sc, interactive_plan=False
+            )
+        self.assertEqual(result.status, 'completed')
+        return wt
+
+    def test_a_run_commits_it_and_links_it_from_its_pull_request(
+        self,
+    ) -> None:
+        text = self._PR.replace(
+            'repo: ./proj', 'repo: https://github.com/org/proj.git'
+        )
+        wt = self._published(text, _SCAN_REPLIES)
+        self.assertIn(
+            self._PATH, [rel for _t, rel, _c in wt.tracked_files]
+        )
+        self.assertIn(self._PATH, wt.pr_bodies[-1])
+
+    def test_each_module_of_a_campaign_gets_its_own(self) -> None:
+        text = _pr_modules().replace(
+            '  build: {template: coder, model: claude-sonnet-5}\n',
+            '  build: {template: coder, model: claude-sonnet-5}\n'
+            '  sec: {template: security-reviewer, '
+            'model: claude-mythos-5-2}\n',
+        ) + (
+            '  - {id: scan, run: sec, scans: build, needs: [build], '
+            'on_block: build}\n'
+            'image:\n'
+            '  from: ghcr.io/omnigent-ai/omnigent-host:v0.20.0\n'
+            '  setup: apt-get install -y jq\n'
+            '  claude_plugins: [claude-security@claude-plugins-official]\n'
+        )
+        wt = self._published(text, {
+            'm0-plan': 'D0', 'm1-plan': 'D1',
+            'm0-tests': 'WORK COMPLETE', 'm1-tests': 'WORK COMPLETE',
+            'm0-build': 'WORK COMPLETE', 'm1-build': 'WORK COMPLETE',
+        })
+        tracked = [rel for _t, rel, _c in wt.tracked_files]
+        for module, body in zip(('m0', 'm1'), wt.pr_bodies, strict=True):
+            path = f'docs/plans/mods-{module}-security/README.md'
+            with self.subTest(module=module):
+                self.assertIn(path, tracked)
+                self.assertIn(path, body)
+
+    def test_the_pull_request_links_it(self) -> None:
+        runner = self._runner(FakeWT())
+        body = runner._pr_body(
+            'build', 'docs/plans/demo.md', summary='s',
+            security_doc=self._PATH,
+        )
+        self.assertIn(self._PATH, body)
+
+
 class TestAScanInACampaign(_Base):
     """In a campaign a module's scan diffs from the campaign tip, the
     commit the module was built on; the first module from the base."""

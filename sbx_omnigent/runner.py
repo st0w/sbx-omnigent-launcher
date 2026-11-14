@@ -67,6 +67,7 @@ from sbx_omnigent import (
     readback,
     sbx_cli,
     security_scan,
+    security_summary,
     verify,
 )
 from sbx_omnigent.defaults import DEFAULT_EGRESS_ALLOW, DEFAULT_HOST_IMAGE
@@ -2760,6 +2761,22 @@ def blocking_finding_id(rec: ReviewRecord, claim: int) -> str:
 #: :meth:`WorktreeManager.create_issue` retries once without it.
 _FINDING_LABEL = 'finding'
 
+#: A finding's outcome when the tracker already had it.
+_ALREADY_TRACKED = 'Already tracked: an earlier run filed it'
+
+
+def _filed(url: str | None) -> str:
+    """A finding's outcome once filing was tried."""
+    if url:
+        return f'Filed: {url}'
+    return 'Could not be filed; it is in the reviews record'
+
+
+def _withheld(verdict: Disposition) -> str:
+    """A finding's outcome when triage kept it out of the tracker."""
+    reason = verdict.reason or 'no reason given'
+    return f'Withheld by triage (`{verdict.verdict}`): {reason}'
+
 
 def finding_marker(ident: str) -> str:
     """
@@ -3265,6 +3282,7 @@ def render_pr_body(
     pick_doc: str | None = None,
     findings: list[tuple[str, str]] | None = None,
     outcome: verify.VerifyOutcome | None = None,
+    security_doc: str | None = None,
 ) -> str:
     """
     Assemble a pull request a reviewer can trust without reading code.
@@ -3292,6 +3310,8 @@ def render_pr_body(
         reader should see that round 1 blocked without opening a file.
     :param outcome: The verification result whose steps are the
         evidence; ``None`` when the pipeline has no gate.
+    :param security_doc: Repo path of the security scan summary, when
+        a scan ran.
     :returns: The markdown body.
     """
     parts = _pr_head_lines(summary, series_note)
@@ -3337,6 +3357,7 @@ def render_pr_body(
                 f'and what was found: `{review_doc}`',
             ]
     parts += _pr_selection_lines(picks, pick_doc)
+    parts += _pr_security_lines(security_doc)
     parts += _pr_finding_lines(findings)
     parts += _pr_environment_lines(reviews)
     for step in outcome.steps if outcome else ():
@@ -3367,6 +3388,20 @@ def render_pr_body(
         else:
             parts.append(block)
     return '\n'.join(parts).rstrip() + '\n'
+
+
+def _pr_security_lines(security_doc: str | None) -> list[str]:
+    """The pull request's pointer to the security scan summary."""
+    if not security_doc:
+        return []
+    return [
+        '',
+        '## Security scan',
+        '',
+        f'Every claude-security scan round, each finding, and what became '
+        f'of it (fixed in the run, filed, or withheld by triage, with the '
+        f'reason): `{security_doc}`',
+    ]
 
 
 def short_title(text: str, limit: int = 60) -> str:
@@ -3690,6 +3725,12 @@ class PipelineRunner:
         self._filed_findings: list[tuple[str, str]] = []
         #: Whether the ``security-*`` labels were checked this run.
         self._security_labels_checked = False
+        #: What filing did with each finding id this chunk, for the
+        #: security summary: filed with its URL, withheld, or tracked.
+        self._filing_outcomes: dict[str, str] = {}
+        #: The issue naming the blocking reports triage reached no
+        #: conclusion on, if one was filed.
+        self._blocking_summary_url: str | None = None
         #: The judge's choices, so the two-writer race can be
         #: evaluated over a series of modules rather than trusted.
         self._picks: list[JudgePick] = []
@@ -4893,6 +4934,7 @@ class PipelineRunner:
         review_doc = self._commit_review_records(winner, plan_path)
         self._commit_security_reports(winner, plan_path)
         self._publish_findings(winner, review_doc)
+        security_doc = self._commit_security_summary(winner, plan_path)
         pick_doc = self._commit_judge_record(winner, plan_path)
         open_pr = self._config.publish.mode == 'pr'
         span = self._chunk_span(winner) if open_pr else None
@@ -4902,6 +4944,7 @@ class PipelineRunner:
             review_doc=review_doc,
             pick_doc=pick_doc,
             series_note=self._series_note(span, None) if span else None,
+            security_doc=security_doc,
         )
         result = self._wt.publish_node(
             self._run_id, winner, self._publish_repo,
@@ -5072,6 +5115,7 @@ class PipelineRunner:
         review_doc: str | None = None,
         pick_doc: str | None = None,
         series_note: str | None = None,
+        security_doc: str | None = None,
     ) -> str:
         """
         The pull-request body for a branch about to publish.
@@ -5083,6 +5127,7 @@ class PipelineRunner:
         :param task: The original ask, when it adds to the summary.
         :param review_doc: Repo path of the committed reviewer reports.
         :param series_note: What a chained chunk's PR says first.
+        :param security_doc: Repo path of the security scan summary.
         :returns: The markdown body.
         """
         has_plan = self._planner_node_id() is not None
@@ -5102,6 +5147,7 @@ class PipelineRunner:
                 else None
             ),
             outcome=self._evidence.get(winner),
+            security_doc=security_doc,
         )
 
     def _next_review_round(self, stage_id: str) -> int:
@@ -5513,6 +5559,159 @@ class PipelineRunner:
             f'file(s) to {folder}/.'
         )
         return folder
+
+    def _commit_security_summary(
+        self, winner: str, plan_path: str
+    ) -> str | None:
+        """
+        Commit the chunk's security summary, after its findings filed.
+
+        ``README.md`` in the ``-security`` folder: each scan round, and
+        each finding with what became of it. Built after filing so it
+        can link the issues. Best-effort like the other records.
+
+        :param winner: The node being published.
+        :param plan_path: The plan artifact path, whose name the folder
+            follows.
+        :returns: The committed path, or ``None``.
+        """
+        by_stage: dict[str, list[ReviewRecord]] = {}
+        for rec in self._chunk_reviews():
+            if self._is_scan(rec):
+                by_stage.setdefault(rec.stage, []).append(rec)
+        if not by_stage:
+            return None
+        stages = [
+            self._scan_stage_view(stage_id, recs)
+            for stage_id, recs in by_stage.items()
+        ]
+        sub = self._active_subtask
+        title = self._config.name + (
+            f' [{sub.id}] {sub.title}' if sub is not None else ''
+        )
+        doc = security_summary.render_summary(title=title, stages=stages)
+        path = f'{self._security_artifact_path(plan_path)}/README.md'
+        try:
+            self._wt.write_tracked_file(
+                self._wt.node_worktree_path(self._run_id, winner), path, doc
+            )
+            committed = self._wt.commit_node(
+                self._run_id, winner,
+                message='docs: add security scan summary',
+                author='security-scan <security-scan@pipeline.local>',
+            )
+        except click.ClickException as exc:
+            click.echo(
+                f'[security] WARNING: could not commit the security scan '
+                f'summary to {path}: {exc}'
+            )
+            return None
+        if not committed:
+            return None
+        click.echo(f'[security] committed the security scan summary to '
+                   f'{path}.')
+        return path
+
+    def _scan_stage_view(
+        self, stage_id: str, records: list[ReviewRecord]
+    ) -> security_summary.ScanStage:
+        """
+        One scan stage's rounds and final outcomes, for the summary.
+
+        :param stage_id: The ``scans:`` stage.
+        :param records: Its records in this chunk.
+        :returns: The view the summary renders.
+        """
+        records = sorted(records, key=lambda rec: rec.round_no)
+        rounds = tuple(
+            security_summary.ScanRound(
+                number=rec.round_no,
+                verdict=rec.verdict or 'APPROVED',
+                folder=(
+                    PurePosixPath(rec.attachments[0]).parent.name
+                    if rec.attachments else None
+                ),
+                findings=self._round_findings(rec),
+                triage=(
+                    self._scan_triage(rec) if rec.verdict == 'BLOCKING'
+                    else ''
+                ),
+            )
+            for rec in records
+        )
+        final = records[-1]
+        outcomes = tuple(
+            self._minor_outcome(final, index)
+            for index, _text in final.filed_findings()
+        )
+        return security_summary.ScanStage(stage_id, rounds, outcomes)
+
+    def _round_findings(
+        self, rec: ReviewRecord
+    ) -> tuple[security_scan.ScanFinding, ...] | None:
+        """A round's findings read back from its saved JSONL, if any."""
+        for relpath in rec.attachments:
+            if PurePosixPath(relpath).name != security_scan.RESULTS_NAME:
+                continue
+            text = self._wt.read_run_artifact(self._run_id, relpath)
+            if text is None:
+                return None
+            try:
+                return security_scan.parse_report(text)
+            except security_scan.ScanReportError:
+                return None
+        return None
+
+    def _scan_triage(self, rec: ReviewRecord) -> str:
+        """
+        What triage concluded on re-checking a blocking scan round.
+
+        :param rec: A BLOCKING scan record.
+        :returns: One line of Markdown.
+        """
+        claims = self._blocking_claims_for(rec)
+        if not claims and not any(
+            stage.verifies for stage in pipeline._iter_stages(
+                self._config.stages
+            )
+        ):
+            return (
+                'not re-checked: the pipeline has no triage stage '
+                '(`verifies:`).'
+            )
+        if not claims:
+            where = (
+                f' It is named in {self._blocking_summary_url}.'
+                if self._blocking_summary_url else ''
+            )
+            return f'triage reached no conclusion on this report.{where}'
+        parts = []
+        for ident, claim in claims:
+            verdict = self._dispositions.get(ident)
+            text = f'`{verdict.verdict}`: {claim}' if verdict else claim
+            outcome = self._filing_outcomes.get(ident)
+            parts.append(f'{text} ({outcome})' if outcome else text)
+        return '; '.join(parts)
+
+    def _minor_outcome(self, rec: ReviewRecord, index: int) -> str:
+        """
+        What became of one of a final scan round's Medium/Low findings.
+
+        :param rec: The final round's record.
+        :param index: The finding's position in it.
+        :returns: One line of Markdown.
+        """
+        ident = finding_id(rec, index)
+        if self._config.publish.mode != 'pr' or not self._publish_repo:
+            verdict = self._dispositions.get(ident)
+            triage = (
+                f'; triage: `{verdict.verdict}`: {verdict.reason}'
+                if verdict is not None else ''
+            )
+            return f'Recorded in the findings ledger{triage}'
+        return self._filing_outcomes.get(
+            ident, 'Not filed: the issue tracker could not be read'
+        )
 
     def _security_artifact_path(self, plan_path: str) -> str:
         """The scan reports' folder: ``<plan>-security`` beside it."""
@@ -6285,9 +6484,11 @@ class PipelineRunner:
             for index, finding in rec.filed_findings():
                 ident = finding_id(rec, index)
                 if finding_marker(ident) in seen:
+                    self._filing_outcomes[ident] = _ALREADY_TRACKED
                     continue
                 verdict = self._dispositions.get(ident)
                 if verdict is not None and not verdict.files:
+                    self._filing_outcomes[ident] = _withheld(verdict)
                     # A verifier read this against the shipping code and
                     # concluded it needs nobody. It is summarised below
                     # with its reason rather than filed — and it is NOT
@@ -6304,6 +6505,7 @@ class PipelineRunner:
                     self._publish_repo, title=title, body=body,
                     labels=self._issue_labels(rec, finding),
                 )
+                self._filing_outcomes[ident] = _filed(url)
                 if url:
                     self._filed_findings.append((url, title))
                 else:
@@ -6446,8 +6648,11 @@ class PipelineRunner:
                 self._publish_repo, title=title, body=body,
                 labels=self._issue_labels(rec),
             )
+            self._filing_outcomes[ident] = _filed(url)
             if url:
                 self._filed_findings.append((url, title))
+        for _rec, ident, _claim, verdict in withheld:
+            self._filing_outcomes[ident] = _withheld(verdict)
         if withheld:
             self._file_triage_summary(withheld, report_doc)
         if unconcluded:
@@ -6486,7 +6691,10 @@ class PipelineRunner:
                 verdict = self._dispositions.get(ident)
                 # Already filed, or recorded with no verdict at all:
                 # neither files, and neither is news to anyone.
-                if verdict is None or finding_marker(ident) in seen:
+                if verdict is None:
+                    continue
+                if finding_marker(ident) in seen:
+                    self._filing_outcomes[ident] = _ALREADY_TRACKED
                     continue
                 if verdict.files:
                     to_file.append((rec, ident, claim))
@@ -6543,6 +6751,7 @@ class PipelineRunner:
             body='\n'.join(lines),
             labels=(_FINDING_LABEL,),
         )
+        self._blocking_summary_url = url
         if url:
             self._filed_findings.append(
                 (url, f'[{chunk}] blocking reports summary')
@@ -11731,6 +11940,9 @@ class PipelineRunner:
             branch_node, self._plan_artifact_path()
         )
         self._publish_findings(branch_node, review_doc)
+        security_doc = self._commit_security_summary(
+            branch_node, self._plan_artifact_path()
+        )
         pick_doc = self._commit_judge_record(
             branch_node, self._plan_artifact_path()
         )
@@ -11746,6 +11958,7 @@ class PipelineRunner:
                 task=self._config.task,
                 review_doc=review_doc,
                 pick_doc=pick_doc,
+                security_doc=security_doc,
             ),
             base_branch=self._config.base_branch,
             open_pr=self._config.publish.mode == 'pr',
