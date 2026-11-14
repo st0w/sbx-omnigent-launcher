@@ -7,8 +7,10 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from collections.abc import Sequence
+from unittest import mock
 
 from sbx_omnigent import image, sbx_cli
 from sbx_omnigent.pipeline import ImageSpec
@@ -253,6 +255,158 @@ class TestTheServerPublishesItsAgentImage(unittest.TestCase):
                     fh.write(text)
                 with self.assertRaises(image.ImageError):
                     image.read_agent_image(self.root)
+
+
+class _Builds:
+    """Fakes for image_built and build_image, recording the builds."""
+
+    def __init__(self, *, built: bool = False,
+                 error: Exception | None = None) -> None:
+        self.built = built
+        self.error = error
+        self.builds: list[str] = []
+
+    def image_built(self, tag: str, **_kw: object) -> bool:
+        return self.built
+
+    def build_image(self, *, tag: str, **_kw: object) -> None:
+        self.builds.append(tag)
+        if self.error is not None:
+            raise self.error
+        self.built = True
+
+    def patch(self):
+        return mock.patch.multiple(
+            image, image_built=self.image_built, build_image=self.build_image
+        )
+
+
+class TestOneBuildAtATime(unittest.TestCase):
+    """
+    The server and a runner can both find the image missing; only one
+    builds it, and the other waits for that build (a lock file in the
+    worktree root).
+    """
+
+    def setUp(self) -> None:
+        self.root = tempfile.mkdtemp(prefix='img-lock-')
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def _ensure(self, builds: _Builds) -> bool:
+        with builds.patch():
+            return image.ensure_image(
+                tag=_TAG, spec=_SPEC, name='box', egress=(),
+                worktree_root=self.root,
+            )
+
+    def test_a_missing_image_is_built(self) -> None:
+        builds = _Builds()
+        self.assertTrue(self._ensure(builds))
+        self.assertEqual(builds.builds, [_TAG])
+
+    def test_a_built_one_is_not(self) -> None:
+        builds = _Builds(built=True)
+        self.assertFalse(self._ensure(builds))
+        self.assertEqual(builds.builds, [])
+
+    def test_a_failure_is_recorded_for_whoever_waits(self) -> None:
+        builds = _Builds(error=image.ImageError('image.setup failed (exit 2)'))
+        with self.assertRaises(image.ImageError):
+            self._ensure(builds)
+        with builds.patch(), self.assertRaises(image.ImageError) as caught:
+            image.wait_for_image(_TAG, self.root, timeout_s=1, poll_s=0)
+        self.assertIn('image.setup failed', str(caught.exception))
+
+    def test_a_success_clears_an_earlier_failure(self) -> None:
+        with self.assertRaises(image.ImageError):
+            self._ensure(_Builds(error=image.ImageError('boom')))
+        builds = _Builds()
+        self._ensure(builds)
+        with builds.patch():
+            image.wait_for_image(_TAG, self.root, timeout_s=1, poll_s=0)
+
+    def test_a_second_builder_waits_and_does_not_build_again(self) -> None:
+        builds = _Builds()
+        held = image.try_build_lock(self.root)
+        assert held is not None
+        result: list[bool] = []
+
+        def second() -> None:
+            result.append(self._ensure(builds))
+
+        with builds.patch():
+            thread = threading.Thread(target=second)
+            thread.start()
+            thread.join(0.3)
+            self.assertTrue(thread.is_alive())  # waiting on the lock
+            builds.built = True                 # the first build finished
+            image.release_build_lock(held)
+            thread.join(5)
+        self.assertEqual((result, builds.builds), ([False], []))
+
+    def test_the_lock_is_not_free_while_held(self) -> None:
+        held = image.try_build_lock(self.root)
+        self.assertIsNotNone(held)
+        self.assertIsNone(image.try_build_lock(self.root))
+        assert held is not None
+        image.release_build_lock(held)
+        again = image.try_build_lock(self.root)
+        self.assertIsNotNone(again)
+        assert again is not None
+        image.release_build_lock(again)
+
+
+class TestASessionWaitsForTheImage(unittest.TestCase):
+    """A session booting the pipeline image waits for a build in
+    progress instead of failing, and fails with the build's reason."""
+
+    def setUp(self) -> None:
+        self.root = tempfile.mkdtemp(prefix='img-wait-')
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def test_a_built_image_returns_at_once(self) -> None:
+        with _Builds(built=True).patch():
+            image.wait_for_image(_TAG, self.root, timeout_s=1, poll_s=0)
+
+    def test_it_waits_for_a_build_in_progress(self) -> None:
+        builds = _Builds()
+        held = image.try_build_lock(self.root)
+        assert held is not None
+
+        def finish() -> None:
+            builds.built = True
+            image.release_build_lock(held)
+
+        timer = threading.Timer(0.3, finish)
+        with builds.patch():
+            timer.start()
+            image.wait_for_image(_TAG, self.root, timeout_s=10, poll_s=0.05)
+        timer.join()
+        self.assertTrue(builds.built)
+
+    def test_no_image_and_no_build_says_restart_the_server(self) -> None:
+        with _Builds().patch(), self.assertRaises(image.ImageError) as caught:
+            image.wait_for_image(_TAG, self.root, timeout_s=1, poll_s=0)
+        self.assertIn('Restart the server', str(caught.exception))
+
+    def test_a_build_that_never_finishes_times_out(self) -> None:
+        held = image.try_build_lock(self.root)
+        assert held is not None
+        self.addCleanup(image.release_build_lock, held)
+        with _Builds().patch(), self.assertRaises(image.ImageError) as caught:
+            image.wait_for_image(_TAG, self.root, timeout_s=0.2, poll_s=0.05)
+        self.assertIn('still building', str(caught.exception))
+
+    def test_another_tags_failure_is_not_this_ones(self) -> None:
+        with self.assertRaises(image.ImageError):
+            with _Builds(error=image.ImageError('old recipe broke')).patch():
+                image.ensure_image(
+                    tag='localhost/omni-sbx-demo:ffffffffffffffff',
+                    spec=_SPEC, name='box', egress=(), worktree_root=self.root,
+                )
+        with _Builds().patch(), self.assertRaises(image.ImageError) as caught:
+            image.wait_for_image(_TAG, self.root, timeout_s=1, poll_s=0)
+        self.assertNotIn('old recipe broke', str(caught.exception))
 
 
 if __name__ == '__main__':

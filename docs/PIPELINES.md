@@ -872,14 +872,25 @@ path.
 whichever release was current on the day it was built. Pinned versions make
 the image the same on every machine, and make a version change a recipe change.
 
-**How a build happens.** At start-up, after the egress check, the runner names
-the image `localhost/omni-sbx-<pipeline>:<fingerprint>`. The fingerprint is a
-hash of `from` and `setup`. If sbx already has a template by that name, the run
-uses it. If not, the runner creates a sandbox from `from` with nothing mounted,
-gives it the gate's network allowlist, runs `setup` under `set -e`, then stops
-the sandbox and saves it as the template. The sandbox is removed whether or not
-the build succeeds. A failed setup stops the run before any turn, with the end
-of its output. Changing `from` or `setup` names a new image, so the next run
+**How a build happens.** The image is named
+`localhost/omni-sbx-<pipeline>:<fingerprint>`, where the fingerprint is a hash of
+`from` and `setup`. If sbx already has a template by that name, it is used. If
+not, it's built: a sandbox is created from `from` with nothing mounted, given the
+per-VM network allowlist, runs `setup` under `set -e`, and is then stopped and
+saved as the template. The sandbox is removed whether or not the build succeeds.
+
+**Who builds it, and who waits.** A server started with `--pipeline` starts the
+build in the background, and is usable straight away. Every agent VM boots the
+image, so a session launched before the build finishes waits for it, then boots.
+A message sent to such a session gives up after about four minutes, so resend it
+once the build is done. A runner that finds the image missing waits for a build
+already in progress rather than starting a second one; with no build running, it
+builds the image itself. One build at a time is enforced by
+`.sbx-omnigent-image.lock` in `sbx.worktree_root`. A failed build is printed by
+whichever process ran it, the server keeps running, and a session or run waiting
+for it fails with the end of the setup's output. Stopping the server during a
+build abandons it, and the next start builds again; remove the leftover
+`image-build-*` sandbox with `sbx rm`. Changing `from` or `setup` names a new image, so the next run
 builds again. `cpus`, `memory` and `timeout` affect only the build, so changing
 them doesn't.
 

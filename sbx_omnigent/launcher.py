@@ -41,7 +41,7 @@ from omnigent.onboarding.sandboxes.base import (
 )
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
-from sbx_omnigent import agy, claude, codex, sbx_cli
+from sbx_omnigent import agy, claude, codex, image, sbx_cli
 from sbx_omnigent import swarm as swarm_mod
 from sbx_omnigent._compat import repo_workspace
 from sbx_omnigent.defaults import DEFAULT_HOST_IMAGE
@@ -577,6 +577,7 @@ class SbxLauncher(ExecModelHostLauncher):
         repo_url, repo_branch, repo_name = _normalize_repo_request(
             repos, repo_url, repo_branch, repo_name
         )
+        self._await_pipeline_image()
         if repo_url is None or not repo_url.startswith(_MOUNT_SENTINEL_PREFIX):
             # Non-sentinel: materialize the box with a throwaway scratch
             # mount (what provision used to do), then run the inherited
@@ -680,6 +681,31 @@ class SbxLauncher(ExecModelHostLauncher):
             adc=credential == 'agy' and self._agy_update,
         )
         return worktree
+
+    def _await_pipeline_image(self) -> None:
+        """
+        Wait for a pipeline image the server is still building.
+
+        Every sandbox boots it with ``--pull never``, so before it
+        exists a launch fails, and a session whose launch failed keeps
+        failing. The server builds a missing image in the background at
+        start; this waits for that build (or a runner's) to finish.
+
+        :raises click.ClickException: If the build failed, nothing is
+            building the missing image, or the wait runs out.
+        """
+        if self._worktree_root is None or not image.is_pipeline_image(
+            self._image
+        ):
+            return
+        try:
+            image.wait_for_image(
+                self._image,
+                self._worktree_root,
+                timeout_s=image.WAIT_TIMEOUT_S,
+            )
+        except image.ImageError as exc:
+            raise click.ClickException(str(exc)) from exc
 
     @staticmethod
     def _split_mount_model(
