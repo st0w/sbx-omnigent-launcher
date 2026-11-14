@@ -51,6 +51,28 @@ BLOCKING = frozenset({'CRITICAL', 'HIGH'})
 #: The plugin's tiers.
 EFFORTS = ('low', 'medium', 'high')
 
+#: The issue labels a filed scan finding carries beside ``finding``:
+#: ``(name, colour, description)``, created on the publish repo when
+#: missing.
+SECURITY_LABELS: tuple[tuple[str, str, str], ...] = (
+    ('security-critical', 'b60205',
+     'claude-security scan finding: Critical severity'),
+    ('security-high', 'd93f0b',
+     'claude-security scan finding: High severity'),
+    ('security-medium', 'fbca04',
+     'claude-security scan finding: Medium severity'),
+    ('security-low', 'c5def5',
+     'claude-security scan finding: Low severity'),
+)
+
+#: The tag :func:`render_defect` starts a finding with.
+_DEFECT_TAG_RE = re.compile(r'\[(security-(?:critical|high|medium|low))\] ')
+
+#: A finding's heading in :func:`render_blocking`, with its severity.
+_BLOCKING_HEADING_RE = re.compile(
+    r'^### \S+ — (CRITICAL|HIGH|MEDIUM|LOW) — ', re.MULTILINE
+)
+
 #: A commit id, short or full.
 _COMMIT_RE = re.compile(r'[0-9a-f]{7,40}')
 
@@ -312,6 +334,37 @@ def render_defect(finding: ScanFinding) -> str:
     if finding.recommendation:
         parts.append(f'Fix: {finding.recommendation}')
     return ' '.join(' '.join(p.split()) for p in parts if p)
+
+
+def defect_label(text: str) -> str | None:
+    """
+    The severity label of a finding :func:`render_defect` wrote.
+
+    :param text: One recorded finding.
+    :returns: e.g. ``"security-medium"``, or ``None`` if it carries no
+        tag (it was not written by a scan).
+    """
+    match = _DEFECT_TAG_RE.match(text)
+    return match.group(1) if match else None
+
+
+def blocking_label(report: str) -> str | None:
+    """
+    The label for a blocking claim re-checked from *report*.
+
+    Triage restates a blocking report's claims in its own words, so a
+    claim cannot be matched to one of the plugin's findings. It takes
+    the most severe level in the report it came from.
+
+    :param report: A report :func:`render_blocking` wrote.
+    :returns: e.g. ``"security-critical"``, or ``None`` if it names no
+        finding.
+    """
+    found = set(_BLOCKING_HEADING_RE.findall(report))
+    for severity in SEVERITIES:
+        if severity in found:
+            return f'security-{severity.lower()}'
+    return None
 
 
 def render_report(

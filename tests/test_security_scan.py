@@ -287,5 +287,46 @@ class TestRendering(unittest.TestCase):
         self.assertIn('no findings', text)
 
 
+
+class TestLabels(unittest.TestCase):
+    """The ``security-<severity>`` label a filed finding carries."""
+
+    def _found(self, *severities: str) -> tuple[ss.ScanFinding, ...]:
+        return ss.parse_report(_jsonl(*(
+            _finding(f'F{i}', sev) for i, sev in enumerate(severities)
+        )))
+
+    def test_a_defect_is_labelled_by_its_tag(self) -> None:
+        for finding in self._found('MEDIUM', 'LOW'):
+            with self.subTest(severity=finding.severity):
+                self.assertEqual(
+                    ss.defect_label(ss.render_defect(finding)), finding.label
+                )
+
+    def test_untagged_text_has_no_label(self) -> None:
+        for text in ('leaks a handle', 'see [security-medium] below',
+                     '[security-severe] made up'):
+            with self.subTest(text=text):
+                self.assertIsNone(ss.defect_label(text))
+
+    def test_a_blocking_report_takes_its_most_severe_level(self) -> None:
+        cases = ((('HIGH',), 'security-high'),
+                 (('HIGH', 'CRITICAL'), 'security-critical'))
+        for severities, label in cases:
+            with self.subTest(severities=severities):
+                report = ss.render_blocking(self._found(*severities))
+                self.assertEqual(ss.blocking_label(report), label)
+
+    def test_a_report_naming_no_finding_has_no_label(self) -> None:
+        self.assertIsNone(ss.blocking_label('VERDICT: BLOCKING'))
+
+    def test_every_severity_has_a_label_definition(self) -> None:
+        self.assertEqual(
+            [name for name, _c, _d in ss.SECURITY_LABELS],
+            [f'security-{s.lower()}' for s in ss.SEVERITIES],
+        )
+        for _name, colour, _desc in ss.SECURITY_LABELS:
+            self.assertRegex(colour, r'\A[0-9a-f]{6}\Z')
+
 if __name__ == '__main__':
     unittest.main()
