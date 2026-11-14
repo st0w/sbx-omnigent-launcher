@@ -687,6 +687,12 @@ class SwarmRegistry:
     separate ``sys_os_shell`` invocations. Each entry stores the handle
     plus the config (server URL + roots) needed to rebuild the driver.
 
+    The directory is shared: the agy harvester keeps its freshness
+    stamp (``agy-harvest.json``) here too. So a file is a swarm entry
+    only when it is a JSON object whose ``swarm_id`` is its own name.
+    Anything else is another tool's file, and is never listed, loaded
+    or deleted.
+
     :param root: Directory holding ``<swarm_id>.json`` files.
     """
 
@@ -707,19 +713,30 @@ class SwarmRegistry:
         """
         Load a swarm entry by id.
 
-        :raises click.ClickException: If no such swarm is registered.
+        :raises click.ClickException: If no such swarm is registered,
+            the file is another tool's, or the entry is broken.
         """
-        try:
-            with open(self._path(swarm_id), encoding='utf-8') as fh:
-                data: dict[str, object] = json.load(fh)
-        except FileNotFoundError as exc:
+        data = self._read(swarm_id)
+        if data is None:
             raise click.ClickException(
                 f'no registered swarm {swarm_id!r} (in {self._root})'
-            ) from exc
+            )
         return data
 
     def remove(self, swarm_id: str) -> None:
-        """Delete a swarm entry (idempotent)."""
+        """
+        Delete a swarm entry (idempotent for a missing one).
+
+        :raises click.ClickException: If the file there is not this
+            swarm's entry: it belongs to another tool and is kept.
+        """
+        if not os.path.exists(self._path(swarm_id)):
+            return
+        if self._read(swarm_id) is None:
+            raise click.ClickException(
+                f'{self._path(swarm_id)} is not the registry entry of swarm '
+                f'{swarm_id!r}; it is not deleted'
+            )
         try:
             os.remove(self._path(swarm_id))
         except FileNotFoundError:
@@ -727,13 +744,84 @@ class SwarmRegistry:
 
     def list_ids(self) -> list[str]:
         """:returns: Registered swarm ids, sorted."""
+        return [name for name, problem in self._scan() if problem is None]
+
+    def broken_entries(self) -> list[tuple[str, str]]:
+        """
+        Files that claim to be swarm entries but cannot be used.
+
+        :returns: ``(file name, what is wrong)`` pairs, sorted.
+        """
+        return [
+            (f'{name}.json', problem)
+            for name, problem in self._scan()
+            if problem is not None
+        ]
+
+    def _scan(self) -> list[tuple[str, str | None]]:
+        """
+        Every swarm entry in the directory, and what is wrong with it.
+
+        Another tool's file (valid JSON that is not an object with a
+        ``swarm_id``) is left out entirely.
+
+        :returns: ``(swarm id, problem or None)``, sorted by id.
+        """
         if not os.path.isdir(self._root):
             return []
-        return sorted(
-            name[:-5]
-            for name in os.listdir(self._root)
-            if name.endswith('.json')
-        )
+        out: list[tuple[str, str | None]] = []
+        for name in sorted(os.listdir(self._root)):
+            if not name.endswith('.json'):
+                continue
+            swarm_id = name[:-5]
+            try:
+                data = self._load_json(swarm_id)
+            except click.ClickException as exc:
+                out.append((swarm_id, exc.message))
+                continue
+            if isinstance(data, dict) and 'swarm_id' in data:
+                out.append((swarm_id, _entry_problem(swarm_id, data)))
+        return out
+
+    def _read(self, swarm_id: str) -> dict[str, object] | None:
+        """
+        This swarm's entry, or ``None`` if the file is missing or is
+        not one (another tool's file, or one naming another swarm).
+
+        :raises click.ClickException: If the file is not valid JSON.
+        """
+        data = self._load_json(swarm_id)
+        if not isinstance(data, dict) or data.get('swarm_id') != swarm_id:
+            return None
+        return data
+
+    def _load_json(self, swarm_id: str) -> object:
+        """
+        The file's parsed JSON, or ``None`` when there is no file.
+
+        :raises click.ClickException: If it cannot be read or parsed.
+        """
+        path = self._path(swarm_id)
+        try:
+            with open(path, encoding='utf-8') as fh:
+                return json.load(fh)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(
+                f'registry entry {path} cannot be read: {exc}'
+            ) from exc
+
+
+def _entry_problem(swarm_id: str, data: dict[str, object]) -> str | None:
+    """What stops a file that claims to be an entry from being used."""
+    if data.get('swarm_id') != swarm_id:
+        return f'its swarm_id is not {swarm_id!r}'
+    try:
+        handle_from_entry(data)
+    except click.ClickException as exc:
+        return exc.message
+    return None
 
 
 def handle_to_entry(
@@ -767,6 +855,21 @@ def handle_from_entry(entry: dict[str, object]) -> SwarmHandle:
         raise click.ClickException(
             f'registry entry {entry.get("swarm_id")!r}: reviewers must be '
             f'a list of mappings'
+        )
+    missing = [
+        key
+        for key in ('swarm_id', 'repo_url', 'worktree_path', 'coder_session')
+        if key not in entry
+    ] + [
+        f'reviewers[{i}].{key}'
+        for i, r in enumerate(raw)
+        for key in ('role', 'session')
+        if key not in r
+    ]
+    if missing:
+        raise click.ClickException(
+            f'registry entry {entry.get("swarm_id")!r} has no '
+            f'{", ".join(missing)}'
         )
     reviewers = tuple(
         Reviewer(role=str(r['role']), session=str(r['session']))
@@ -1502,6 +1605,8 @@ def _list(registry: SwarmRegistry) -> None:
         entry = registry.load(swarm_id)
         handle = handle_from_entry(entry)
         click.echo(f'{swarm_id}: {", ".join(handle.roles())}')
+    for name, problem in registry.broken_entries():
+        click.echo(f'[registry] skipped {name}: {problem}', err=True)
 
 
 # ── Walking-skeleton demo ─────────────────────────────────────────

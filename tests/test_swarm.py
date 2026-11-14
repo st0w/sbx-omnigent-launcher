@@ -20,6 +20,7 @@ import unittest
 from unittest import mock
 
 import click
+from click.testing import CliRunner
 
 from sbx_omnigent.launch_args import YOLO_LAUNCH_ARGS, launch_args_for
 from sbx_omnigent.swarm import (
@@ -37,6 +38,9 @@ from sbx_omnigent.swarm import (
     handle_to_entry,
     last_assistant_text,
     mount_sentinel,
+)
+from sbx_omnigent.swarm import (
+    cli as swarm_cli,
 )
 from sbx_omnigent.swarm_session import (
     SwarmSessionError,
@@ -548,6 +552,91 @@ class TestRegistryRoundTrip(unittest.TestCase):
     def test_list_ids_on_missing_dir(self) -> None:
         empty = os.path.join(self.root, 'does-not-exist')
         self.assertEqual(SwarmRegistry(empty).list_ids(), [])
+
+
+class TestTheRegistrySharesItsDirectory(unittest.TestCase):
+    """
+    The registry's directory is shared: the agy harvester keeps its
+    freshness stamp, ``agy-harvest.json``, beside the swarm entries. A
+    file is a swarm entry only when it is a JSON object whose
+    ``swarm_id`` is its own name; anything else is another tool's file,
+    never listed, loaded or deleted. `list` crashed on the stamp with
+    ``KeyError: 'swarm_id'``.
+    """
+
+    def setUp(self) -> None:
+        self.root = tempfile.mkdtemp(prefix='swarm-reg-')
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.registry = SwarmRegistry(self.root)
+        self.registry.save(handle_to_entry(
+            SwarmHandle(
+                swarm_id='s1', repo_url='https://github.com/o/r.git',
+                worktree_path='/srv/worktrees/s1', coder_session='c1',
+                reviewers=(Reviewer(role='bug', session='r1'),),
+            ),
+            server='http://x:6767', canonical_root='/c', worktree_root='/w',
+        ))
+        self.stamp = os.path.join(self.root, 'agy-harvest.json')
+        self._write('agy-harvest.json', '{"at": 1794600000.0}')
+
+    def _write(self, name: str, text: str) -> None:
+        with open(os.path.join(self.root, name), 'w', encoding='utf-8') as fh:
+            fh.write(text)
+
+    def _list(self) -> tuple[int, str, str]:
+        result = CliRunner().invoke(
+            swarm_cli, ['--registry', self.root, 'list']
+        )
+        return result.exit_code, result.stdout, result.stderr
+
+    def test_another_tools_file_is_not_a_swarm(self) -> None:
+        self.assertEqual(self.registry.list_ids(), ['s1'])
+
+    def test_list_shows_the_swarms_and_not_the_stamp(self) -> None:
+        code, out, err = self._list()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, 's1: coder, bug\n')
+        self.assertNotIn('agy-harvest', err)
+
+    def test_another_tools_file_cannot_be_loaded(self) -> None:
+        with self.assertRaises(click.ClickException) as caught:
+            self.registry.load('agy-harvest')
+        self.assertIn('no registered swarm', str(caught.exception))
+
+    def test_another_tools_file_is_never_deleted(self) -> None:
+        with self.assertRaises(click.ClickException):
+            self.registry.remove('agy-harvest')
+        self.assertTrue(os.path.exists(self.stamp))
+
+    def test_removing_a_missing_swarm_is_still_a_no_op(self) -> None:
+        self.registry.remove('gone')
+
+    def test_an_entry_whose_id_is_not_its_name_is_not_loaded(self) -> None:
+        self._write('s2.json', '{"swarm_id": "s1"}')
+        self.assertEqual(self.registry.list_ids(), ['s1'])
+        with self.assertRaises(click.ClickException):
+            self.registry.load('s2')
+
+    def test_a_broken_entry_is_reported_not_a_traceback(self) -> None:
+        self._write('s3.json', '{"swarm_id": "s3"')
+        self._write('s4.json', '{"swarm_id": "s4"}')
+        code, out, err = self._list()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, 's1: coder, bug\n')
+        self.assertIn('s3.json', err)
+        self.assertIn('s4.json', err)
+
+    def test_loading_a_broken_entry_says_so(self) -> None:
+        self._write('s3.json', '{"swarm_id": "s3"')
+        with self.assertRaises(click.ClickException) as caught:
+            self.registry.load('s3')
+        self.assertIn('s3.json', str(caught.exception))
+
+    def test_an_entry_missing_a_field_is_refused_by_name(self) -> None:
+        with self.assertRaises(click.ClickException) as caught:
+            handle_from_entry({'swarm_id': 's4'})
+        self.assertIn('s4', str(caught.exception))
+        self.assertIn('repo_url', str(caught.exception))
 
 
 class TestCodexIsAThirdHarness(unittest.TestCase):
