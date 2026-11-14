@@ -268,7 +268,8 @@ Two follow-on notes:
   the harvester will report a sandbox that cannot start. Point `--workspace` at
   a **persistent** directory when bootstrapping on a server:
   `omni-sbx-agy bootstrap --workspace /var/lib/omnigent/agy-ws`.
-- The runner starts a token harvester itself and stops it at the end, so there
+- The server starts a token harvester itself when agy is enabled and stops it
+  when it exits (a pipeline run does the same when none is running), so there
   is no second background command to remember.
 
 ## Keeping a run alive

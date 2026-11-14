@@ -313,9 +313,16 @@ sbx exec -it agy-auth-trusted agy      # run '/login', complete the browser cons
 
 ### Always-on: keep the swap token fresh
 
+The server does this. With `agy_enabled: true`, `omni-sbx server` starts a
+harvester (a ~30-minute force-refresh loop) when it starts, stops it when it
+exits, and warns, naming the log and the sign-in command, if the token isn't
+refreshed within three minutes. A harvester that's already running is used
+instead. The pipeline runner starts one too, for the length of a run, when none
+is running. By hand, only to test a cycle or to give it extra `--host` values
+(start it before the server):
+
 ```bash
-omni-sbx-agy harvest                   # ~30-min force-refresh loop (run under a
-                                       # process manager)
+omni-sbx-agy harvest                   # ~30-min force-refresh loop
 omni-sbx-agy harvest --once            # single cycle (cron / verification)
 ```
 

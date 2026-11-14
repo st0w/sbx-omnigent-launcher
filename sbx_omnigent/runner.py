@@ -12598,24 +12598,6 @@ def preflight_codex_login(
         echo(f'[preflight] {warning}')
 
 
-def stop_harvester(proc: subprocess.Popen[bytes] | None) -> None:
-    """
-    Stop a harvester this run started, if any.
-
-    :param proc: The child from :func:`agy.spawn_harvester`, or ``None``
-        when the run did not start one (nothing to stop).
-    """
-    if proc is None:
-        return
-    try:
-        proc.terminate()
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-    except OSError:
-        pass
-
-
 def ensure_agy_harvester(
     config: pipeline.PipelineConfig,
     *,
@@ -12660,7 +12642,8 @@ def ensure_agy_harvester(
     :param wait: Freshness waiter (injected in tests).
     :param now: Epoch seconds to measure staleness from.
     :returns: The harvester this call started (the caller MUST stop it
-        via :func:`stop_harvester`), or ``None`` when it started none.
+        via :func:`agy.stop_harvester`), or ``None`` when it started
+        none.
     :raises click.ClickException: If the secret cannot be made fresh.
     """
     if not agy_agent_names(config):
@@ -12705,7 +12688,7 @@ def ensure_agy_harvester(
     if not (wait or agy.wait_for_fresh_swap)(
         deadline_s=deadline_s, stamp_path=stamp_path
     ):
-        stop_harvester(proc)
+        agy.stop_harvester(proc)
         raise click.ClickException(
             f'the agy swap secret did not go fresh within '
             f'{deadline_s:.0f}s, so agent(s) '
@@ -12983,7 +12966,7 @@ def main(
     else:
         interrupted = False
     finally:
-        stop_harvester(harvester)
+        agy.stop_harvester(harvester)
     if interrupted:
         # Teardown has run and the harvester is stopped. A worker of a
         # parallel stage can still be inside a turn's HTTP wait, and the

@@ -403,6 +403,24 @@ def spawn_harvester(
         )
 
 
+def stop_harvester(proc: subprocess.Popen[bytes] | None) -> None:
+    """
+    Stop a harvester this process started, if any.
+
+    :param proc: The child from :func:`spawn_harvester`, or ``None``
+        when nothing was started (nothing to stop).
+    """
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def wait_for_fresh_swap(
     *,
     deadline_s: float,

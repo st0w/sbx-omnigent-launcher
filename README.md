@@ -507,10 +507,11 @@ any sandbox can present it, so a target is a Google API anyone in a sandbox can
 call with your real token. You can confirm it with `sbx policy log <sandbox>`: the
 listed hosts show `forward` (decrypted, so the swap happens) and every other Google
 host `forward-bypass`. A regional `agy_gcp_location` such as `us-central1` calls
-`<region>-aiplatform.googleapis.com`, which isn't on the list. For one, run the
-harvester yourself with a `--host` for every host you need: `--host` replaces the
-default list rather than adding to it. A pipeline run uses a harvester that's
-already running instead of starting its own.
+`<region>-aiplatform.googleapis.com`, which isn't on the list. For one, start the
+harvester yourself, **before the server**, with a `--host` for every host you
+need: `--host` replaces the default list rather than adding to it. The server and
+a pipeline run both use a harvester that's already running instead of starting
+their own.
 
 **One-time setup** — stand up the trusted box and log in once:
 
@@ -521,11 +522,15 @@ omni-sbx-agy bootstrap                      # creates agy-auth-trusted (isolated
 sbx exec -it agy-auth-trusted agy           # run '/login', complete browser consent
 ```
 
-**Always-on** — keep the swap secret fresh. **A pipeline run starts one for
-you**: if the pipeline declares any agy agent and the swap secret is stale, the
-runner launches a harvester, waits for the first refresh, and stops it when the
-run ends (`--no-auto-harvest` opts out). Run one yourself only for non-pipeline
-work, or to keep the secret warm between runs:
+**Always-on** — keep the swap secret fresh. **You don't run this yourself.**
+A server with `agy_enabled: true` starts a harvester when it starts and stops it
+when it exits; its first message says so, with the harvester's pid and log. If
+the token hasn't been refreshed within three minutes, the server prints a warning
+naming the log and how to sign in again. A pipeline run also starts one if none
+is running (for a runner without such a server), waits for the first refresh,
+and stops it when the run ends (`--no-auto-harvest` opts out). Run one by hand
+only to test a cycle, or with extra `--host` values (start it before the server,
+which then uses it):
 
 ```bash
 omni-sbx-agy harvest                        # ~30-min force-refresh loop
@@ -535,8 +540,8 @@ omni-sbx-agy harvest --once                 # single cycle (cron / verification)
 Only **one** harvester may run at a time — each cycle rewrites the trusted box's
 token file before forcing a re-mint, so two would race. That is enforced with an
 exclusive lock (`~/.sbx-swarm/agy-harvest.lock`): a second one refuses to start,
-and the runner detects a harvester you already have running and waits for it
-instead of competing. An auto-started one logs to `~/.sbx-swarm/agy-harvest.log`.
+and the server and the runner both detect a harvester that's already running and
+use it instead of competing. An auto-started one logs to `~/.sbx-swarm/agy-harvest.log`.
 
 Each cycle force-expires the trusted box's on-disk token, runs `agy models` (the
 lightest authenticated action) to make agy re-mint via OAuth, reads the fresh
