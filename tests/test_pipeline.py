@@ -5,10 +5,12 @@ Run: .venv/bin/python -m unittest discover -s tests
 
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 from omnigent.spec import parse
@@ -926,6 +928,99 @@ class TestAPipelineImage(_Base):
             P.image_tag(self._with(_IMAGE + '  cpus: 8\n  timeout: 900\n')),
             P.image_tag(self._with(_IMAGE)),
         )
+
+
+class _PluginHome:
+    """A temporary home with claude-security installed, as Claude Code
+    records it."""
+
+    def __init__(self) -> None:
+        self.home = Path(tempfile.mkdtemp(prefix='plugin-home-'))
+        plugins = self.home / '.claude' / 'plugins'
+        self.install = (
+            plugins / 'cache' / 'claude-plugins-official'
+            / 'claude-security' / '0.12.0'
+        )
+        (self.install / 'skills').mkdir(parents=True)
+        (self.install / 'skills' / 'SKILL.md').write_text('scan things\n')
+        (plugins / 'installed_plugins.json').write_text(json.dumps({
+            'version': 2,
+            'plugins': {'claude-security@claude-plugins-official': [
+                {'installPath': str(self.install), 'version': '0.12.0'},
+            ]},
+        }))
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self.home, ignore_errors=True)
+
+
+class TestAnImagesClaudePlugins(_Base):
+    """``image.claude_plugins`` copies host-installed Claude Code
+    plugins into the image; their content is part of its fingerprint."""
+
+    _PLUGINS = '  claude_plugins: [claude-security@claude-plugins-official]\n'
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.h = _PluginHome()
+        self.addCleanup(self.h.cleanup)
+        home = mock.patch.object(P.Path, 'home', return_value=self.h.home)
+        home.start()
+        self.addCleanup(home.stop)
+
+    def _with(self, extra: str) -> P.PipelineConfig:
+        return self._load(_FULL + _IMAGE + extra)
+
+    def test_they_parse(self) -> None:
+        image = self._with(self._PLUGINS).image
+        assert image is not None
+        self.assertEqual(
+            image.claude_plugins, ('claude-security@claude-plugins-official',)
+        )
+
+    def test_none_by_default(self) -> None:
+        image = self._load(_FULL + _IMAGE).image
+        assert image is not None
+        self.assertEqual(image.claude_plugins, ())
+
+    def test_a_bad_id_or_a_duplicate_is_refused(self) -> None:
+        for value in ('[claude-security]', 'claude-security@x',
+                      '[a@b, a@b]', '[5]'):
+            with self.subTest(value=value):
+                with self.assertRaises(P.PipelineError) as caught:
+                    self._with(f'  claude_plugins: {value}\n')
+                self.assertIn('image.claude_plugins', str(caught.exception))
+
+    def test_without_plugins_the_tag_is_unchanged(self) -> None:
+        # Existing pipeline images keep their name: no rebuild.
+        cfg = self._load(_FULL + _IMAGE)
+        recipe = (
+            f'{P._IMAGE_FORMAT}\n{cfg.image.base}\n{cfg.image.setup}'
+        )
+        self.assertTrue(P.image_tag(cfg).endswith(
+            P.hashlib.sha256(recipe.encode()).hexdigest()[:16]
+        ))
+
+    def test_plugins_change_the_tag(self) -> None:
+        self.assertNotEqual(
+            P.image_tag(self._with(self._PLUGINS)),
+            P.image_tag(self._load(_FULL + _IMAGE)),
+        )
+
+    def test_a_plugin_update_changes_it_again(self) -> None:
+        before = P.image_tag(self._with(self._PLUGINS))
+        (self.h.install / 'skills' / 'SKILL.md').write_text('newer\n')
+        self.assertNotEqual(P.image_tag(self._with(self._PLUGINS)), before)
+
+    def test_a_plugin_not_installed_is_named_when_the_tag_is_made(
+        self,
+    ) -> None:
+        cfg = self._with(
+            '  claude_plugins: [missing@claude-plugins-official]\n'
+        )
+        with self.assertRaises(P.PipelineError) as caught:
+            P.image_tag(cfg)
+        self.assertIn('missing@claude-plugins-official', str(caught.exception))
 
 
 class TestAContractCheckStage(_Base):

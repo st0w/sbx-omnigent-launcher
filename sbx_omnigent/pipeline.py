@@ -35,7 +35,7 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
-from sbx_omnigent import agy, claude, codex
+from sbx_omnigent import agy, claude, claude_plugins, codex
 from sbx_omnigent._compat import CODEX_EFFORTS, model_family_mismatch
 
 #: Shipped role prompt templates live here (Path-relative, like the
@@ -1262,6 +1262,7 @@ class ImageSpec:
     cpus: int | None = None
     memory: str | None = None
     timeout_s: float = 3600.0
+    claude_plugins: tuple[str, ...] = ()
 
 
 #: Bumped when what goes into an image changes for a reason other than
@@ -1269,7 +1270,9 @@ class ImageSpec:
 _IMAGE_FORMAT = 'omni-sbx-image-v1'
 
 #: The keys an ``image:`` block may have.
-_IMAGE_KEYS = frozenset({'from', 'setup', 'cpus', 'memory', 'timeout'})
+_IMAGE_KEYS = frozenset(
+    {'from', 'setup', 'cpus', 'memory', 'timeout', 'claude_plugins'}
+)
 
 
 def image_tag(config: PipelineConfig) -> str | None:
@@ -1283,13 +1286,30 @@ def image_tag(config: PipelineConfig) -> str | None:
     with. ``localhost/`` keeps sbx from reading the name as a Docker Hub
     repository.
 
+    With ``claude_plugins``, the host's installed copy of each plugin is
+    read and its version and files are part of the fingerprint, so a
+    plugin update names a new image.
+
     :param config: The parsed pipeline.
     :returns: e.g. ``localhost/omni-sbx-discover:0123456789abcdef``, or
         ``None`` when the pipeline declares no image.
+    :raises PipelineError: If a listed plugin is not installed on the
+        host, or not safe to copy.
     """
     if config.image is None:
         return None
     recipe = f'{_IMAGE_FORMAT}\n{config.image.base}\n{config.image.setup}'
+    if config.image.claude_plugins:
+        # Appended only when there are plugins, so an image without
+        # them keeps the name it already has.
+        try:
+            plugins = [
+                claude_plugins.resolve(plugin_id)
+                for plugin_id in config.image.claude_plugins
+            ]
+        except claude_plugins.PluginError as exc:
+            raise PipelineError(f'image.claude_plugins: {exc}') from exc
+        recipe += f'\nclaude_plugins:{claude_plugins.digest(plugins)}'
     digest = hashlib.sha256(recipe.encode()).hexdigest()[:16]
     return f'localhost/omni-sbx-{config.name}:{digest}'
 
@@ -1310,7 +1330,7 @@ def _parse_image(raw: object) -> ImageSpec | None:
     if unknown:
         raise PipelineError(
             f'image: unknown key(s) {", ".join(repr(k) for k in unknown)}; '
-            f'expected from, setup, cpus, memory, timeout'
+            f'expected from, setup, cpus, memory, timeout, claude_plugins'
         )
     base = _opt_str(entry.get('from'), 'image.from')
     if base is None:
@@ -1339,13 +1359,45 @@ def _parse_image(raw: object) -> ImageSpec | None:
         or timeout <= 0
     ):
         raise PipelineError('image.timeout must be a positive number')
+    plugins = _parse_claude_plugins(entry.get('claude_plugins'))
     return ImageSpec(
         base=base,
         setup=setup.strip(),
         cpus=cpus,
         memory=memory.strip() if memory else None,
         timeout_s=float(timeout) if timeout is not None else 3600.0,
+        claude_plugins=plugins,
     )
+
+
+def _parse_claude_plugins(raw: object) -> tuple[str, ...]:
+    """
+    Parse ``image.claude_plugins``: host-installed plugins to copy in.
+
+    :param raw: The raw field, or ``None``.
+    :returns: The plugin ids, in order.
+    :raises PipelineError: If it is not a list of distinct
+        ``<name>@<marketplace>`` ids.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise PipelineError(
+            'image.claude_plugins must be a list, like '
+            '[claude-security@claude-plugins-official]'
+        )
+    out: list[str] = []
+    for item in raw:
+        try:
+            plugin_id = claude_plugins.validate_plugin_id(item)
+        except ValueError as exc:
+            raise PipelineError(f'image.claude_plugins: {exc}') from exc
+        if plugin_id in out:
+            raise PipelineError(
+                f'image.claude_plugins lists {plugin_id} twice'
+            )
+        out.append(plugin_id)
+    return tuple(out)
 
 
 def _validate_image(config: PipelineConfig) -> None:

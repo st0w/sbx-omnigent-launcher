@@ -8,8 +8,10 @@ throwaway sandbox, and saves the result as a local template. Booting a
 sandbox from it takes about a second.
 
 The build: create a sandbox from the base with nothing mounted, scope
-its egress like the gate's, run the setup, stop the sandbox (sbx saves
-only a stopped one), save it as the template, and always remove it.
+its egress like the gate's, run the setup, install any host Claude Code
+plugins the image names (copied in, offline), stop the sandbox (sbx
+saves only a stopped one), save it as the template, and always remove
+it.
 The template's name comes from :func:`sbx_omnigent.pipeline.image_tag`,
 so a changed recipe is a new name and an unchanged one is never rebuilt.
 """
@@ -23,11 +25,12 @@ import secrets
 import subprocess
 import tempfile
 import time
+from pathlib import Path
 from typing import IO
 
 import click
 
-from sbx_omnigent import sbx_cli
+from sbx_omnigent import claude_plugins, sbx_cli
 from sbx_omnigent.pipeline import ImageSpec, _sanitize
 from sbx_omnigent.verify import clamp_lines, salient_tail, scrub
 
@@ -381,6 +384,9 @@ def build_image(
     """
     Build *spec* into the local template *tag*.
 
+    Runs ``image.setup``, then installs ``image.claude_plugins`` from
+    the host's own installs (see :func:`_install_plugins`).
+
     :param tag: The template name to save as.
     :param spec: The pipeline's ``image:`` block.
     :param name: The build sandbox's name, from :func:`build_box_name`.
@@ -416,6 +422,8 @@ def build_image(
                 runner=runner,
             )
         _run_setup(name, spec, runner)
+        if spec.claude_plugins:
+            _install_plugins(name, spec.claude_plugins, runner)
         _sbx(
             ['sbx', 'stop', name],
             timeout_s=sbx_cli.MANAGE_TIMEOUT_S,
@@ -430,6 +438,56 @@ def build_image(
         )
     finally:
         _remove(name, runner)
+
+
+def _install_plugins(
+    name: str, plugin_ids: tuple[str, ...], runner: sbx_cli.Runner | None
+) -> None:
+    """
+    Install host Claude Code plugins in the build sandbox, offline.
+
+    Each plugin is copied from the host's own install into a local
+    marketplace (:func:`claude_plugins.stage_marketplace`), the
+    marketplace is copied into the sandbox's home, and Claude Code adds
+    it and installs each plugin from it. The VMs can't reach the
+    marketplaces' hosts, and only what the user already installed on
+    the host is copied.
+
+    :param name: The build sandbox.
+    :param plugin_ids: ``image.claude_plugins``.
+    :param runner: Subprocess runner (injected in tests).
+    :raises ImageError: If a plugin can't be found, copied, added or
+        installed.
+    """
+    try:
+        plugins = [claude_plugins.resolve(pid) for pid in plugin_ids]
+    except claude_plugins.PluginError as exc:
+        raise ImageError(str(exc)) from exc
+    with tempfile.TemporaryDirectory(prefix='omni-sbx-plugins-') as tmp:
+        staged = claude_plugins.stage_marketplace(plugins, Path(tmp))
+        _sbx(
+            ['sbx', 'cp', str(staged), f'{name}:/root/'],
+            timeout_s=sbx_cli.MANAGE_TIMEOUT_S,
+            failure='could not copy the Claude Code plugins into the build',
+            runner=runner,
+        )
+    market = f'/root/{claude_plugins.STAGED_MARKETPLACE}'
+    _sbx(
+        ['sbx', 'exec', name, '--', 'claude', 'plugin', 'marketplace',
+         'add', market],
+        timeout_s=sbx_cli.INSTALL_TIMEOUT_S,
+        failure='could not add the staged Claude Code plugin marketplace',
+        runner=runner,
+    )
+    for plugin in plugins:
+        _sbx(
+            ['sbx', 'exec', name, '--', 'claude', 'plugin', 'install',
+             claude_plugins.staged_id(plugin)],
+            timeout_s=sbx_cli.INSTALL_TIMEOUT_S,
+            failure=f'could not install the Claude Code plugin '
+            f'{plugin.plugin_id}',
+            runner=runner,
+        )
 
 
 def _run_setup(
