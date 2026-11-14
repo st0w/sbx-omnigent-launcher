@@ -60,9 +60,9 @@ TOKEN_FILE = '~/.gemini/antigravity-cli/antigravity-oauth-token'
 #: leaked credential. Nothing needs the prefix: Omnigent's gate wants a
 #: non-empty token, and the proxy matches this exact string. The agent
 #: VM's token file and metadata stand-in serve this SAME value, so keep
-#: them in sync by importing this constant. Changing it registers a new
-#: swap secret beside the old one; remove the old one with
-#: ``sbx secret rm``.
+#: them in sync by importing this constant. sbx keeps one custom secret
+#: per env var, so changing it means removing the old swap secret
+#: (``sbx secret rm``) before the harvester can set the new one.
 PLACEHOLDER_TOKEN = (
     'omni-sbx-agy-PROXY-SWAP-PLACEHOLDER-DO-NOT-USE-'
     '0000000000000000000000000000'
