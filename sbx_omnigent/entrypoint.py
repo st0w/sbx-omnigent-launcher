@@ -28,6 +28,7 @@ Run ``omni-sbx server ...`` exactly as you would ``omni server ...``.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import subprocess
@@ -46,7 +47,7 @@ from omnigent.server.managed_hosts import (
     _parse_host_config,
 )
 
-from sbx_omnigent import claude, egress, image, pipeline
+from sbx_omnigent import agy, claude, egress, image, pipeline
 from sbx_omnigent._compat import load_agy_bridge
 from sbx_omnigent.defaults import (
     DEFAULT_EGRESS_ALLOW,
@@ -651,6 +652,120 @@ def _ensure_pipeline_image(
     ).start()
 
 
+#: How long the server waits for a harvester's first refresh before it
+#: warns that agy sessions will not sign in.
+_FIRST_REFRESH_S = 180.0
+
+_HARVEST_WATCH_THREAD = 'sbx-omnigent-agy-harvest-watch'
+
+
+class _ServerHarvester:
+    """
+    The agy token harvester a server keeps running while agy is enabled.
+
+    agy VMs sign in with an inert placeholder that sbx's proxy swaps for
+    a real Google token on the wire. That token lives about an hour, and
+    the harvester refreshes it every 30 minutes; without one, every agy
+    session stops signing in an hour after the last refresh. The
+    pipeline runner already starts one for the length of a run, but
+    sessions opened on the server had to rely on a harvester someone
+    remembered to leave running. So the server starts one when it reads
+    ``agy_enabled``, and stops it when it exits.
+
+    One harvester at a time: the harvester lock (see
+    :func:`agy.acquire_harvest_lock`) says whether one is running, and a
+    running one is used rather than doubled. The config is read again on
+    every session, so this acts once per server process.
+    """
+
+    def __init__(
+        self,
+        *,
+        running: Callable[[], bool] = agy.harvester_running,
+        spawn: Callable[[], Any] = agy.spawn_harvester,
+        register_exit: Callable[..., object] = atexit.register,
+        start_watch: Callable[[], None] | None = None,
+    ) -> None:
+        """
+        :param running: Whether a harvester holds the lock.
+        :param spawn: Starts a detached harvester; returns its process.
+        :param register_exit: Registers a call for the server's exit.
+        :param start_watch: Starts the first-refresh check; ``None``
+            runs :func:`_watch_first_refresh` in a daemon thread.
+        """
+        self._running = running
+        self._spawn = spawn
+        self._register_exit = register_exit
+        self._start_watch = start_watch or _start_first_refresh_watch
+        self._lock = threading.Lock()
+        self._done = False
+
+    def ensure(self, agy_enabled: bool) -> None:
+        """
+        Start the harvester once, if agy is on and none is running.
+
+        :param agy_enabled: ``sandbox.sbx.agy_enabled``.
+        """
+        if not agy_enabled:
+            return
+        with self._lock:
+            if self._done:
+                return
+            self._done = True
+            if self._running():
+                print(
+                    '[sbx-omnigent] an agy token harvester is already '
+                    'running; the server uses it.',
+                    file=sys.stderr,
+                )
+                return
+            proc = self._spawn()
+            self._register_exit(agy.stop_harvester, proc)
+        print(
+            f'[sbx-omnigent] started the agy token harvester (pid '
+            f'{proc.pid}). It refreshes the agy token every 30 minutes, '
+            f'logs to {agy.HARVEST_LOG}, and stops with the server.',
+            file=sys.stderr,
+        )
+        self._start_watch()
+
+
+def _start_first_refresh_watch() -> None:
+    """Check for the first refresh without holding up startup."""
+    threading.Thread(
+        target=_watch_first_refresh, name=_HARVEST_WATCH_THREAD, daemon=True
+    ).start()
+
+
+def _watch_first_refresh(
+    *, wait: Callable[..., bool] = agy.wait_for_fresh_swap
+) -> None:
+    """
+    Warn when the harvester has not refreshed the token in time.
+
+    The usual cause is a trusted box whose sign-in has lapsed, which
+    only a person can fix; without this, agy sessions just fail to sign
+    in.
+
+    :param wait: Polls the harvest stamp until fresh or the deadline.
+    """
+    if wait(deadline_s=_FIRST_REFRESH_S):
+        return
+    print(
+        f'[sbx-omnigent] WARNING: the agy token harvester has not '
+        f'refreshed the token in {int(_FIRST_REFRESH_S)}s, so agy '
+        f'sessions will not sign in. See {agy.HARVEST_LOG}. If it says '
+        f'RE-LOGIN REQUIRED, sign in again: sbx exec -it '
+        f'{agy.TRUSTED_BOX_DEFAULT} agy, then /login.',
+        file=sys.stderr,
+    )
+
+
+#: The server's harvester; :func:`_build_sbx_config` hands it
+#: ``agy_enabled``.
+_AGY_HARVESTER = _ServerHarvester()
+
+
 def _publish_agent_image(worktree_root: str, agent_image: str) -> None:
     """
     Publish the image agents boot, for the pipeline runner to check.
@@ -747,6 +862,7 @@ def _build_sbx_config(raw: dict[str, Any]) -> ManagedSandboxConfig:
     host_config = _parse_host_config(raw)
     warn_on_inert_providers(host_config)
     _ensure_pipeline_image(egress_allow, worktree_root)
+    _AGY_HARVESTER.ensure(agy_enabled)
     if worktree_root is not None:
         _publish_egress_policy(worktree_root, egress_allow)
         _publish_agent_image(worktree_root, agent_image)

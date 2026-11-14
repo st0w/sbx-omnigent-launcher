@@ -9183,7 +9183,7 @@ class TestCtrlCStopsTheRunNow(_Base):
                     R, '_drive', side_effect=KeyboardInterrupt
                 ), \
                 mock.patch.object(
-                    R, 'stop_harvester',
+                    R.agy, 'stop_harvester',
                     side_effect=lambda _h: order.append('harvester'),
                 ), \
                 mock.patch.object(
@@ -10441,7 +10441,7 @@ class TestAgyAutoHarvest(_Base):
         self.assertEqual(self.spawned, [])
 
     def test_stop_harvester_is_a_noop_for_none(self) -> None:
-        R.stop_harvester(None)  # the "we started nothing" path
+        R.agy.stop_harvester(None)  # the "we started nothing" path
 
     def test_cli_stops_the_harvester_it_started(self) -> None:
         # The child must not outlive the run that started it.

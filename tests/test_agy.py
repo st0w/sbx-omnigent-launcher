@@ -442,6 +442,31 @@ class TestSetCustomArgv(unittest.TestCase):
             set_custom_argv(hosts=[])
 
 
+class TestStopHarvester(unittest.TestCase):
+    """Stopping a harvester this process started."""
+
+    def test_none_is_a_noop(self) -> None:
+        agy.stop_harvester(None)
+
+    def test_it_is_terminated_and_reaped(self) -> None:
+        proc = mock.Mock()
+        agy.stop_harvester(proc)
+        proc.terminate.assert_called_once_with()
+        proc.wait.assert_called_once_with(timeout=10)
+        proc.kill.assert_not_called()
+
+    def test_one_that_will_not_stop_is_killed(self) -> None:
+        proc = mock.Mock()
+        proc.wait.side_effect = subprocess.TimeoutExpired('harvest', 10)
+        agy.stop_harvester(proc)
+        proc.kill.assert_called_once_with()
+
+    def test_one_already_gone_is_fine(self) -> None:
+        proc = mock.Mock()
+        proc.terminate.side_effect = ProcessLookupError()
+        agy.stop_harvester(proc)
+
+
 class TestHarvesterPoke(unittest.TestCase):
     """Harvester.poke() classifies every poke outcome."""
 
