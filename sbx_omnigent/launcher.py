@@ -605,9 +605,13 @@ class SbxLauncher(ExecModelHostLauncher):
                 ),
             )
 
-        path, mode, credential = self._parse_mount_sentinel(
-            repo_url, repo_branch
-        )
+        branch, model = self._split_mount_model(repo_branch)
+        path, mode, credential = self._parse_mount_sentinel(repo_url, branch)
+        if model is not None and credential is not None:
+            raise click.ClickException(
+                f'mount sentinel fragment {repo_branch!r} is invalid — only '
+                f'a Claude VM carries a model'
+            )
         worktree = self._resolve_worktree_path(path)
         if mode == 'rw':
             # Coder: the worktree IS the primary, read-write.
@@ -651,7 +655,7 @@ class SbxLauncher(ExecModelHostLauncher):
             # The pin comes first, and after egress: it downloads.
             if self._claude_version is not None:
                 self._pin_claude_version(sandbox_id)
-            self._seed_claude_settings(sandbox_id)
+            self._seed_claude_settings(sandbox_id, model=model)
         # The server OWNS this file and passes it on every managed
         # launch: it is the verbatim in-sandbox
         # ``~/.omnigent/config.yaml``, including the ``providers``
@@ -676,6 +680,33 @@ class SbxLauncher(ExecModelHostLauncher):
             adc=credential == 'agy' and self._agy_update,
         )
         return worktree
+
+    @staticmethod
+    def _split_mount_model(
+        repo_branch: str | None,
+    ) -> tuple[str | None, str | None]:
+        """
+        Split a Claude VM's pinned model off a sentinel fragment.
+
+        The runner tags a Claude session's sentinel ``#<mode>/<model>``
+        (see :func:`swarm.mount_sentinel`) so the VM's ``/model`` picker
+        can list that model; Omnigent launches only a model the picker
+        lists.
+
+        :param repo_branch: The ``#`` fragment, or ``None``.
+        :returns: ``(fragment without the model, model or None)``.
+        :raises click.ClickException: If the model is not one the
+            picker slot can hold.
+        """
+        if repo_branch is None or '/' not in repo_branch:
+            return repo_branch, None
+        rest, _slash, model = repo_branch.partition('/')
+        try:
+            return rest, claude.validate_custom_model(model)
+        except ValueError as exc:
+            raise click.ClickException(
+                f'mount sentinel fragment {repo_branch!r} is invalid — {exc}'
+            ) from exc
 
     @staticmethod
     def _parse_mount_sentinel(
@@ -1004,7 +1035,9 @@ class SbxLauncher(ExecModelHostLauncher):
                 f'(exit {proc.returncode}): {detail[-800:]}'
             )
 
-    def _seed_claude_settings(self, name: str) -> None:
+    def _seed_claude_settings(
+        self, name: str, *, model: str | None = None
+    ) -> None:
         """
         Pre-accept Claude's bypass-permissions dialog inside a VM.
 
@@ -1022,7 +1055,13 @@ class SbxLauncher(ExecModelHostLauncher):
         timeout and reports nothing — the most expensive failure shape
         this launcher has.
 
+        Also puts the session's pinned *model* in the VM's ``/model``
+        picker (:data:`claude.CUSTOM_MODEL_ENV`): Omnigent launches only
+        a model the picker lists, and drops any other pin to the
+        default.
+
         :param name: The sandbox to seed.
+        :param model: The session's pinned model, or ``None``.
         :raises click.ClickException: If the seed cannot run or does
             not report success.
         """
@@ -1031,6 +1070,7 @@ class SbxLauncher(ExecModelHostLauncher):
                 ['sbx', 'exec', name, 'python3', '-c',
                  claude.build_settings_seed_script(
                      disable_autoupdater=self._claude_version is not None,
+                     custom_model=model,
                  )],
                 timeout_s=sbx_cli.MANAGE_TIMEOUT_S,
             )

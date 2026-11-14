@@ -195,6 +195,24 @@ class TestMountSentinel(unittest.TestCase):
         with self.assertRaises(ValueError):
             mount_sentinel('/srv/worktrees/a', 'rwx')
 
+    def test_a_claude_vm_carries_its_model(self) -> None:
+        self.assertEqual(
+            mount_sentinel(
+                '/srv/worktrees/a', 'ro', model='claude-mythos-5-2'
+            ),
+            'git@sbxmount:/srv/worktrees/a#ro/claude-mythos-5-2',
+        )
+
+    def test_only_a_claude_vm_takes_a_model(self) -> None:
+        with self.assertRaises(ValueError):
+            mount_sentinel(
+                '/srv/worktrees/a', 'rw', credential='codex', model='gpt-6'
+            )
+
+    def test_a_model_the_fragment_cannot_carry_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            mount_sentinel('/srv/worktrees/a', 'rw', model='claude-x[1m]')
+
 
 class TestSwarmHandle(unittest.TestCase):
     def _handle(self) -> SwarmHandle:

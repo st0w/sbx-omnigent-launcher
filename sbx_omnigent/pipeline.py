@@ -794,6 +794,17 @@ def _validate_model_families(config: PipelineConfig) -> None:
         reason = model_family_mismatch(agent.harness, agent.model)
         if reason is not None:
             raise PipelineError(f'agent {agent_name!r}: {reason}')
+        # A Claude agent's model rides in the mount sentinel to the
+        # launcher, which puts it in the VM's /model picker; Omnigent
+        # launches only a model the picker lists.
+        if (
+            agent.harness not in agy.AGY_HARNESSES
+            and agent.harness not in codex.CODEX_HARNESSES
+        ):
+            try:
+                claude.validate_custom_model(agent.model)
+            except ValueError as exc:
+                raise PipelineError(f'agent {agent_name!r}: {exc}') from exc
 
 
 def _validate_codex_efforts(config: PipelineConfig) -> None:

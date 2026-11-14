@@ -135,6 +135,26 @@ as a `-c` config value, so the launcher only passes one from a fixed ladder
 (`none` through `xhigh`). A `codex-native` agent pinned to anything else, such as
 `max`, is refused when the pipeline loads instead of running at codex's default.
 
+**A Claude agent runs the model it pins, including one outside the families.**
+Omnigent launches a Claude session's pinned model only if Claude Code's `/model`
+picker lists it. The picker lists the default and the four family aliases
+(`sonnet`, `fable`, `opus`, `haiku`), each resolving to a single id, so any
+other model is dropped before launch: the default runs and the pin is cleared,
+with only a warning inside the VM. Live, a reviewer pinned to `claude-mythos-5-2`
+ran on `claude-sonnet-5-5`, although the same login served Mythos when asked for
+it by id. A pin to an older version of a family goes the same way once its alias
+moves on (`claude-fable-5-1` after `fable` resolved to 5.2).
+
+So the launcher puts each Claude agent's pinned model in its VM's one extra
+picker slot (`ANTHROPIC_CUSTOM_MODEL_OPTION` in `~/.claude/settings.json`)
+before the host starts. The runner passes the model in the session's mount
+sentinel (`#ro/claude-mythos-5-2`), which Omnigent lowercases and holds to git's
+branch-name rules. So a Claude agent's model must be lowercase letters and
+digits joined by single `.` or `-`, like `claude-mythos-5-2`. Anything else,
+such as `claude-opus-4-8[1m]`, is refused when the pipeline loads. The model
+must still be one the Claude login can use: the slot makes the picker offer it,
+not the account serve it.
+
 ### `stages:` — the DAG
 
 Each stage is one node (or a `parallel:` fan-out of nodes). A node's **kind** is

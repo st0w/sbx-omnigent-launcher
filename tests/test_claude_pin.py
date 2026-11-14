@@ -165,7 +165,9 @@ class TestThePinScript(unittest.TestCase):
         self.assertIn(claude.PIN_OK_MARKER, proc.stdout)
 
 
-def _seed(home: Path, **kw: bool) -> subprocess.CompletedProcess[str]:
+def _seed(
+    home: Path, **kw: bool | str
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, '-c', claude.build_settings_seed_script(**kw)],
         env={**os.environ, 'HOME': str(home)},
@@ -280,6 +282,77 @@ class TestATooOldClaudeNamesThePin(unittest.TestCase):
         ):
             with self.subTest(error=error):
                 self.assertEqual(claude.version_hint(error), '')
+
+
+class TestAPinnedModelIsPutInThePicker(unittest.TestCase):
+    """
+    Omnigent launches a pinned Claude model only if Claude Code's
+    /model picker lists it, and the picker lists only the default and
+    the family aliases. Live, a reviewer pinned to claude-mythos-5-2 ran
+    on claude-sonnet-5-5. The one extra slot makes the picker list it.
+    """
+
+    def setUp(self) -> None:
+        self.home = Path(tempfile.mkdtemp(prefix='claude-home-'))
+        self.settings = self.home / claude.SETTINGS_REL_PATH
+
+    def _env(self) -> dict[str, object]:
+        data = json.loads(self.settings.read_text(encoding='utf-8'))
+        env = data.get('env', {})
+        assert isinstance(env, dict)
+        return env
+
+    def test_the_model_goes_in_the_slot(self) -> None:
+        proc = _seed(self.home, custom_model='claude-mythos-5-2')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            self._env(), {claude.CUSTOM_MODEL_ENV: 'claude-mythos-5-2'}
+        )
+
+    def test_it_sits_beside_the_autoupdater_switch(self) -> None:
+        _seed(self.home, custom_model='claude-fable-5-2',
+              disable_autoupdater=True)
+        self.assertEqual(self._env(), {
+            claude.AUTOUPDATER_ENV: '1',
+            claude.CUSTOM_MODEL_ENV: 'claude-fable-5-2',
+        })
+
+    def test_it_replaces_an_earlier_value(self) -> None:
+        _seed(self.home, custom_model='claude-fable-5-2')
+        _seed(self.home, custom_model='claude-mythos-5-2')
+        self.assertEqual(
+            self._env()[claude.CUSTOM_MODEL_ENV], 'claude-mythos-5-2'
+        )
+
+    def test_no_model_writes_no_slot(self) -> None:
+        _seed(self.home)
+        data = json.loads(self.settings.read_text(encoding='utf-8'))
+        self.assertNotIn('env', data)
+
+
+class TestAModelTheSlotCanHold(unittest.TestCase):
+    """It rides in the mount sentinel's fragment, which Omnigent
+    lowercases and checks against git's branch rules."""
+
+    def test_real_ids_pass(self) -> None:
+        for model in ('claude-mythos-5-2', 'claude-fable-5-2',
+                      'claude-opus-5-5', 'claude-sonnet-4.5'):
+            with self.subTest(model=model):
+                self.assertEqual(claude.validate_custom_model(model), model)
+
+    def test_anything_a_branch_name_or_lowercasing_breaks_is_refused(
+        self,
+    ) -> None:
+        for model in ('claude-opus-4-8[1m]', 'Claude-Opus-5-5', 'a..b',
+                      '-x', 'x-', 'x.', 'a b', 'a:b', 'a/b', '', None, 5,
+                      'x' * 129):
+            with self.subTest(model=model):
+                with self.assertRaises(ValueError):
+                    claude.validate_custom_model(model)
+
+    def test_the_seed_script_refuses_one_too(self) -> None:
+        with self.assertRaises(ValueError):
+            claude.build_settings_seed_script(custom_model='bad model')
 
 
 if __name__ == '__main__':
