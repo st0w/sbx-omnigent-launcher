@@ -686,8 +686,22 @@ opening note rather than its summary.
 - **Medium and Low** don't block. They are the scan's findings, one line each
   tagged `[security-medium]` or `[security-low]`, and go where a reviewer's
   findings go: triage (a `verifies:` stage) checks them against the
-  shipping code, and the reviews record and the findings ledger on the
-  published branch keep them.
+  shipping code, and the reviews record keeps them. Only the scan's **final
+  round** files them as issues (or adds them to the findings ledger when the
+  pipeline doesn't publish a pull request): an earlier round describes code
+  the writer has since changed, and the final round reports again whatever
+  still applies.
+
+**Labels.** A scan finding filed as an issue carries `finding` and
+`security-critical`, `security-high`, `security-medium` or `security-low`.
+The run creates any of those four labels the publish repo is missing before
+it files. It never overwrites one that exists, so colours you set stay. A
+Critical or High finding that triage re-checks and finds still reproducing is
+filed with the most severe level in its round, because triage restates a
+blocking report's claims in its own words and they can't be matched to the
+plugin's findings one to one. If the labels can't be created, the run says so,
+and an issue GitHub refuses a label on is filed without labels rather than
+lost.
 
 Every round is recorded in the run directory under `reviews/` as
 `<stage>-<agent>-r<round>.md`, with every finding it reported, and in the

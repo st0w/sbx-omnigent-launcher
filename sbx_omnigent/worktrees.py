@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import time
 import urllib.parse
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import click
@@ -475,7 +476,7 @@ class WorktreeManager:
         *,
         title: str,
         body: str,
-        label: str | None = None,
+        labels: Sequence[str] = (),
     ) -> str | None:
         """
         File one issue on the publish repository.
@@ -492,9 +493,9 @@ class WorktreeManager:
         :param repo_url: The publish repository URL.
         :param title: Issue title.
         :param body: Issue body (markdown).
-        :param label: Label to apply, or ``None``. A label the repo does
-            not have makes ``gh`` refuse the whole call, so this retries
-            once WITHOUT it rather than losing the finding.
+        :param labels: Labels to apply. A label the repo does not have
+            makes ``gh`` refuse the whole call, so this retries once
+            WITHOUT any rather than losing the finding.
         :returns: The new issue's URL, or ``None`` if it could not be
             filed.
         """
@@ -502,17 +503,63 @@ class WorktreeManager:
         base = ['gh', 'issue', 'create', '-R', slug,
                 '--title', neutralize_mentions(title),
                 '--body', neutralize_mentions(body)]
+        label_args = [arg for name in labels for arg in ('--label', name)]
         try:
-            return self._run_publish(
-                base + (['--label', label] if label else [])
-            ).strip() or None
+            return self._run_publish(base + label_args).strip() or None
         except click.ClickException:
-            if not label:
+            if not labels:
                 return None
         try:
             return self._run_publish(base).strip() or None
         except click.ClickException:
             return None
+
+    def ensure_labels(
+        self, repo_url: str, labels: Sequence[tuple[str, str, str]]
+    ) -> bool:
+        """
+        Create each label the publish repository does not have yet.
+
+        Never ``--force``: a label that exists is left exactly as a
+        person styled it. GitHub treats label names case-insensitively,
+        so this does too.
+
+        Best-effort like :meth:`create_issue`: an issue filed with a
+        label that could not be created is retried there without labels.
+
+        :param repo_url: The publish repository URL.
+        :param labels: ``(name, colour, description)`` for each label;
+            the colour is six hex digits.
+        :returns: Whether every label now exists. ``False`` when the
+            existing labels cannot be listed (nothing is created then,
+            since every label would look missing) or a create failed.
+        """
+        slug = github_slug(repo_url)
+        try:
+            listing = json.loads(self._run_publish([
+                'gh', 'label', 'list', '-R', slug,
+                '--json', 'name', '--limit', '1000',
+            ]))
+        except (click.ClickException, ValueError):
+            return False
+        if not isinstance(listing, list) or not all(
+            isinstance(item, dict) and isinstance(item.get('name'), str)
+            for item in listing
+        ):
+            return False
+        existing = {item['name'].casefold() for item in listing}
+        ok = True
+        for name, colour, description in labels:
+            if name.casefold() in existing:
+                continue
+            try:
+                self._run_publish([
+                    'gh', 'label', 'create', name, '-R', slug,
+                    '--color', colour, '--description', description,
+                ])
+            except click.ClickException:
+                ok = False
+        return ok
 
     def issue_bodies_text(
         self, repo_url: str, *, limit: int = 500

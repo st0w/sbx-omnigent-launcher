@@ -554,7 +554,7 @@ class TestPipelineWorktrees(unittest.TestCase):
         self.mgr._run_publish = run_publish
         url = self.mgr.create_issue(
             'https://github.com/org/proj', title='t', body='b',
-            label='finding',
+            labels=('finding',),
         )
         self.assertEqual(url, 'https://github.com/org/proj/issues/7')
         self.assertEqual(len(calls), 2, 'it did not retry without label')
@@ -562,6 +562,77 @@ class TestPipelineWorktrees(unittest.TestCase):
         self.assertNotIn('--label', calls[1])
         self.assertEqual(calls[1][:5],
                          ['gh', 'issue', 'create', '-R', 'org/proj'])
+
+    def test_create_issue_applies_every_label(self) -> None:
+        calls: list[list[str]] = []
+        self.mgr._run_publish = lambda cmd: (calls.append(cmd), 'u')[1]
+        self.mgr.create_issue(
+            'https://github.com/org/proj', title='t', body='b',
+            labels=('finding', 'security-high'),
+        )
+        argv = calls[0]
+        given = [argv[i + 1] for i, a in enumerate(argv) if a == '--label']
+        self.assertEqual(given, ['finding', 'security-high'])
+
+    def test_create_issue_without_labels_does_not_retry(self) -> None:
+        calls: list[list[str]] = []
+
+        def boom(cmd):
+            calls.append(cmd)
+            raise click.ClickException('offline')
+
+        self.mgr._run_publish = boom
+        self.assertIsNone(self.mgr.create_issue(
+            'https://github.com/org/proj', title='t', body='b'
+        ))
+        self.assertEqual(len(calls), 1)
+
+    def _labels(self, existing: str, fail_create: bool = False):
+        calls: list[list[str]] = []
+
+        def run_publish(cmd):
+            calls.append(cmd)
+            if cmd[:3] == ['gh', 'label', 'list']:
+                return existing
+            if fail_create:
+                raise click.ClickException('HTTP 403')
+            return ''
+
+        self.mgr._run_publish = run_publish
+        ok = self.mgr.ensure_labels('https://github.com/org/proj', (
+            ('security-high', 'd93f0b', 'High severity'),
+            ('security-low', 'c5def5', 'Low severity'),
+        ))
+        return ok, calls
+
+    def test_ensure_labels_creates_only_the_missing_ones(self) -> None:
+        ok, calls = self._labels(
+            '[{"name": "finding"}, {"name": "Security-High"}]'
+        )
+        self.assertTrue(ok)
+        listing, *creates = calls
+        self.assertEqual(
+            listing[:5], ['gh', 'label', 'list', '-R', 'org/proj']
+        )
+        self.assertIn('--json', listing)
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(
+            creates[0][:6],
+            ['gh', 'label', 'create', 'security-low', '-R', 'org/proj'],
+        )
+        self.assertIn('c5def5', creates[0])
+        self.assertNotIn('--force', creates[0])
+
+    def test_ensure_labels_reports_a_failed_create(self) -> None:
+        ok, _calls = self._labels('[]', fail_create=True)
+        self.assertFalse(ok)
+
+    def test_ensure_labels_creates_nothing_when_it_cannot_list(self) -> None:
+        for listing in ('not json', '{"name": "x"}', '[{"nom": "x"}]'):
+            with self.subTest(listing=listing):
+                ok, calls = self._labels(listing)
+                self.assertFalse(ok)
+                self.assertEqual(len(calls), 1)
 
     def test_issue_listing_includes_closed_and_reports_failure(
         self,

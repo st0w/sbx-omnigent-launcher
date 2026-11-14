@@ -3688,6 +3688,8 @@ class PipelineRunner:
         self._reviewed_ok: set[str] = set()
         #: (url, title) per finding filed this run, for the PR body.
         self._filed_findings: list[tuple[str, str]] = []
+        #: Whether the ``security-*`` labels were checked this run.
+        self._security_labels_checked = False
         #: The judge's choices, so the two-writer race can be
         #: evaluated over a series of modules rather than trusted.
         self._picks: list[JudgePick] = []
@@ -6170,7 +6172,7 @@ class PipelineRunner:
         :param winner: The node whose branch publishes.
         :param report_doc: Repo path of the full reviewer reports.
         """
-        records = [r for r in self._chunk_reviews() if r.findings]
+        records = self._findings_to_publish()
         if self._config.publish.mode == 'pr' and self._publish_repo:
             if records:
                 self._file_findings_as_issues(records, report_doc)
@@ -6180,6 +6182,74 @@ class PipelineRunner:
             self._file_blocking_findings(report_doc)
         elif records:
             self._commit_findings_ledger(winner, report_doc)
+
+    def _findings_to_publish(self) -> list[ReviewRecord]:
+        """
+        The chunk's records whose findings are filed or ledgered.
+
+        A scan stage's earlier rounds are left out: they describe code
+        the writer has since changed, and the final round reports again
+        whatever still applies. Their findings stay in the reviews
+        record and their blocking reports still reach triage.
+
+        :returns: Records with findings, superseded scan rounds removed.
+        """
+        records = self._chunk_reviews()
+        latest: dict[str, int] = {}
+        for rec in records:
+            if self._is_scan(rec):
+                latest[rec.stage] = max(latest.get(rec.stage, 0), rec.round_no)
+        return [
+            rec for rec in records
+            if rec.findings
+            and not (self._is_scan(rec) and rec.round_no < latest[rec.stage])
+        ]
+
+    def _is_scan(self, rec: ReviewRecord) -> bool:
+        """Whether *rec* was recorded by a ``scans:`` stage."""
+        stage = self._stage_by_id.get(rec.stage)
+        return stage is not None and stage.scans is not None
+
+    def _issue_labels(
+        self, rec: ReviewRecord, finding: str | None = None
+    ) -> tuple[str, ...]:
+        """
+        The labels for an issue filed from *rec*.
+
+        ``finding`` always; a scan's finding also its
+        ``security-<severity>``, from its tag, or for a blocking claim
+        (*finding* ``None``) from the most severe level in the round.
+
+        :param rec: The vote the finding came from.
+        :param finding: A non-blocking finding's text, or ``None`` for
+            a blocking claim.
+        :returns: The labels.
+        """
+        if not self._is_scan(rec):
+            return (_FINDING_LABEL,)
+        label = (
+            security_scan.blocking_label(rec.blocking_report)
+            if finding is None
+            else security_scan.defect_label(finding)
+        )
+        if label is None:
+            return (_FINDING_LABEL,)
+        self._ensure_security_labels()
+        return (_FINDING_LABEL, label)
+
+    def _ensure_security_labels(self) -> None:
+        """Create any missing ``security-*`` label, once per run."""
+        if self._security_labels_checked or not self._publish_repo:
+            return
+        self._security_labels_checked = True
+        if not self._wt.ensure_labels(
+            self._publish_repo, security_scan.SECURITY_LABELS
+        ):
+            click.echo(
+                '[findings] WARNING: could not create the security-* '
+                'labels on the publish repo. A scan finding is filed '
+                'without labels if GitHub refuses one.'
+            )
 
     def _file_findings_as_issues(
         self, records: list[ReviewRecord], report_doc: str | None
@@ -6232,7 +6302,7 @@ class PipelineRunner:
                 )
                 url = self._wt.create_issue(
                     self._publish_repo, title=title, body=body,
-                    label=_FINDING_LABEL,
+                    labels=self._issue_labels(rec, finding),
                 )
                 if url:
                     self._filed_findings.append((url, title))
@@ -6320,7 +6390,7 @@ class PipelineRunner:
                 f'the code and withheld'
             ),
             body='\n'.join(lines),
-            label=_FINDING_LABEL,
+            labels=(_FINDING_LABEL,),
         )
         if url:
             self._filed_findings.append((url, f'[{chunk}] triage summary'))
@@ -6374,7 +6444,7 @@ class PipelineRunner:
             )
             url = self._wt.create_issue(
                 self._publish_repo, title=title, body=body,
-                label=_FINDING_LABEL,
+                labels=self._issue_labels(rec),
             )
             if url:
                 self._filed_findings.append((url, title))
@@ -6471,7 +6541,7 @@ class PipelineRunner:
                 f'reached no conclusion'
             ),
             body='\n'.join(lines),
-            label=_FINDING_LABEL,
+            labels=(_FINDING_LABEL,),
         )
         if url:
             self._filed_findings.append(
@@ -6498,7 +6568,7 @@ class PipelineRunner:
         :param report_doc: Repo path of the full reviewer reports.
         :returns: The committed path, or ``None`` when nothing was new.
         """
-        records = [r for r in self._chunk_reviews() if r.findings]
+        records = self._findings_to_publish()
         if not records:
             return None
         path = self._findings_ledger_path()

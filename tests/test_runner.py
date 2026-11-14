@@ -95,6 +95,8 @@ class FakeWT:
         self.branch_files: dict[str, str] = {}
         #: Issues filed through create_issue, in order.
         self.issues: list[dict] = []
+        self.label_calls: list[tuple[str, tuple]] = []
+        self.labels_ensured = True
         #: What issue_bodies_text returns. '' = no issues yet;
         #: None = the tracker could not be read at all.
         self.issue_bodies: str | None = ''
@@ -213,11 +215,17 @@ class FakeWT:
         # None means "could not read" — distinct from "no issues".
         return self.issue_bodies
 
-    def create_issue(self, repo_url, *, title, body, label=None):
+    def create_issue(self, repo_url, *, title, body, labels=()):
         if self.issue_create_fails:
             return None
-        self.issues.append({'title': title, 'body': body, 'label': label})
+        self.issues.append(
+            {'title': title, 'body': body, 'labels': tuple(labels)}
+        )
         return f'https://github.com/org/proj/issues/{len(self.issues)}'
+
+    def ensure_labels(self, repo_url, labels) -> bool:
+        self.label_calls.append((repo_url, tuple(labels)))
+        return self.labels_ensured
 
     def read_tracked_file(self, worktree_path, relpath) -> str | None:
         # Last write wins, mirroring a real filesystem — the ledger is
@@ -9569,6 +9577,152 @@ class TestTheScanReportsAreKept(_ScanBase):
             runner._commit_security_reports('build', 'docs/plans/demo.md')
         )
         self.assertEqual(wt.commits, [])
+
+
+class TestScanFindingsAreLabelled(_Base):
+    """
+    A scan finding filed as an issue carries ``finding`` and its
+    ``security-<severity>`` label, created on the repo when missing.
+    Only the final scan round files its Medium and Low findings: the
+    earlier rounds describe code that no longer ships.
+    """
+
+    _PR = _SCANNED_PIPELINE.replace(
+        'publish: local', 'base_branch: main\npublish: pr'
+    )
+
+    def _runner(self, wt, *, blocking=('HIGH',), text=None):
+        cfg = self._cfg(text or self._PR)
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=wt,
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0, publish_repo='https://gh/org/proj',
+        )
+        scan = R.security_scan
+        first = scan.parse_report(_scan_jsonl(*blocking, 'MEDIUM', 'LOW'))
+        final = scan.parse_report(_scan_jsonl('MEDIUM'))
+        runner._reviews = [
+            R.ReviewRecord(
+                chunk=None, stage='review', reviewer='bugs', round_no=1,
+                verdict='APPROVED', target='build',
+                findings=('leaks a handle',), defects=('leaks a handle',),
+            ),
+            self._scan_record(1, first),
+            self._scan_record(2, final),
+        ]
+        return runner
+
+    def _scan_record(self, round_no, findings):
+        scan = R.security_scan
+        defects = tuple(scan.render_defect(f) for f in findings
+                        if not f.blocks)
+        blocking = [f for f in findings if f.blocks]
+        return R.ReviewRecord(
+            chunk=None, stage='scan', reviewer='sec', round_no=round_no,
+            verdict='BLOCKING' if blocking else 'APPROVED', target='build',
+            findings=defects, defects=defects,
+            blocking_report=scan.render_blocking(blocking) if blocking
+            else '',
+        )
+
+    def _publish(self, runner):
+        with mock.patch('sbx_omnigent.runner.click.echo'):
+            runner._publish_findings('build', 'docs/plans/demo-reviews.md')
+
+    def _labels_of(self, wt, needle):
+        return [i['labels'] for i in wt.issues if needle in i['body']]
+
+    def test_the_final_rounds_findings_carry_their_severity(self) -> None:
+        wt = FakeWT()
+        self._publish(self._runner(wt))
+        self.assertEqual(
+            self._labels_of(wt, 'Medium problem'),
+            [('finding', 'security-medium')],
+        )
+
+    def test_earlier_rounds_file_nothing(self) -> None:
+        wt = FakeWT()
+        self._publish(self._runner(wt))
+        self.assertEqual(self._labels_of(wt, 'Low problem'), [])
+        self.assertEqual(len(self._labels_of(wt, 'Medium problem')), 1)
+
+    def test_a_reviewers_finding_keeps_its_one_label(self) -> None:
+        wt = FakeWT()
+        self._publish(self._runner(wt))
+        self.assertEqual(
+            self._labels_of(wt, 'leaks a handle'), [('finding',)]
+        )
+
+    def test_the_security_labels_are_ensured_once(self) -> None:
+        wt = FakeWT()
+        self._publish(self._runner(wt))
+        self.assertEqual(len(wt.label_calls), 1)
+        repo, labels = wt.label_calls[0]
+        self.assertEqual(repo, 'https://gh/org/proj')
+        self.assertEqual(
+            [name for name, _colour, _desc in labels],
+            ['security-critical', 'security-high', 'security-medium',
+             'security-low'],
+        )
+        for _name, colour, desc in labels:
+            self.assertRegex(colour, r'\A[0-9a-f]{6}\Z')
+            self.assertIn('claude-security', desc)
+
+    def test_labels_are_still_applied_when_ensuring_fails(self) -> None:
+        # create_issue falls back to no labels if gh refuses one.
+        wt = FakeWT()
+        wt.labels_ensured = False
+        self._publish(self._runner(wt))
+        self.assertEqual(
+            self._labels_of(wt, 'Medium problem'),
+            [('finding', 'security-medium')],
+        )
+
+    def test_without_a_scan_finding_no_labels_are_ensured(self) -> None:
+        wt = FakeWT()
+        runner = self._runner(wt)
+        runner._reviews = runner._reviews[:1]
+        self._publish(runner)
+        self.assertEqual(wt.label_calls, [])
+
+    def _reproduce_blocking(self, runner):
+        rec = runner._reviews[1]
+        ident = R.blocking_finding_id(rec, 1)
+        runner._dispositions[ident] = R.Disposition(
+            'reproduces', 'the query still interpolates name'
+        )
+        runner._blocking_claims[ident] = 'the query still interpolates name'
+
+    def test_a_reproducing_blocking_claim_carries_its_rounds_severity(
+        self,
+    ) -> None:
+        wt = FakeWT()
+        runner = self._runner(wt)
+        self._reproduce_blocking(runner)
+        self._publish(runner)
+        self.assertEqual(
+            self._labels_of(wt, 'still interpolates'),
+            [('finding', 'security-high')],
+        )
+
+    def test_the_most_severe_level_in_the_round_is_used(self) -> None:
+        wt = FakeWT()
+        runner = self._runner(wt, blocking=('HIGH', 'CRITICAL'))
+        self._reproduce_blocking(runner)
+        self._publish(runner)
+        self.assertEqual(
+            self._labels_of(wt, 'still interpolates'),
+            [('finding', 'security-critical')],
+        )
+
+    def test_a_local_ledger_leaves_out_earlier_rounds(self) -> None:
+        wt = FakeWT()
+        runner = self._runner(wt, text=_SCANNED_PIPELINE)
+        with mock.patch('sbx_omnigent.runner.click.echo'):
+            runner._publish_findings('build', 'docs/plans/demo-reviews.md')
+        ledger = '\n'.join(text for _t, _rel, text in wt.tracked_files)
+        self.assertIn('Medium problem', ledger)
+        self.assertNotIn('Low problem', ledger)
 
 
 class TestAScanInACampaign(_Base):
