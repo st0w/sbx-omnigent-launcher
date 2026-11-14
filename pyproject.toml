@@ -15,7 +15,15 @@ requires-python = ">=3.12"
 # imports omnigent at runtime. Pinning a version here risks pip trying to swap
 # the omnigent already in your env. Install with `uv pip install -e .` (or
 # `pip install -e . --no-deps`) into that shared environment.
-dependencies = []
+#
+# Everything else this package imports is listed. The ranges are the ones
+# omnigent itself requires (0.20.0), so an environment that satisfies omnigent
+# satisfies these and installing never changes them. tests/test_packaging.py
+# fails on an import that isn't listed here.
+dependencies = [
+    "click>=8.0,<10",
+    "pyyaml>=6.0,<7",
+]
 
 [project.scripts]
 # Run `omni-sbx server ...` exactly as you would `omni server ...`.

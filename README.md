@@ -1106,13 +1106,15 @@ uv run --no-project --python /path/to/omnigent-venv/bin/python \
     --with ruff ruff check sbx_omnigent/ tests/
 ```
 
-> **Plain `uv run` inside this directory does not work.** This package declares
-> no dependencies on purpose (see the note in `pyproject.toml` — it imports the
-> `omnigent` already in your env rather than pinning it), so `uv run` builds a
-> fresh *empty* venv and every test module dies on `ModuleNotFoundError: No
-> module named 'click'`. The `--no-project --python <omnigent-venv>` pair is what
-> makes it resolve. For the same reason there is no `uv.lock` here: this is a
-> `uv pip install -e .` package, not a uv-managed project.
+> **Plain `uv run` inside this directory does not work.** This package leaves
+> `omnigent` out of its dependencies on purpose (see the note in
+> `pyproject.toml` — it imports the `omnigent` already in your env rather than
+> pinning it), so `uv run` builds a venv without it and nearly every test module
+> dies on `ModuleNotFoundError: No module named 'omnigent'`. The `--no-project
+> --python <omnigent-venv>` pair is what makes it resolve. For the same reason,
+> `uv.lock` pins only what the package does declare (`click` and PyYAML) and
+> can't build a working environment on its own: this is a `uv pip install -e .`
+> package, not a uv-managed project.
 
 ## Layout
 
