@@ -4056,10 +4056,14 @@ class PipelineRunner:
             # verification must not become the base every later module
             # is built on.
             self._verify_winner(winner, staged)
-            # Advance the campaign thread to this chunk's winner so the
-            # next chunk builds on it.
-            self._wt.alias_node_branch(self._run_id, 'campaign', winner)
             self._publish_chunk(sub, winner, first=index == 0)
+            # Advance the campaign thread to this chunk's winner so the
+            # next chunk builds on it. AFTER the publish, which commits
+            # the chunk's plan, decisions and reviews onto the winner:
+            # the next planner is told they are in its worktree under
+            # docs/plans/, and before this they were only there if the
+            # chunk's PR had already been merged into the base.
+            self._wt.alias_node_branch(self._run_id, 'campaign', winner)
             self._completed_chunks.add(sub.id)
             # Persist the completion NOW, not at the next stage's end.
             # The next stage is the following module's PLANNER, which
@@ -4966,10 +4970,6 @@ class PipelineRunner:
         """Publish one chunk's winner to ``pipeline/<run>-<chunk>``."""
         if self._config.publish.mode == 'none':
             return
-        # The campaign branch was just moved to this winner, BEFORE the
-        # doc commits below: it is the exact commit the next chunk is
-        # built on, which is where the next PR's own changes start.
-        seed = self._wt.hub_branch_tip(self._run_id, 'campaign') or ''
         plan, plan_path = self._chunk_plan_of_record(sub, first=first)
         if plan:
             self._wt.write_tracked_file(
@@ -4985,11 +4985,10 @@ class PipelineRunner:
         self._record_referrals()
         self._commit_decisions_ledger(winner)
         # Flat mode has ONE planner for the whole campaign, so its
-        # session record is the same conversation every time. Committing
-        # it per chunk rewrote one path from every branch — the same
-        # add/add collision the per-chunk names above remove — while
-        # adding nothing. Per-module mode has a planner per module, and
-        # a per-module path, so it still records every chunk.
+        # session record is the same conversation every time, committed
+        # once and carried to later chunks by the campaign thread.
+        # Per-module mode has a planner per module, and a per-module
+        # path, so it records every chunk.
         if self._config.subtasks or first:
             self._commit_planning_session(winner, plan_path)
         review_doc = self._commit_review_records(winner, plan_path)
@@ -5007,6 +5006,11 @@ class PipelineRunner:
             series_note=self._series_note(span, None) if span else None,
             security_doc=security_doc,
         )
+        # The winner with every record above committed: the campaign
+        # branch moves here once this returns, so it is the commit the
+        # next chunk is built on, and where the next PR's own changes
+        # start.
+        seed = self._wt.hub_branch_tip(self._run_id, winner) or ''
         result = self._wt.publish_node(
             self._run_id, winner, self._publish_repo,
             title=(
@@ -6016,12 +6020,11 @@ class PipelineRunner:
         The base path this chunk's OWN records hang off.
 
         Per-chunk records must not share a path across chunks. Each
-        chunk publishes its own pull request, and nothing threads the
-        doc commits forward — the campaign branch is aliased to the
-        winner BEFORE ``_publish_chunk`` commits them — so two chunks
-        writing one path do not modify a shared file, they each CREATE
-        it. Git sees the same path added on both sides and every merge
-        after the first conflicts.
+        chunk publishes its own pull request, and the campaign thread
+        carries every earlier chunk's records into the later ones, so a
+        shared path would be one file rewritten by every chunk: each
+        chunk's record would replace the one before it, and two pull
+        requests merged out of order would conflict on it.
 
         Per-module mode never hit this because its *plan_path* is
         already per-module (``discover-m1.md``), which these records
@@ -6420,11 +6423,10 @@ class PipelineRunner:
 
         A tracker when the pipeline publishes to GitHub, the
         committed file otherwise. The file was the original design
-        and the wrong shape: a chunk's branch is cut from the prior
-        IMPLEMENTATION tip, so it never carried that chunk's docs
-        commits, so the ledger restarted each time — and two chunks
-        adding the same path collide on merge. An issue tracker is
-        cross-branch and cross-campaign by construction.
+        and the wrong shape: until the campaign thread carried each
+        chunk's records forward, the ledger restarted every chunk, and
+        even now it lives on one run's branches only. An issue tracker
+        is cross-branch and cross-campaign by construction.
 
         The file survives for ``publish: local`` and ``mode: none``,
         where there is no tracker to file into.
