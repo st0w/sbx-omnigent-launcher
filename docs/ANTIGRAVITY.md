@@ -73,8 +73,10 @@ Three planes, so the durable refresh credential never touches an untrusted agent
    driven only via `sbx exec`, no dial-back, empty workspace, no other agents)
    holds the *only* real refresh token and self-refreshes.
 4. The **harvester** (`omni-sbx-agy harvest`) pokes the trusted box on a cadence,
-   reads the freshly-minted access token, and writes it into the sbx custom
-   secret's *value* — **on stdin**, so the token never appears in argv/`ps`/logs.
+   reads the freshly-minted access token, and writes it into every agy VM's own
+   sbx custom secret — **on stdin**, so the token never appears in argv/`ps`/logs.
+   Each secret is scoped to its VM, created by the launcher at the VM's boot, and
+   deleted with the VM, so no other sandbox can use the token.
 
 ### Rejected alternatives
 
@@ -267,20 +269,28 @@ the inline case — is cleaner in principle but needs more moving parts, incl.
   swap secret, googleapis is `forward-bypass` (tunneled, not decrypted, not
   swapped). Adding the secret flips the host to `forward`. `agy` does **not**
   cert-pin, so the MITM is accepted. (`sbx policy log` shows the mode.)
-- **The swap secret names exact hosts, never a wildcard.** It's global, and sbx
-  puts its placeholder in **every** sandbox's environment, so each target is a
-  Google API any process in any sandbox can call with the real token. It used to
-  be `**.googleapis.com`, which reached Storage, IAM and Secret Manager. Now it's
+- **Each agy VM has its own swap secret** (`set-custom --sandbox <vm>`). A
+  global one is usable from every sandbox: sbx puts its placeholder in every
+  sandbox's environment, so Claude and Codex VMs could have called Vertex AI as
+  you. Checked on sbx v0.46.0: a scoped secret added to a running sandbox takes
+  effect at once; one placeholder can be scoped to many sandboxes, each with its
+  own value; re-running `set-custom --sandbox` updates in place; a scoped secret
+  wins over a global one with the same placeholder; `sbx secret ls --json` lists
+  each with `scope` set to the sandbox's name, which is how the harvester finds
+  them all; `sbx rm` deletes a sandbox's own secrets. The launcher creates a VM's
+  secret at boot from the token the trusted box holds (read, never poked: only the
+  harvester refreshes), and the harvester refreshes the value each cycle, keeping
+  each secret's hosts.
+- **The swap secrets name exact hosts, never a wildcard.** The swap used to target
+  `**.googleapis.com`, which reached Storage, IAM and Secret Manager. Now it's
   Vertex AI (`aiplatform.googleapis.com` for agy 1.4.x, `aiplatform.us.rep` and
   `aiplatform.eu.rep` for the multi-region locations agy 1.1.16 calls), Code Assist
   (`cloudcode-pa`) and userinfo (`www`). Enterprise/GCP accounts call the 3-label
   `aiplatform.us.rep.googleapis.com`, which a single-`*` wildcard misses; naming
-  it exactly avoids that too. A regional location (`<region>-aiplatform`) needs
-  `omni-sbx-agy harvest` run with a `--host` for every host, since `--host`
-  replaces the default list. Re-running `set-custom` with the same placeholder
-  replaces the host list, so a changed list takes effect on the next refresh.
-  `sbx policy log <sandbox>` shows each listed host as `forward` and every other
-  Google host as `forward-bypass`.
+  it exactly avoids that too. A regional `agy_gcp_location` adds its
+  `<location>-aiplatform.googleapis.com`, chosen by the launcher from the server
+  config. `sbx policy log <sandbox>` shows each listed host as `forward` and every
+  other Google host as `forward-bypass`.
 - **Trusted-box refresh mechanics:** the poke is `agy models` (the lightest
   authenticated action, no inference). Force a deterministic refresh by setting
   the on-disk token's `expiry` to the past, then running `agy models`; agy
@@ -306,8 +316,7 @@ the inline case — is cleaner in principle but needs more moving parts, incl.
 ### One-time: stand up the trusted box
 
 ```bash
-omni-sbx-agy bootstrap                 # creates agy-auth-trusted, scopes egress,
-                                       # seeds the swap-secret placeholder
+omni-sbx-agy bootstrap                 # creates agy-auth-trusted, scopes egress
 sbx exec -it agy-auth-trusted agy      # run '/login', complete the browser consent
 ```
 

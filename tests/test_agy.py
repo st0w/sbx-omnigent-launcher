@@ -26,9 +26,11 @@ from sbx_omnigent.agy import (
     BACKOFF_CEIL_S,
     BACKOFF_FLOOR_S,
     EXPIRED_MARKER,
+    HARVEST_LOG,
     PLACEHOLDER_TOKEN,
     SWAP_ENV,
     SWAP_HOSTS,
+    TRUSTED_BOX_DEFAULT,
     AgyHarvestError,
     AgyReloginNeeded,
     Harvester,
@@ -37,6 +39,7 @@ from sbx_omnigent.agy import (
     detail,
     harvest_age_s,
     harvester_running,
+    install_swap_secret,
     parse_access_token,
     poke_command,
     record_harvest,
@@ -44,6 +47,8 @@ from sbx_omnigent.agy import (
     restore_missing_workspace,
     set_custom_argv,
     spawn_harvester,
+    swap_hosts_for,
+    swap_secret_scopes,
     wait_for_fresh_swap,
 )
 
@@ -390,18 +395,18 @@ class TestSetCustomArgv(unittest.TestCase):
     """set_custom_argv() never carries the value; updates in place."""
 
     def test_omits_value_flag(self) -> None:
-        argv = set_custom_argv()
+        argv = set_custom_argv(sandbox='vm-1')
         self.assertNotIn('--value', argv)
         self.assertNotIn('--token', argv)
 
     def test_fixed_placeholder_and_env(self) -> None:
-        argv = set_custom_argv()
+        argv = set_custom_argv(sandbox='vm-1')
         idx = argv.index('--placeholder')
         self.assertEqual(argv[idx + 1], PLACEHOLDER_TOKEN)
         self.assertEqual(argv[argv.index('--env') + 1], SWAP_ENV)
 
     def test_all_hosts_present(self) -> None:
-        argv = set_custom_argv()
+        argv = set_custom_argv(sandbox='vm-1')
         hosts = [argv[i + 1] for i, a in enumerate(argv) if a == '--host']
         self.assertEqual(hosts, list(SWAP_HOSTS))
 
@@ -430,16 +435,23 @@ class TestSetCustomArgv(unittest.TestCase):
             with self.subTest(api=api):
                 self.assertNotIn(f'{api}.googleapis.com', SWAP_HOSTS)
 
-    def test_no_deprecated_global_flag(self) -> None:
-        # Global is sbx's default; v0.46.0 deprecates -g with a warning.
-        argv = set_custom_argv()
+    def test_scoped_to_one_sandbox_never_global(self) -> None:
+        # A global secret is usable from every sandbox on the machine,
+        # Claude and Codex VMs included (#130).
+        argv = set_custom_argv(sandbox='vm-1')
+        self.assertEqual(argv[argv.index('--sandbox') + 1], 'vm-1')
         self.assertNotIn('-g', argv)
         self.assertNotIn('--global', argv)
-        self.assertNotIn('--sandbox', argv)
+
+    def test_a_sandbox_name_that_is_not_one_is_refused(self) -> None:
+        for name in ('', '-rf', 'a b', 'vm;rm', '../x'):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    set_custom_argv(sandbox=name)
 
     def test_empty_hosts_rejected(self) -> None:
         with self.assertRaises(ValueError):
-            set_custom_argv(hosts=[])
+            set_custom_argv(sandbox='vm-1', hosts=[])
 
 
 class TestStopHarvester(unittest.TestCase):
@@ -714,14 +726,14 @@ class TestHarvesterUpdateSecret(unittest.TestCase):
 
     def test_token_on_stdin_not_argv(self) -> None:
         runner = RecordingRunner([FakeProc(0)])
-        _quiet(run=runner).update_secret(_REAL_TOKEN)
+        _quiet(run=runner).update_secret(_REAL_TOKEN, sandbox='vm-1')
         call = runner.calls[0]
         self.assertEqual(call['stdin'], _REAL_TOKEN)
         self.assertNotIn(_REAL_TOKEN, call['argv'])
 
     def test_uses_set_custom(self) -> None:
         runner = RecordingRunner([FakeProc(0)])
-        _quiet(run=runner).update_secret(_REAL_TOKEN)
+        _quiet(run=runner).update_secret(_REAL_TOKEN, sandbox='vm-1')
         self.assertEqual(
             runner.calls[0]['argv'][:3], ['sbx', 'secret', 'set-custom']
         )
@@ -729,23 +741,305 @@ class TestHarvesterUpdateSecret(unittest.TestCase):
     def test_nonzero_raises(self) -> None:
         runner = RecordingRunner([FakeProc(1, '', 'denied')])
         with self.assertRaises(AgyHarvestError):
-            _quiet(run=runner).update_secret('t')
+            _quiet(run=runner).update_secret('t', sandbox='vm-1')
 
 
 class TestHarvesterCycle(unittest.TestCase):
     """cycle_once() chains poke -> update and returns a redacted id."""
 
     def test_returns_redacted_fingerprint(self) -> None:
-        runner = RecordingRunner([_ok_poke(), FakeProc(0)])
+        runner = RecordingRunner([_ok_poke(), _listing('vm-1'), FakeProc(0)])
         out = _quiet(run=runner).cycle_once()
         self.assertNotIn(_REAL_TOKEN, out)
         self.assertEqual(out, redact(_REAL_TOKEN))
 
     def test_secret_gets_the_poked_token(self) -> None:
-        runner = RecordingRunner([_ok_poke(), FakeProc(0)])
+        runner = RecordingRunner([_ok_poke(), _listing('vm-1'), FakeProc(0)])
         _quiet(run=runner).cycle_once()
-        # Second call is the secret update; its stdin is the real token.
-        self.assertEqual(runner.calls[1]['stdin'], _REAL_TOKEN)
+        # Third call is the VM's secret update: the real token on stdin.
+        self.assertEqual(runner.calls[2]['stdin'], _REAL_TOKEN)
+
+
+def _listing(*scopes: str, placeholder: str = PLACEHOLDER_TOKEN) -> FakeProc:
+    """An ``sbx secret ls --json`` result, a swap secret per scope."""
+    secrets = [
+        {'scope': scope, 'targets': list(SWAP_HOSTS), 'env': SWAP_ENV,
+         'placeholder': placeholder, 'secret': '*****'}
+        for scope in scopes
+    ]
+    secrets.append(
+        {'scope': 'global', 'targets': ['api.anthropic.com'],
+         'placeholder': 'sk-ant-other', 'secret': '*****'}
+    )
+    return FakeProc(0, json.dumps({'secrets': [], 'custom_secrets': secrets}))
+
+
+class TestSwapSecretScopes(unittest.TestCase):
+    """The swap secrets that exist: one per agy VM, and any global one
+    left from before secrets were scoped (#130)."""
+
+    def test_scoped_and_global_are_told_apart(self) -> None:
+        listing = _listing('managed-a', 'global', 'managed-b').stdout
+        self.assertEqual(
+            swap_secret_scopes(listing, placeholder=PLACEHOLDER_TOKEN),
+            ([('managed-a', SWAP_HOSTS), ('managed-b', SWAP_HOSTS)], True),
+        )
+
+    def test_other_placeholders_are_ignored(self) -> None:
+        listing = _listing('managed-a', placeholder='someone-else').stdout
+        self.assertEqual(
+            swap_secret_scopes(listing, placeholder=PLACEHOLDER_TOKEN),
+            ([], False),
+        )
+
+    def test_a_malformed_listing_is_refused(self) -> None:
+        for text in ('not json', '[]', '{"custom_secrets": {}}',
+                     '{"custom_secrets": [1]}'):
+            with self.subTest(text=text):
+                with self.assertRaises(AgyHarvestError):
+                    swap_secret_scopes(text, placeholder=PLACEHOLDER_TOKEN)
+
+    def test_a_scope_that_is_not_a_sandbox_name_is_refused(self) -> None:
+        listing = _listing('-rf', placeholder=PLACEHOLDER_TOKEN).stdout
+        with self.assertRaises(AgyHarvestError):
+            swap_secret_scopes(listing, placeholder=PLACEHOLDER_TOKEN)
+
+
+class TestHarvesterUpdatesEveryAgyVm(unittest.TestCase):
+    """Each cycle rewrites every agy VM's own secret, and none that
+    every sandbox shares (#130)."""
+
+    def _cycle(self, listing, *results):
+        said: list[str] = []
+        runner = RecordingRunner([_ok_poke(), listing, *results])
+        out = _quiet(run=runner, echo=said.append).cycle_once()
+        return runner, said, out
+
+    def test_each_vm_gets_the_token_on_stdin(self) -> None:
+        runner, _said, _out = self._cycle(_listing('vm-a', 'vm-b'))
+        sets = [c for c in runner.calls if c['argv'][:3] == _SET_CUSTOM]
+        self.assertEqual(
+            [c['argv'][c['argv'].index('--sandbox') + 1] for c in sets],
+            ['vm-a', 'vm-b'],
+        )
+        for call in sets:
+            self.assertEqual(call['stdin'], _REAL_TOKEN)
+            self.assertNotIn(_REAL_TOKEN, call['argv'])
+
+    def test_it_lists_the_secrets_after_the_poke(self) -> None:
+        runner, _said, _out = self._cycle(_listing())
+        self.assertEqual(
+            runner.calls[1]['argv'], ['sbx', 'secret', 'ls', '--json']
+        )
+
+    def test_no_global_secret_is_ever_written(self) -> None:
+        runner, _said, _out = self._cycle(_listing('vm-a', 'global'))
+        for call in runner.calls:
+            if call['argv'][:3] == _SET_CUSTOM:
+                self.assertIn('--sandbox', call['argv'])
+
+    def test_a_leftover_global_secret_is_reported_once(self) -> None:
+        said: list[str] = []
+        runner = RecordingRunner([
+            _ok_poke(), _listing('global'), _ok_poke(), _listing('global'),
+        ])
+        harvester = _quiet(run=runner, echo=said.append)
+        harvester.cycle_once()
+        harvester.cycle_once()
+        warnings = [m for m in said if 'global' in m]
+        self.assertEqual(len(warnings), 1, said)
+        self.assertIn(
+            f'sbx secret rm --placeholder {PLACEHOLDER_TOKEN}', warnings[0]
+        )
+
+    def test_no_agy_vm_still_stamps_the_cycle(self) -> None:
+        runner, _said, out = self._cycle(_listing())
+        self.assertEqual(out, redact(_REAL_TOKEN))
+        self.assertFalse(
+            [c for c in runner.calls if c['argv'][:3] == _SET_CUSTOM]
+        )
+
+    def test_one_vm_that_fails_does_not_stop_the_rest(self) -> None:
+        runner, said, _out = self._cycle(
+            _listing('vm-a', 'vm-b'),
+            FakeProc(1, '', 'sandbox vm-a not found'), FakeProc(0),
+        )
+        sets = [c for c in runner.calls if c['argv'][:3] == _SET_CUSTOM]
+        self.assertEqual(len(sets), 2)
+        self.assertTrue([m for m in said if 'vm-a' in m], said)
+
+    def test_a_listing_that_fails_fails_the_cycle(self) -> None:
+        runner = RecordingRunner([_ok_poke(), FakeProc(1, '', 'daemon down')])
+        with self.assertRaises(AgyHarvestError):
+            _quiet(run=runner).cycle_once()
+
+
+class TestAnAgyVmGetsItsSecretAtLaunch(unittest.TestCase):
+    """
+    A new agy VM gets its own swap secret before its host starts, with
+    the token the trusted box holds now. The box is read, never poked:
+    only the harvester refreshes it, and two refreshers race (#130).
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix='agy-install-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.stamp = self.tmp / 'stamp.json'
+
+    def _fresh(self) -> None:
+        record_harvest('sha256:x', path=self.stamp)
+
+    def _install(self, runner, **kw):
+        kw.setdefault('wait', lambda **_k: False)
+        install_swap_secret(
+            'vm-a', run=runner, echo=lambda _m: None,
+            stamp_path=self.stamp, **kw,
+        )
+
+    def test_it_reads_the_box_then_sets_the_vms_secret(self) -> None:
+        self._fresh()
+        runner = RecordingRunner(
+            [FakeProc(0, 'AGY_READ_OK\n' + _token_body()), FakeProc(0)]
+        )
+        self._install(runner)
+        read, write = runner.calls
+        self.assertEqual(
+            read['argv'][:4], ['sbx', 'exec', TRUSTED_BOX_DEFAULT, 'python3']
+        )
+        self.assertEqual(write['argv'][:3], _SET_CUSTOM)
+        self.assertEqual(
+            write['argv'][write['argv'].index('--sandbox') + 1], 'vm-a'
+        )
+        self.assertEqual(write['stdin'], _REAL_TOKEN)
+        self.assertNotIn(_REAL_TOKEN, write['argv'])
+
+    def test_it_never_refreshes_the_box(self) -> None:
+        self._fresh()
+        runner = RecordingRunner(
+            [FakeProc(0, 'AGY_READ_OK\n' + _token_body()), FakeProc(0)]
+        )
+        self._install(runner)
+        script = runner.calls[0]['argv'][-1]
+        self.assertNotIn('agy', script.replace('AGY_READ', ''))
+        self.assertNotIn(EXPIRED_MARKER, script)
+
+    def test_a_stale_stamp_waits_for_the_harvester(self) -> None:
+        waited: list[dict] = []
+
+        def wait(**kwargs):
+            waited.append(kwargs)
+            self._fresh()
+            return True
+
+        runner = RecordingRunner(
+            [FakeProc(0, 'AGY_READ_OK\n' + _token_body()), FakeProc(0)]
+        )
+        self._install(runner, wait=wait)
+        self.assertEqual(len(waited), 1)
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_no_fresh_token_fails_the_launch(self) -> None:
+        runner = RecordingRunner()
+        with self.assertRaises(AgyHarvestError) as caught:
+            self._install(runner)
+        self.assertEqual(runner.calls, [])
+        self.assertIn(str(HARVEST_LOG), str(caught.exception))
+
+    def test_a_box_without_a_token_needs_a_login(self) -> None:
+        self._fresh()
+        runner = RecordingRunner([FakeProc(0, 'AGY_READ_NOFILE\n')])
+        with self.assertRaises(AgyReloginNeeded):
+            self._install(runner)
+        self.assertEqual(len(runner.calls), 1)
+
+    def test_an_unreadable_box_fails(self) -> None:
+        self._fresh()
+        for proc in (FakeProc(1, '', 'no such sandbox'),
+                     FakeProc(0, 'something else'),
+                     FakeProc(0, 'AGY_READ_OK\nnot json')):
+            with self.subTest(stdout=proc.stdout):
+                with self.assertRaises(AgyHarvestError):
+                    self._install(RecordingRunner([proc]))
+
+    def test_a_failed_secret_write_fails(self) -> None:
+        self._fresh()
+        runner = RecordingRunner([
+            FakeProc(0, 'AGY_READ_OK\n' + _token_body()),
+            FakeProc(1, '', 'denied'),
+        ])
+        with self.assertRaises(AgyHarvestError):
+            self._install(runner)
+
+    def test_a_missing_workspace_is_restored_and_retried(self) -> None:
+        self._fresh()
+        gone = FakeProc(
+            1, '',
+            'ERROR: workspace directory /tmp/agy-auth-trusted-ws does '
+            'not exist',
+        )
+        runner = RecordingRunner([
+            gone, FakeProc(0, 'AGY_READ_OK\n' + _token_body()), FakeProc(0),
+        ])
+        with mock.patch.object(
+            agy, 'restore_missing_workspace',
+            side_effect=lambda err: '/tmp/x' if 'workspace' in err else None,
+        ):
+            self._install(runner)
+        self.assertEqual(len(runner.calls), 3)
+
+
+class TestSwapHostsFollowTheLocation(unittest.TestCase):
+    """Each agy VM's secret covers the Vertex AI host its configured
+    location calls, so a regional location needs no harvester flag."""
+
+    def test_multi_region_and_global_need_nothing_extra(self) -> None:
+        for location in ('us', 'eu', 'global', None):
+            with self.subTest(location=location):
+                self.assertEqual(swap_hosts_for(location), SWAP_HOSTS)
+
+    def test_a_regional_location_adds_its_endpoint(self) -> None:
+        self.assertEqual(
+            swap_hosts_for('us-central1'),
+            (*SWAP_HOSTS, 'us-central1-aiplatform.googleapis.com'),
+        )
+
+    def test_a_location_that_is_not_one_is_refused(self) -> None:
+        for location in ('', 'US', 'us central1', '../x', 'x.evil.com',
+                         'us-central1;rm'):
+            with self.subTest(location=location):
+                with self.assertRaises(ValueError):
+                    swap_hosts_for(location)
+
+
+class TestTheHarvesterKeepsEachVmsHosts(unittest.TestCase):
+    """The harvester refreshes the value only: each VM's hosts are the
+    ones its launch chose, as sbx lists them."""
+
+    def test_the_listed_hosts_are_written_back(self) -> None:
+        regional = (*SWAP_HOSTS, 'us-central1-aiplatform.googleapis.com')
+        listing = json.dumps({'custom_secrets': [{
+            'scope': 'vm-a', 'targets': list(regional), 'env': SWAP_ENV,
+            'placeholder': PLACEHOLDER_TOKEN, 'secret': '*****',
+        }]})
+        runner = RecordingRunner(
+            [_ok_poke(), FakeProc(0, listing), FakeProc(0)]
+        )
+        _quiet(run=runner).cycle_once()
+        argv = runner.calls[2]['argv']
+        self.assertEqual(
+            [argv[i + 1] for i, a in enumerate(argv) if a == '--host'],
+            list(regional),
+        )
+
+    def test_a_swap_secret_with_no_usable_hosts_is_refused(self) -> None:
+        for targets in ([], ['**.googleapis.com'], [3], 'x'):
+            with self.subTest(targets=targets):
+                listing = json.dumps({'custom_secrets': [{
+                    'scope': 'vm-a', 'targets': targets,
+                    'placeholder': PLACEHOLDER_TOKEN,
+                }]})
+                with self.assertRaises(AgyHarvestError):
+                    swap_secret_scopes(listing)
 
 
 class TestHarvesterLoop(unittest.TestCase):
@@ -753,7 +1047,7 @@ class TestHarvesterLoop(unittest.TestCase):
 
     def test_success_sleeps_interval_resets_backoff(self) -> None:
         runner = RecordingRunner(
-            [_ok_poke(), FakeProc(0), _ok_poke(), FakeProc(0)]
+            [_ok_poke(), _listing(), _ok_poke(), _listing()]
         )
         sleeps = _Sleeps()
         _quiet(run=runner, sleep=sleeps, interval_s=1800).run_forever(
@@ -790,8 +1084,8 @@ class TestHarvesterLoop(unittest.TestCase):
             [
                 FakeProc(0, 'AGY_POKE_FAIL 1 network down'),
                 FakeProc(0, 'AGY_POKE_FAIL 1 network down'),
-                _ok_poke(), FakeProc(0),
-                _ok_poke(), FakeProc(0),
+                _ok_poke(), _listing(),
+                _ok_poke(), _listing(),
             ]
         )
         sleeps = _Sleeps()
@@ -814,7 +1108,7 @@ class TestHarvesterLoop(unittest.TestCase):
         self.assertEqual(sleeps.durations, [BACKOFF_FLOOR_S])
 
     def test_no_token_ever_logged(self) -> None:
-        runner = RecordingRunner([_ok_poke(), FakeProc(0)])
+        runner = RecordingRunner([_ok_poke(), _listing('vm-1'), FakeProc(0)])
         msgs: list[str] = []
         Harvester(
             run=runner, sleep=_Sleeps(), echo=msgs.append, interval_s=1
@@ -858,18 +1152,18 @@ class TestHarvestCli(unittest.TestCase):
         self.assertFalse(harvester_running(path=self.root / 'h.lock'))
 
     def test_once_success_prints_fingerprint_not_token(self) -> None:
-        runner = RecordingRunner([_ok_poke(), FakeProc(0)])
+        runner = RecordingRunner([_ok_poke(), _listing('vm-1'), FakeProc(0)])
         result = _invoke_cli(['harvest', '--once'], runner)
         self.assertEqual(result.exit_code, 0)
         self.assertIn('sha256:', result.output)
         self.assertNotIn(_REAL_TOKEN, result.output)
 
     def test_once_installs_poked_token_on_stdin(self) -> None:
-        runner = RecordingRunner([_ok_poke(), FakeProc(0)])
+        runner = RecordingRunner([_ok_poke(), _listing('vm-1'), FakeProc(0)])
         _invoke_cli(['harvest', '--once'], runner)
-        # calls: [0]=poke exec, [1]=secret set-custom w/ token on stdin.
-        self.assertEqual(runner.calls[1]['stdin'], _REAL_TOKEN)
-        self.assertNotIn(_REAL_TOKEN, runner.calls[1]['argv'])
+        # calls: [0]=poke, [1]=listing, [2]=the VM's secret (stdin).
+        self.assertEqual(runner.calls[2]['stdin'], _REAL_TOKEN)
+        self.assertNotIn(_REAL_TOKEN, runner.calls[2]['argv'])
 
     def test_once_failure_nonzero_exit(self) -> None:
         runner = RecordingRunner([FakeProc(0, 'AGY_POKE_FAIL 1 net down')])
@@ -896,16 +1190,16 @@ class TestBootstrapCli(unittest.TestCase):
             argvs[2][:5],
             ['sbx', 'policy', 'allow', 'network', '--sandbox'],
         )
-        self.assertEqual(argvs[3][:3], _SET_CUSTOM)
+        self.assertEqual(len(argvs), 3)
 
-    def test_seeds_placeholder_value_on_stdin(self) -> None:
+    def test_writes_no_swap_secret(self) -> None:
+        # Each agy VM gets its own at launch (#130); a global one would
+        # be usable from every sandbox.
         runner = RecordingRunner()
         _invoke_cli(['bootstrap', '--box', 'probe'], runner)
-        seed = next(
-            c for c in runner.calls if c['argv'][:3] == _SET_CUSTOM
+        self.assertFalse(
+            [c for c in runner.calls if c['argv'][:3] == _SET_CUSTOM]
         )
-        self.assertEqual(seed['stdin'], PLACEHOLDER_TOKEN)
-        self.assertNotIn('--value', seed['argv'])
 
     def test_skip_create_omits_create(self) -> None:
         runner = RecordingRunner()
@@ -915,7 +1209,7 @@ class TestBootstrapCli(unittest.TestCase):
         self.assertFalse(
             any(a[:3] == ['sbx', 'create', 'shell'] for a in argvs)
         )
-        # Still applies egress + seeds the secret.
+        # Still applies egress.
         self.assertTrue(
             any(a[:4] == ['sbx', 'policy', 'allow', 'network'] for a in argvs)
         )
@@ -977,7 +1271,7 @@ class TestHarvestStamp(unittest.TestCase):
         record_harvest('f', path=unwritable / 'stamp.json', now=1.0)
 
     def test_cycle_once_records_the_refresh(self) -> None:
-        runner = RecordingRunner([_ok_poke(), FakeProc(0)])
+        runner = RecordingRunner([_ok_poke(), _listing()])
         out = _quiet(run=runner, stamp_path=self.stamp).cycle_once()
         age = harvest_age_s(path=self.stamp)
         self.assertIsNotNone(age)

@@ -25,6 +25,28 @@ import click
 from sbx_omnigent import agy, codex, sbx_cli
 from sbx_omnigent.launcher import _MOUNT_SENTINEL_PREFIX, SbxLauncher
 
+
+def _no_real_swap_secret(*_args: object, **_kwargs: object) -> None:
+    raise AssertionError(
+        'a test reached agy.install_swap_secret, which reads the real '
+        'trusted box and writes a real sbx secret: stub '
+        'SbxLauncher._install_agy_swap_secret instead'
+    )
+
+
+#: Every test here builds agy VMs; none may reach the real trusted box.
+_SWAP_SECRET_GUARD = mock.patch.object(
+    agy, 'install_swap_secret', _no_real_swap_secret
+)
+
+
+def setUpModule() -> None:
+    _SWAP_SECRET_GUARD.start()
+
+
+def tearDownModule() -> None:
+    _SWAP_SECRET_GUARD.stop()
+
 _RUN = 'sbx_omnigent.launcher.sbx_cli.run'
 
 
@@ -73,6 +95,7 @@ class _Base(unittest.TestCase):
             mock.patch.object(launcher, '_apply_egress', side_effect=egress),
             note('_update_agy'),
             note('_inject_agy_credentials'),
+            note('_install_agy_swap_secret'),
             note('_inject_codex_credentials'),
             note('_pin_claude_version'),
             note('_seed_claude_settings'),
@@ -97,6 +120,19 @@ class TestOnlyAgyVmsAreUpdated(_Base):
         )
         self.assertLess(
             steps.index('_update_agy'), steps.index('_launch_host (adc)')
+        )
+
+    def test_its_swap_secret_comes_after_the_seed_before_the_host(
+        self,
+    ) -> None:
+        steps, _extras = self._start(self._launcher())
+        self.assertLess(
+            steps.index('_inject_agy_credentials'),
+            steps.index('_install_agy_swap_secret'),
+        )
+        self.assertLess(
+            steps.index('_install_agy_swap_secret'),
+            steps.index('_launch_host (adc)'),
         )
 
     def test_an_agy_vm_gets_the_updater_hosts_per_vm(self) -> None:

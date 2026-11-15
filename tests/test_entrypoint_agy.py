@@ -84,6 +84,24 @@ class TestAgyEnabledConfig(unittest.TestCase):
 
 
 
+class TestAgyLocationConfig(unittest.TestCase):
+    """The location names a Vertex AI host each agy VM's swap secret
+    covers, so a malformed one is refused at startup."""
+
+    def test_a_malformed_location_is_refused(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            _build_sbx_config(_cfg({
+                'agy_enabled': True, 'agy_gcp_location': 'x.evil.com',
+            }))
+        self.assertIn('agy_gcp_location', str(caught.exception))
+
+    def test_a_regional_location_is_accepted(self) -> None:
+        launcher = _launcher({
+            'agy_enabled': True, 'agy_gcp_location': 'us-central1',
+        })
+        self.assertEqual(launcher._agy_gcp_location, 'us-central1')
+
+
 class TestAgyUpdateConfig(unittest.TestCase):
     """`sbx.agy_update` reaches the launcher, off unless asked for."""
 

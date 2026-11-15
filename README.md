@@ -498,27 +498,29 @@ real token is short-lived (~1h), so one **trusted auth-agy box** holds the
 *only* refresh token and self-refreshes; the host-side `omni-sbx-agy` helper
 keeps the swap secret's value current.
 
-The swap secret is scoped to the exact hosts agy authenticates to, never a
-wildcard: Vertex AI (`aiplatform.googleapis.com`, `aiplatform.us.rep.googleapis.com`,
+**Each agy VM has its own swap secret**, scoped to that VM with `sbx secret
+set-custom --sandbox`, so no other sandbox (a Claude or Codex VM, the verify gate,
+anything else you run in sbx) can get your token swapped in. The launcher creates
+it before the VM's agy starts, with the token the trusted box holds at that moment,
+and refuses to launch the VM if no harvester has refreshed it recently. The
+harvester then refreshes every agy VM's secret each cycle, and `sbx rm` deletes
+it with the VM. Run `sbx secret ls` to see one per agy VM, under the VM's name.
+
+Each secret names the exact hosts agy authenticates to, never a wildcard: Vertex AI
+(`aiplatform.googleapis.com`, `aiplatform.us.rep.googleapis.com`,
 `aiplatform.eu.rep.googleapis.com`), Code Assist (`cloudcode-pa.googleapis.com`)
-and userinfo (`www.googleapis.com`). This matters because the secret is global
-and sbx puts its placeholder in **every** sandbox's environment: any process in
-any sandbox can present it, so a target is a Google API anyone in a sandbox can
-call with your real token. You can confirm it with `sbx policy log <sandbox>`: the
-listed hosts show `forward` (decrypted, so the swap happens) and every other Google
-host `forward-bypass`. A regional `agy_gcp_location` such as `us-central1` calls
-`<region>-aiplatform.googleapis.com`, which isn't on the list. For one, start the
-harvester yourself, **before the server**, with a `--host` for every host you
-need: `--host` replaces the default list rather than adding to it. The server and
-a pipeline run both use a harvester that's already running instead of starting
-their own.
+and userinfo (`www.googleapis.com`). A regional `agy_gcp_location` such as
+`us-central1` adds `us-central1-aiplatform.googleapis.com`; nothing else is needed
+for one. `sbx policy log <sandbox>` shows the listed hosts as `forward`
+(decrypted, so the swap happens) and every other Google host as `forward-bypass`.
+The server and a pipeline run both use a harvester that's already running instead
+of starting their own.
 
 **One-time setup** — stand up the trusted box and log in once:
 
 ```bash
 omni-sbx-agy bootstrap                      # creates agy-auth-trusted (isolated,
-                                            # NOT an Omnigent host), scopes egress,
-                                            # seeds the swap secret placeholder
+                                            # NOT an Omnigent host), scopes egress
 sbx exec -it agy-auth-trusted agy           # run '/login', complete browser consent
 ```
 
@@ -545,7 +547,7 @@ use it instead of competing. An auto-started one logs to `~/.sbx-swarm/agy-harve
 
 Each cycle force-expires the trusted box's on-disk token, runs `agy models` (the
 lightest authenticated action) to make agy re-mint via OAuth, reads the fresh
-access token off the box, and writes it into the swap secret's value **on
+access token off the box, and writes it into each agy VM's swap secret **on
 stdin** — the token never appears in a process argument or a log line (only a
 redacted `sha256:…` fingerprint is printed). The trusted box's minimal
 steady-state egress is just `oauth2.googleapis.com` + `cloudcode-pa.googleapis.com`;
@@ -553,9 +555,16 @@ steady-state egress is just `oauth2.googleapis.com` + `cloudcode-pa.googleapis.c
 
 If the trusted box's refresh token is revoked/expired, `harvest` prints a loud
 `RE-LOGIN REQUIRED` and keeps probing — re-run `sbx exec -it agy-auth-trusted agy`
-and `/login`, and it recovers on the next cycle. The swap secret uses a **fixed**
-placeholder, so each refresh **updates it in place** (no duplicate placeholders —
-keep exactly one; see [Credentials](#credentials)).
+and `/login`, and it recovers on the next cycle. The swap secrets share one
+**fixed** placeholder, so each refresh **updates every VM's secret in place**.
+
+**Upgrading from a global swap secret.** Launchers before per-VM secrets kept one
+global swap secret, which every sandbox could use. The harvester no longer writes
+it, and says so once while it still exists. Remove it with:
+
+```bash
+sbx secret rm --placeholder omni-sbx-agy-PROXY-SWAP-PLACEHOLDER-DO-NOT-USE-0000000000000000000000000000 -f
+```
 
 ### Running agy agents
 

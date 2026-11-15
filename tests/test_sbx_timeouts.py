@@ -191,7 +191,9 @@ class TestLauncherRemoteCommand(unittest.TestCase):
 class TestAgyHarvester(unittest.TestCase):
     def test_the_secret_update_is_bounded(self) -> None:
         runner = _Runner()
-        agy.Harvester(box='b', run=runner).update_secret('tok')
+        agy.Harvester(box='b', run=runner).update_secret(
+            'tok', sandbox='vm-1'
+        )
         self.assertEqual(
             runner.timeout_of('secret'), sbx_cli.MANAGE_TIMEOUT_S
         )
@@ -201,8 +203,20 @@ class TestAgyHarvester(unittest.TestCase):
         # would kill the always-on loop.
         with self.assertRaises(agy.AgyHarvestError) as caught:
             agy.Harvester(box='b', run=_Runner(hang='secret')).update_secret(
-                'tok'
+                'tok', sandbox='vm-1'
             )
+        self.assertTrue(_daemon_named(str(caught.exception)))
+
+    def test_the_secret_listing_is_bounded(self) -> None:
+        runner = _Runner(_Proc(stdout='{"custom_secrets": []}'))
+        agy.Harvester(box='b', run=runner).swap_sandboxes()
+        self.assertEqual(
+            runner.timeout_of('secret'), sbx_cli.MANAGE_TIMEOUT_S
+        )
+
+    def test_a_hung_secret_listing_is_a_harvest_error(self) -> None:
+        with self.assertRaises(agy.AgyHarvestError) as caught:
+            agy.Harvester(box='b', run=_Runner(hang='secret')).swap_sandboxes()
         self.assertTrue(_daemon_named(str(caught.exception)))
 
 

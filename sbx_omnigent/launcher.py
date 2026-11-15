@@ -642,6 +642,7 @@ class SbxLauncher(ExecModelHostLauncher):
             if self._agy_update:
                 self._update_agy(sandbox_id)
             self._inject_agy_credentials(sandbox_id)
+            self._install_agy_swap_secret(sandbox_id)
         elif credential == 'codex':
             self._inject_codex_credentials(sandbox_id)
         else:
@@ -955,6 +956,34 @@ class SbxLauncher(ExecModelHostLauncher):
             ],
             action=f'apply egress allowlist to {name!r}',
         )
+
+    def _install_agy_swap_secret(self, name: str) -> None:
+        """
+        Give an agy VM its own swap secret, before its host starts.
+
+        The secret is scoped to this VM, so no other sandbox can use the
+        Google token, and covers the hosts agy calls for the configured
+        location (:func:`agy.swap_hosts_for`). The harvester rewrites
+        its value every cycle, and ``sbx rm`` deletes it with the VM
+        (#130). A no-op unless ``agy_enabled``.
+
+        Fail-loud: without it every agy request in this VM carries the
+        inert placeholder and is refused, which reads as agy failing to
+        sign in.
+
+        :param name: The agy VM.
+        :raises click.ClickException: If the secret cannot be installed.
+        """
+        if not self._agy_enabled:
+            return
+        try:
+            agy.install_swap_secret(
+                name, hosts=agy.swap_hosts_for(self._agy_gcp_location)
+            )
+        except agy.AgyHarvestError as exc:
+            raise click.ClickException(
+                f'could not give agy VM {name!r} its swap secret: {exc}'
+            ) from exc
 
     def _inject_agy_credentials(self, name: str) -> None:
         """
