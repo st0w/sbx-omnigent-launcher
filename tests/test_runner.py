@@ -30,6 +30,22 @@ from click.testing import CliRunner, Result
 
 from sbx_omnigent import egress, pipeline
 from sbx_omnigent.runner import run as R
+from sbx_omnigent.runner.limits import (
+    _VM_DISK_BYTES,
+    _WORKTREE_DISK_BYTES,
+)
+from sbx_omnigent.runner.parsing.dispositions import (
+    DISPOSITION_ABSENT,
+    DISPOSITION_FILED,
+    DISPOSITION_RECORDED,
+)
+from sbx_omnigent.runner.parsing.plans import (
+    _PLAN_RECAP_WINDOW,
+    plan_shape_failures,
+)
+from sbx_omnigent.runner.prompts.checks import (
+    _CHECK_FINISH,
+)
 from sbx_omnigent.swarm_session import (
     PlanDecision,
     SwarmRunnerUnavailable,
@@ -39,6 +55,7 @@ from sbx_omnigent.swarm_session import (
     SwarmTurnTimeout,
 )
 from sbx_omnigent.worktrees import WorktreeManager
+from tests.support.plans import plan_text, plan_with_decisions
 
 
 def _assert_plan_committed(case, wt, worktree, path, marker):
@@ -535,7 +552,7 @@ class FakeSC:
     def _shaped(self, label: str, text: str) -> str:
         """Plan shape around a planner's reply; see send_and_wait."""
         if _is_planner_label(label) and not self.raw_plan_replies:
-            return _plan_text(2200, text)
+            return plan_text(2200, text)
         return text
 
     def read_items(self, session, *, tail=None):
@@ -622,7 +639,7 @@ class FakeSC:
         # fixture that did would only be testing the refusal. Tests of
         # the guard itself pass real text directly.
         if _is_planner_label(label) and not self.raw_plan_replies:
-            reply = _plan_text(2200, reply)
+            reply = plan_text(2200, reply)
         if (
             _WORK_COMPLETE in message
             and not self.raw_writer_replies
@@ -984,69 +1001,6 @@ class TestLinear(_Base):
                 for p, n in staged
             )
         )
-
-
-class TestParseDisputes(unittest.TestCase):
-    """
-    Telling "my contract is impossible" from the prompt asking for it.
-
-    Every role prompt ends "label it DISPUTED, and stop", so the bare
-    word is in nearly every report. Treating that as a dispute would
-    halt almost every run; measured on four campaigns, both that
-    SHIPPED contained the echo and no real claim.
-    """
-
-    def test_the_prompt_echo_is_not_a_dispute(self) -> None:
-        # The exact phrase every role prompt ends with. If this reads as
-        # a dispute, the runner halts on every review it ever sees.
-        echo = (
-            'If it truly cannot be resolved that way, say so in your '
-            'reply, label it DISPUTED, and stop. Your reply is the only '
-            'channel that reaches a human.'
-        )
-        self.assertEqual(R.parse_disputes(echo), ())
-
-        # The same phrase WRAPPED so it begins a line. Only the required
-        # `:`/dash separator rejects this one — the start-of-line anchor
-        # does not — and reports do quote the prompt back at any width.
-        wrapped = (
-            'If it truly cannot be resolved that way, say so and\n'
-            'DISPUTED, and stop. Your reply is the only channel.\n'
-        )
-        self.assertEqual(R.parse_disputes(wrapped), ())
-
-    def test_a_claim_after_the_marker_is_a_dispute(self) -> None:
-        got = R.parse_disputes(
-            'DISPUTED: the frozen mapping test conflicts with the '
-            'vocabulary, so this cannot be approved.'
-        )
-        self.assertEqual(len(got), 1)
-        self.assertTrue(got[0].startswith('the frozen mapping test'))
-
-    def test_the_marker_may_be_decorated_like_a_finding(self) -> None:
-        for text in (
-            '**DISPUTED — the frozen test is internally inconsistent.**',
-            '1. **DISPUTED — the suite is unsatisfiable.** Details follow.',
-            '- DISPUTED: stages disagree on a contract.',
-            'DISPUTED - no catalog content can satisfy it.',
-        ):
-            with self.subTest(text=text[:34]):
-                self.assertEqual(len(R.parse_disputes(text)), 1)
-
-    def test_a_report_with_no_marker_yields_nothing(self) -> None:
-        for text in ('', None, 'VERDICT: BLOCKING', 'nothing disputed'):
-            with self.subTest(text=text):
-                self.assertEqual(R.parse_disputes(text), ())
-
-    def test_every_dispute_in_a_multi_finding_report_is_returned(
-        self,
-    ) -> None:
-        got = R.parse_disputes(
-            'DISPUTED: the first assertion cannot hold.\n'
-            'Some prose in between.\n'
-            'DISPUTED — the second one cannot either.\n'
-        )
-        self.assertEqual(len(got), 2)
 
 
 _TWO_REVIEWERS = """\
@@ -1588,7 +1542,7 @@ class TestTheRunnerWaitsForBackgroundWork(_Base):
         )
 
     def test_the_finish_rules_allow_background_work(self) -> None:
-        for rule in (R._CHECK_FINISH, R._WRITER_FINISH):
+        for rule in (_CHECK_FINISH, R._WRITER_FINISH):
             with self.subTest(rule=rule[:40]):
                 self.assertIn('background', rule)
                 self.assertNotIn('do not end your turn while', rule)
@@ -3046,7 +3000,6 @@ stages:
     gate: consensus
     on_block: refactor
 """
-
 
 
 _JUDGE_REFACTOR = """\
@@ -5888,7 +5841,7 @@ class TestDispositionsDecideWhatIsFiled(_Base):
     def test_a_reproduces_verdict_files_exactly_as_before(self) -> None:
         wt = FakeWT()
         runner = self._runner(wt)
-        self._conclude(runner, R.DISPOSITION_FILED, 'still there')
+        self._conclude(runner, DISPOSITION_FILED, 'still there')
         self._file(runner)
         titles = [i['title'] for i in wt.issues]
         self.assertEqual(len(titles), 2, titles)
@@ -5899,7 +5852,7 @@ class TestDispositionsDecideWhatIsFiled(_Base):
         # not zero, which is the outcome worse than N.
         wt = FakeWT()
         runner = self._runner(wt)
-        self._conclude(runner, R.DISPOSITION_ABSENT, 'not in this tree')
+        self._conclude(runner, DISPOSITION_ABSENT, 'not in this tree')
         self._file(runner)
         titles = [i['title'] for i in wt.issues]
         self.assertEqual(len(titles), 1, titles)
@@ -5912,7 +5865,7 @@ class TestDispositionsDecideWhatIsFiled(_Base):
         wt = FakeWT()
         runner = self._runner(wt)
         self._conclude(
-            runner, R.DISPOSITION_RECORDED, 'pool.py:88 documents it'
+            runner, DISPOSITION_RECORDED, 'pool.py:88 documents it'
         )
         self._file(runner)
         body = wt.issues[0]['body']
@@ -5928,7 +5881,7 @@ class TestDispositionsDecideWhatIsFiled(_Base):
         # recoverable, and that nothing was marked as dealt with.
         wt = FakeWT()
         runner = self._runner(wt)
-        self._conclude(runner, R.DISPOSITION_ABSENT, 'checked, gone')
+        self._conclude(runner, DISPOSITION_ABSENT, 'checked, gone')
         self._file(runner)
         self.assertIn('still live', wt.issues[0]['body'])
 
@@ -5939,10 +5892,10 @@ class TestDispositionsDecideWhatIsFiled(_Base):
         runner = self._runner(wt)
         rec = runner._chunk_reviews()[0]
         runner._dispositions[R.finding_id(rec, 1)] = R.Disposition(
-            R.DISPOSITION_ABSENT, 'gone'
+            DISPOSITION_ABSENT, 'gone'
         )
         runner._dispositions[R.finding_id(rec, 2)] = R.Disposition(
-            R.DISPOSITION_FILED, 'real'
+            DISPOSITION_FILED, 'real'
         )
         self._file(runner)
         titles = sorted(i['title'] for i in wt.issues)
@@ -6013,7 +5966,7 @@ class TestTheLedgerSurvivesARun(_Base):
 
         _r, sc, _w = self._run(
             _PER_MODULE,
-            {'plan': _plan_text(3000), 'tw': 'tests', 'build': 'code'},
+            {'plan': plan_text(3000), 'tw': 'tests', 'build': 'code'},
             wt=wt,
         )
 
@@ -6781,13 +6734,13 @@ class TestTheVerificationGate(_Base):
         pending = runner._pending_findings()
         kept = runner._record_dispositions(
             pending,
-            {1: R.Disposition(R.DISPOSITION_ABSENT, 'gone in 4622247')},
+            {1: R.Disposition(DISPOSITION_ABSENT, 'gone in 4622247')},
         )
         self.assertEqual(kept, 1)
         stored = runner._dispositions[
             R.finding_id(pending[0][0], pending[0][1])
         ]
-        self.assertEqual(stored.verdict, R.DISPOSITION_ABSENT)
+        self.assertEqual(stored.verdict, DISPOSITION_ABSENT)
         self.assertEqual(stored.reason, 'gone in 4622247')
 
     def test_a_finding_with_no_conclusion_still_counts_as_filed(
@@ -7000,17 +6953,17 @@ class TestBlockingFindingsReachTheVerifier(_Base):
             reports,
             {
                 (1, 1): R.Disposition(
-                    R.DISPOSITION_FILED, 'repr still prints the key'
+                    DISPOSITION_FILED, 'repr still prints the key'
                 ),
                 (1, 2): R.Disposition(
-                    R.DISPOSITION_ABSENT, 'fixed in round 2'
+                    DISPOSITION_ABSENT, 'fixed in round 2'
                 ),
             },
         )
         self.assertEqual(kept, 1)
         ident = R.blocking_finding_id(reports[0][0], 1)
         self.assertEqual(
-            runner._dispositions[ident].verdict, R.DISPOSITION_FILED
+            runner._dispositions[ident].verdict, DISPOSITION_FILED
         )
         self.assertIn('repr still prints', runner._blocking_claims[ident])
 
@@ -7024,38 +6977,6 @@ class TestBlockingFindingsReachTheVerifier(_Base):
         reports = runner._pending_blocking_reports()
         self.assertEqual(runner._record_blocking_dispositions(reports, {}), 0)
         self.assertEqual(runner._blocking_claims, {})
-
-
-class TestParseBlockingDispositions(unittest.TestCase):
-    """The verifier answers per claim, under its own header."""
-
-    def test_claims_are_read_by_report_and_number(self) -> None:
-        got = R.parse_blocking_dispositions(
-            'BLOCKING-DISPOSITIONS:\n'
-            '- B1.1: reproduces — repr prints the key in the winner\n'
-            '- B1.2: absent — the winner coerces the timestamp\n'
-        )
-        self.assertEqual(got[(1, 1)].verdict, R.DISPOSITION_FILED)
-        self.assertIn('repr prints the key', got[(1, 1)].reason)
-        self.assertEqual(got[(1, 2)].verdict, R.DISPOSITION_ABSENT)
-
-    def test_the_B_prefix_is_optional(self) -> None:
-        got = R.parse_blocking_dispositions(
-            'BLOCKING-DISPOSITIONS:\n- 2.1: reproduces — still there\n'
-        )
-        self.assertEqual(got[(2, 1)].verdict, R.DISPOSITION_FILED)
-
-    def test_no_header_yields_nothing(self) -> None:
-        self.assertEqual(R.parse_blocking_dispositions('nothing here'), {})
-
-    def test_an_unreadable_verdict_is_skipped_not_guessed(self) -> None:
-        got = R.parse_blocking_dispositions(
-            'BLOCKING-DISPOSITIONS:\n'
-            '- B1.1: mumble — no idea\n'
-            '- B1.2: reproduces — still there\n'
-        )
-        self.assertNotIn((1, 1), got)
-        self.assertEqual(got[(1, 2)].verdict, R.DISPOSITION_FILED)
 
 
 class TestBlockingClaimsAreFiled(_Base):
@@ -7100,7 +7021,7 @@ class TestBlockingClaimsAreFiled(_Base):
     def test_a_claim_that_reproduces_becomes_an_issue(self) -> None:
         runner, wt = self._runner()
         self._conclude(
-            runner, R.DISPOSITION_FILED, 'repr prints the key in impl-b'
+            runner, DISPOSITION_FILED, 'repr prints the key in impl-b'
         )
         runner._file_blocking_findings('docs/plans/m0-reviews.md')
         titles = [i['title'] for i in wt.issues]
@@ -7109,7 +7030,7 @@ class TestBlockingClaimsAreFiled(_Base):
 
     def test_the_issue_says_it_was_raised_as_blocking(self) -> None:
         runner, wt = self._runner()
-        self._conclude(runner, R.DISPOSITION_FILED, 'still there')
+        self._conclude(runner, DISPOSITION_FILED, 'still there')
         runner._file_blocking_findings('docs/plans/m0-reviews.md')
         body = wt.issues[0]['body']
         self.assertIn('BLOCKING', body)
@@ -7118,7 +7039,7 @@ class TestBlockingClaimsAreFiled(_Base):
 
     def test_the_body_carries_the_dedup_marker(self) -> None:
         runner, wt = self._runner()
-        rec = self._conclude(runner, R.DISPOSITION_FILED, 'still there')
+        rec = self._conclude(runner, DISPOSITION_FILED, 'still there')
         runner._file_blocking_findings('docs/plans/m0-reviews.md')
         self.assertIn(
             R.finding_marker(R.blocking_finding_id(rec, 1)),
@@ -7127,7 +7048,7 @@ class TestBlockingClaimsAreFiled(_Base):
 
     def test_a_claim_already_filed_is_not_filed_again(self) -> None:
         runner, wt = self._runner()
-        rec = self._conclude(runner, R.DISPOSITION_FILED, 'still there')
+        rec = self._conclude(runner, DISPOSITION_FILED, 'still there')
         wt.issue_bodies = R.finding_marker(R.blocking_finding_id(rec, 1))
         runner._file_blocking_findings('docs/plans/m0-reviews.md')
         self.assertEqual(wt.issues, [])
@@ -7138,7 +7059,7 @@ class TestBlockingClaimsAreFiled(_Base):
         # The common case: the winner already fixed it. It must not
         # file, and the reason must survive.
         runner, wt = self._runner()
-        self._conclude(runner, R.DISPOSITION_ABSENT, 'fixed in round 2')
+        self._conclude(runner, DISPOSITION_ABSENT, 'fixed in round 2')
         runner._file_blocking_findings('docs/plans/m0-reviews.md')
         titles = [i['title'] for i in wt.issues]
         self.assertEqual(len(titles), 1, titles)
@@ -7158,7 +7079,7 @@ class TestBlockingClaimsAreFiled(_Base):
     def test_an_unreadable_tracker_files_nothing(self) -> None:
         runner, wt = self._runner()
         wt.issue_bodies = None
-        self._conclude(runner, R.DISPOSITION_FILED, 'still there')
+        self._conclude(runner, DISPOSITION_FILED, 'still there')
         runner._file_blocking_findings('docs/plans/m0-reviews.md')
         self.assertEqual(wt.issues, [])
 
@@ -7166,150 +7087,9 @@ class TestBlockingClaimsAreFiled(_Base):
         # A record with no non-blocking findings at all used to return
         # early, so its blocking claims never reached the tracker.
         runner, wt = self._runner()
-        self._conclude(runner, R.DISPOSITION_FILED, 'still there')
+        self._conclude(runner, DISPOSITION_FILED, 'still there')
         runner._publish_findings('build', 'docs/plans/m0-reviews.md')
         self.assertTrue(wt.issues)
-
-
-class TestParseDispositions(unittest.TestCase):
-    """
-    A verifier's conclusions, and the rule that it FAILS OPEN.
-
-    Everything here protects one property: an index this parser does not
-    return a conclusion for is filed exactly as it is today. A verifier
-    that dies, answers nothing, or writes something unreadable costs a
-    wasted triage — never a lost finding.
-    """
-
-    def test_each_conclusion_is_read_with_its_reason(self) -> None:
-        got = R.parse_dispositions(
-            'DISPOSITIONS:\n'
-            '- 1: reproduces — still leaked at pool.py:88\n'
-            '- 2: absent — removed in 4622247\n'
-        )
-        self.assertEqual(got[1].verdict, R.DISPOSITION_FILED)
-        self.assertEqual(got[1].reason, 'still leaked at pool.py:88')
-        self.assertEqual(got[2].verdict, R.DISPOSITION_ABSENT)
-        self.assertFalse(got[2].files)
-
-    def test_only_reproduces_still_files(self) -> None:
-        got = R.parse_dispositions(
-            'DISPOSITIONS:\n- 1: reproduces\n- 2: absent\n'
-            '- 3: recorded\n- 4: decided\n- 5: duplicate\n'
-        )
-        self.assertEqual(
-            [i for i in sorted(got) if got[i].files], [1]
-        )
-
-    def test_the_verdict_may_sit_inside_a_sentence(self) -> None:
-        # A verifier writes a conclusion, not a token. "already
-        # documented in models.py" carries its verdict in word two.
-        got = R.parse_dispositions(
-            'DISPOSITIONS:\n'
-            '- 1: already documented in models.py\n'
-            '- 2: duplicate of 1\n'
-        )
-        self.assertEqual(got[1].verdict, R.DISPOSITION_RECORDED)
-        self.assertEqual(got[1].reason, 'in models.py')
-        self.assertEqual(got[2].verdict, R.DISPOSITION_DUPLICATE)
-
-    def test_an_unreadable_line_does_not_discard_the_ones_below_it(
-        self,
-    ) -> None:
-        # The expensive failure: one line a verifier phrased oddly
-        # silently swallowing every conclusion after it.
-        got = R.parse_dispositions(
-            'DISPOSITIONS:\n'
-            '- 1: reproduces\n'
-            '- 2: I could not tell\n'
-            '- 3: absent — checked, it is gone\n'
-        )
-        self.assertNotIn(2, got)
-        self.assertEqual(got[3].verdict, R.DISPOSITION_ABSENT)
-
-    def test_no_block_at_all_yields_no_conclusions(self) -> None:
-        # Which files everything — the pre-gate behaviour exactly.
-        for text in ('', None, 'I ran out of turns.'):
-            with self.subTest(text=text):
-                self.assertEqual(R.parse_dispositions(text), {})
-
-    def test_the_last_block_wins_like_every_other_marker(self) -> None:
-        got = R.parse_dispositions(
-            'DISPOSITIONS:\n- 1: absent\n\n'
-            'On reflection.\n\nDISPOSITIONS:\n- 1: reproduces\n'
-        )
-        self.assertTrue(got[1].files)
-
-
-class TestFindingSections(unittest.TestCase):
-    """
-    Sorting the non-blocking output by what each item IS.
-
-    The pre-split blob asked for three different things at once and only
-    the first was a defect. Sorting them where they are written is what
-    lets a later-increment item be ROUTED to the planner that acts on
-    it, and a premise be VERIFIED, instead of all three landing in one
-    tracker for a human to re-read and re-classify.
-    """
-
-    def test_each_block_is_lifted_into_its_own_section(self) -> None:
-        text = (
-            'Looks right.\n\n'
-            'DEFECTS:\n- the retry budget is undocumented\n\n'
-            'LATER-INCREMENT:\n- pagination belongs to [m2]\n\n'
-            'PREMISES:\n- I assumed build_providers cannot fail\n\n'
-            'VERDICT: APPROVED'
-        )
-        got = R.FindingSections.of(text)
-        self.assertEqual(got.defects, ('the retry budget is undocumented',))
-        self.assertEqual(got.later_increment, ('pagination belongs to [m2]',))
-        self.assertEqual(
-            got.premises, ('I assumed build_providers cannot fail',)
-        )
-
-    def test_a_legacy_findings_block_is_read_as_defects(self) -> None:
-        # The loudest bucket, deliberately. A reviewer that ignores the
-        # new protocol, or a reply written before it existed, must lose
-        # nothing, so an uncategorized item gets the MOST attention.
-        got = R.FindingSections.of('FINDINGS:\n- something is wrong')
-        self.assertEqual(got.defects, ('something is wrong',))
-        self.assertEqual(got.later_increment, ())
-        self.assertEqual(got.premises, ())
-
-    def test_all_is_the_union_and_puts_defects_first(self) -> None:
-        text = (
-            'PREMISES:\n- p\n\n'
-            'LATER-INCREMENT:\n- l\n\n'
-            'DEFECTS:\n- d\n'
-        )
-        self.assertEqual(R.FindingSections.of(text).all, ('d', 'l', 'p'))
-
-    def test_a_missing_block_is_empty_not_an_error(self) -> None:
-        got = R.FindingSections.of('DEFECTS:\n- only this one')
-        self.assertEqual(got.defects, ('only this one',))
-        self.assertEqual(got.all, ('only this one',))
-
-    def test_nothing_raised_yields_all_empty(self) -> None:
-        for text in ('', None, 'VERDICT: APPROVED'):
-            with self.subTest(text=text):
-                self.assertEqual(R.FindingSections.of(text).all, ())
-
-    def test_the_headers_may_be_decorated_like_every_other_marker(
-        self,
-    ) -> None:
-        for header in ('LATER-INCREMENT:', '## Later-Increment',
-                       '**LATER_INCREMENT:**', 'later increment'):
-            with self.subTest(header=header):
-                self.assertEqual(
-                    R.FindingSections.of(f'{header}\n- x').later_increment,
-                    ('x',),
-                )
-
-    def test_a_legacy_block_and_a_defects_block_both_count(self) -> None:
-        # A reviewer that writes both is not made to choose; neither
-        # list is dropped.
-        got = R.FindingSections.of('DEFECTS:\n- a\n\nFINDINGS:\n- b')
-        self.assertEqual(got.defects, ('a', 'b'))
 
 
 class TestEnvironmentLimitsAreTheirOwnSection(unittest.TestCase):
@@ -7446,67 +7226,6 @@ class TestReviewRecordCarriesTheSections(unittest.TestCase):
         self.assertEqual(
             R.ReviewRecord.from_dict(raw).defects, ('keep', 'also keep')
         )
-
-
-class TestParseFindings(unittest.TestCase):
-    """
-    A reviewer's NON-BLOCKING findings are the lossy set: blocking ones
-    are acted on in-round, these are archived and never read again.
-    Lifted out with the same marker protocol as `VERDICT:` and
-    `DECISIONS FOR LATER MODULES:` rather than by parsing prose.
-    """
-
-    def test_items_are_lifted_in_order(self) -> None:
-        text = (
-            'Looks fine overall.\n\n'
-            'FINDINGS:\n'
-            '- ListServiceAccounts is unpaginated (belongs to [identities])\n'
-            '- the retry budget is not documented\n\n'
-            'VERDICT: APPROVED'
-        )
-        self.assertEqual(
-            R.parse_findings(text),
-            ('ListServiceAccounts is unpaginated (belongs to [identities])',
-             'the retry budget is not documented'),
-        )
-
-    def test_numbered_and_bulleted_items_both_count(self) -> None:
-        text = 'FINDINGS:\n1. first\n2) second\n* third\n• fourth'
-        self.assertEqual(
-            R.parse_findings(text), ('first', 'second', 'third', 'fourth')
-        )
-
-    def test_the_last_block_wins(self) -> None:
-        # Same rule as parse_decisions: a reviewer that restates
-        # its list after thinking again means the later one.
-        text = 'FINDINGS:\n- early\n\nOn reflection.\n\nFINDINGS:\n- late'
-        self.assertEqual(R.parse_findings(text), ('late',))
-
-    def test_blank_lines_inside_the_list_are_tolerated(self) -> None:
-        text = 'FINDINGS:\n- one\n\n- two'
-        self.assertEqual(R.parse_findings(text), ('one', 'two'))
-
-    def test_prose_after_the_list_ends_it(self) -> None:
-        text = 'FINDINGS:\n- one\nThat is all.\n- not a finding'
-        self.assertEqual(R.parse_findings(text), ('one',))
-
-    def test_the_header_may_be_decorated(self) -> None:
-        for header in ('FINDINGS:', '## FINDINGS', '**FINDINGS:**',
-                       '  findings :  '):
-            with self.subTest(header=header):
-                self.assertEqual(
-                    R.parse_findings(f'{header}\n- x'), ('x',)
-                )
-
-    def test_no_block_yields_nothing(self) -> None:
-        # NOT an error: a reviewer with nothing to raise is the normal
-        # case. The caller falls back to keeping the whole report.
-        for text in ('', None, 'VERDICT: APPROVED', 'findings were none'):
-            with self.subTest(text=text):
-                self.assertEqual(R.parse_findings(text), ())
-
-    def test_an_empty_block_yields_nothing(self) -> None:
-        self.assertEqual(R.parse_findings('FINDINGS:\n\nVERDICT: OK'), ())
 
 
 class TestTheIncrementBoundsEveryRole(_Base):
@@ -7737,7 +7456,6 @@ class TestSettledDecisionsReachTheReviewers(_Base):
         r._referrals = [('m3c', 'a reviewer wondered about pagination')]
         msg = r._review_instruction(r._stage_by_id['review-a'])
         self.assertNotIn('wondered about pagination', msg)
-
 
 
 class TestTheReviewedClaimSurvivesAResume(_Base):
@@ -8022,58 +7740,6 @@ class TestAJudgeThatDecidedButMisspelledIt(_Base):
         )
         self.assertNotIn('by default', instr)
         self.assertIn('HALTS', instr)
-
-
-_PS_CANDIDATES = ['m0-impl-a', 'm0-impl-b']
-
-
-class TestParseSelect(unittest.TestCase):
-    """Unit coverage for the two-tier parser."""
-
-    C = _PS_CANDIDATES
-
-    def test_tier_one_exact_form(self) -> None:
-        self.assertEqual(
-            R.parse_select('SELECT: m0-impl-b', self.C), 'm0-impl-b'
-        )
-
-    def test_tier_two_needs_the_marker_AND_a_known_id(self) -> None:
-        self.assertEqual(
-            R.parse_select('SELECT m0-impl-b', self.C), 'm0-impl-b'
-        )
-        self.assertIsNone(R.parse_select('m0-impl-b is better', self.C))
-        self.assertIsNone(R.parse_select('SELECT the better one', self.C))
-
-    def test_a_tier_one_capture_that_is_not_a_candidate_falls_through(
-        self,
-    ) -> None:
-        # The regex eats the next word of a sentence; a real choice
-        # further down must still win.
-        self.assertEqual(
-            R.parse_select(
-                'SELECT: whichever is safer\n\nSELECT m0-impl-b', self.C
-            ),
-            'm0-impl-b',
-        )
-
-    def test_a_substring_id_never_shadows_the_longer_one(self) -> None:
-        self.assertEqual(
-            R.parse_select('SELECT m0-impl-a', ['impl-a', 'm0-impl-a']),
-            'm0-impl-a',
-        )
-
-    def test_the_last_select_line_wins(self) -> None:
-        self.assertEqual(
-            R.parse_select(
-                'SELECT m0-impl-a\nno wait\nSELECT m0-impl-b', self.C
-            ),
-            'm0-impl-b',
-        )
-
-    def test_without_candidates_the_old_behaviour_is_exact(self) -> None:
-        # Callers that pass no candidate list get tier 1, unvalidated.
-        self.assertEqual(R.parse_select('SELECT: anything'), 'anything')
-        self.assertIsNone(R.parse_select('SELECT anything'))
 
 
 class TestAParallelBlockRunsInParallel(_Base):
@@ -9212,25 +8878,6 @@ class TestAWriterMustSayItFinished(_Base):
         self.assertNotIn('WORK COMPLETE', sc.message_for_label('review-sec'))
 
 
-class TestTheFinishLineIsRead(unittest.TestCase):
-    """Only a line that is exactly the marker counts."""
-
-    def test_the_line_counts(self) -> None:
-        for text in ('done\n\nWORK COMPLETE', 'done\n**WORK COMPLETE**',
-                     'done\n`WORK COMPLETE`\n'):
-            with self.subTest(text=text):
-                self.assertTrue(R.work_finished(text))
-
-    def test_a_promise_does_not(self) -> None:
-        for text in (
-            'I will end with WORK COMPLETE once the build is done.',
-            'WORK COMPLETE is what I will say later',
-            '', None,
-        ):
-            with self.subTest(text=text):
-                self.assertFalse(R.work_finished(text))
-
-
 class TestCtrlCStopsTheRunNow(_Base):
     """
     Ctrl-C means stop, not "stop once every parallel turn is done".
@@ -9986,7 +9633,7 @@ class TestTheSecuritySummary(_Base):
         runner = self._runner(wt)
         final = runner._reviews[-1]
         runner._dispositions[R.finding_id(final, 1)] = R.Disposition(
-            R.DISPOSITION_RECORDED, 'already tracked as a known limit'
+            DISPOSITION_RECORDED, 'already tracked as a known limit'
         )
         _path, text = self._summary(runner, wt)
         row = next(line for line in text.splitlines()
@@ -10024,7 +9671,7 @@ class TestTheSecuritySummary(_Base):
         runner = self._runner(wt)
         ident = R.blocking_finding_id(runner._reviews[0], 1)
         runner._dispositions[ident] = R.Disposition(
-            R.DISPOSITION_FILED, 'the query still interpolates name'
+            DISPOSITION_FILED, 'the query still interpolates name'
         )
         runner._blocking_claims[ident] = 'the query still interpolates name'
         _path, text = self._summary(runner, wt)
@@ -11088,34 +10735,6 @@ class TestAgySwapGuard(_Base):
         self.assertEqual(result.status, 'completed')
 
 
-def _plan_text(size: int, marker: str = '') -> str:
-    """
-    Plan-SHAPED text of roughly *size* chars.
-
-    The selection rules are about relative size and recency, but the
-    guard is now structural — so filler like ``'x' * 4000`` is correctly
-    not a plan, and these fixtures have to look like one.
-    """
-    head = (
-        '## Files\n'
-        '- src/core.rs — the parser\n'
-        '- src/lib.rs — exports it\n'
-        '- tests/parse_test.rs — the cases\n\n'
-        '## Interfaces\n'
-        '`parse` takes a spec and returns whole seconds; its single '
-        'responsibility is parsing.\n\n'
-        '## Algorithm\n'
-        '1. Read the spec\n2. Split the units\n3. Sum them\n\n'
-        '## Edge cases\n'
-        'An invalid suffix must fail; a malformed spec raises.\n\n'
-        '## Test strategy\n'
-        'The test author must verify each unit test case.\n\n'
-        f'{marker}\n'
-    )
-    pad = max(0, size - len(head))
-    return head + ('detail. ' * (pad // 8 + 1))[:pad]
-
-
 #: The live pipeline's own shape: plan, a tests-only writer, two
 #: isolated implementers, a consensus review per candidate, a judge, a
 #: refactor, a review of the refactor, and a triage pass. Every other
@@ -11372,10 +10991,10 @@ class TestTheLiveCadreCarriesRealArtifacts(_Base):
         plan = _real_plan()
         self.assertGreater(len(plan), 8000)
         self.assertGreater(
-            plan.index('is complete'), R._PLAN_RECAP_WINDOW,
+            plan.index('is complete'), _PLAN_RECAP_WINDOW,
             'the recap phrase must sit outside the opening window',
         )
-        self.assertEqual(R.plan_shape_failures(plan), [])
+        self.assertEqual(plan_shape_failures(plan), [])
 
     def test_a_refactor_review_is_scoped_to_the_diff(self) -> None:
         # review-r used to receive the implementation instruction: the
@@ -11419,532 +11038,6 @@ class TestTheLiveCadreCarriesRealArtifacts(_Base):
         )
         self.assertIn('Review the working tree in your mount', msg)
         self.assertNotIn('You are reviewing a REFACTOR', msg)
-
-
-class TestARealPlanSurvivesTheWholeHandoff(unittest.TestCase):
-    """
-    One regression test for the path that has cost four planning cycles.
-
-    Every plan-side defect found so far -- a summary accepted as a
-    design, a recap pattern vetoing a 127KB plan for one substring, the
-    approved text discarded, a horizontal rule lifted as a decision --
-    was found by LOSING A CAMPAIGN, because nothing exercised the
-    handoff with a plan the size and shape a real planner emits.
-
-    So this builds one: numbered sections with cross-references, many
-    named files, a DECISIONS block closed by a rule, and the phrase
-    "is complete" used legitimately deep in the body. It then walks the
-    whole path a plan takes between the approval gate and the builders.
-
-    A change that would reject or mangle a real plan now fails here, in
-    a second, instead of thirty minutes into a campaign.
-    """
-
-    @staticmethod
-    def _realistic_plan() -> str:
-        body = [_plan_text(3000), '']
-        for n in range(1, 18):
-            body += [
-                f'## {n}. Section {n}',
-                f'Covered in §{max(1, n - 1)}; see also §{min(17, n + 1)}.',
-                f'- `acme/component/mod{n}.py` — the {n}th module',
-                f'- `tests/unit/test_mod{n}.py` — its cases',
-                'An invalid input must raise; the test author verifies each.',
-                '',
-            ]
-        body += [
-            '## Work items',
-            '- Cover each declared service, or give a written statement of '
-            'why fewer is complete.',
-            '',
-            '## DECISIONS FOR LATER MODULES:',
-            '',
-            '- **The transport owns its watermark grammar.** An adapter '
-            'must never parse one.',
-            '- **Attestations never enter the success-only table.** They '
-            'are a separate evidence kind.',
-            '',
-            '---',
-            '',
-            '## QUESTIONS:',
-            'None; everything above is settled.',
-        ]
-        return '\n'.join(body)
-
-    def test_it_is_recognised_as_a_plan(self) -> None:
-        self.assertEqual(R.plan_shape_failures(self._realistic_plan()), [])
-
-    def test_it_survives_selection_with_nothing_else_readable(self) -> None:
-        # The live m2-4 shape: an ack consolidation and an empty reply
-        # read. The approved text must come back intact.
-        plan = self._realistic_plan()
-        self.assertEqual(
-            R.select_plan_of_record('The plan is complete.', [], plan), plan
-        )
-
-    def test_its_decisions_lift_cleanly(self) -> None:
-        got = R.parse_decisions(self._realistic_plan())
-        self.assertEqual(len(got), 2)
-        self.assertTrue(
-            all(len(d) > 40 for d in got),
-            f'a rule or separator was lifted as a decision: {got}',
-        )
-
-    def test_a_horizontal_rule_does_not_become_a_decision(self) -> None:
-        # `---` closing a DECISIONS block parsed as a bullet whose text
-        # is `--`, which would land verbatim in the committed ledger
-        # that [m3]-[m7] read.
-        text = (
-            'DECISIONS FOR LATER MODULES:\n'
-            '- **A real decision.** With a reason attached to it.\n'
-            '---\n'
-            '## Next section\n'
-        )
-        self.assertEqual(len(R.parse_decisions(text)), 1)
-
-    def test_it_is_large_enough_to_be_representative(self) -> None:
-        # The defects only appear at real scale; a 400-char fixture
-        # would have passed every one of them.
-        self.assertGreater(len(self._realistic_plan()), 5000)
-
-
-class TestTheRecapCheckOnlyReadsTheOpening(unittest.TestCase):
-    """
-    An acknowledgement LEADS with "the plan is complete". A design plan
-    may mention the phrase once, in passing, on page forty.
-
-    The recap patterns were unanchored, so they vetoed a document of any
-    size for one substring anywhere in it. Measured on the recovered
-    `ingestion-m2-4` plan: 127,683 characters, 52 sections, and the only
-    match was at line 907 of 1,003 -- work item 12's "or a written
-    statement of why fewer is complete". That plan was rejected as an
-    acknowledgement.
-
-    This is very likely what killed that run: the consolidation turn is
-    asked to re-emit the whole plan, and the whole plan contains the
-    phrase. The `approved` fallback added alongside this does NOT cover
-    it -- the approved text carries the same sentence -- so both
-    candidates were rejected for the same false positive.
-
-    The original catch is preserved by construction: the recap it was
-    built for was 1,774 characters, so it lies entirely inside the
-    opening window.
-    """
-
-    _RECAP = (
-        'The plan has been finalized and APPROVED by the user. The plan '
-        'phase is complete. I updated src/core.rs and src/lib.rs.'
-    )
-
-    def test_the_live_recap_is_still_rejected(self) -> None:
-        why = R.plan_shape_failures(self._RECAP)
-        self.assertTrue(
-            any('acknowledgement' in w for w in why),
-            f'the recap this check exists for must stay rejected: {why}',
-        )
-
-    def test_a_recap_padded_past_the_window_is_still_rejected(self) -> None:
-        # Padding an acknowledgement must not buy it a pass; it still
-        # fails the structural checks even if the phrase scrolls away.
-        why = R.plan_shape_failures(self._RECAP + ' Thanks. ' * 400)
-        self.assertNotEqual(why, [])
-
-    def test_a_long_plan_mentioning_the_phrase_late_passes(self) -> None:
-        plan = (
-            _plan_text(6000)
-            + '\n\n## Work items\n'
-            + '- Cover each declared service, or give a written statement '
-              'of why fewer is complete.\n'
-        )
-        self.assertEqual(R.plan_shape_failures(plan), [])
-
-    def test_the_opening_is_still_read(self) -> None:
-        # A plan-shaped body cannot rescue an acknowledgement that opens
-        # by announcing itself.
-        text = 'The plan is now complete.\n\n' + _plan_text(6000)
-        why = R.plan_shape_failures(text)
-        self.assertTrue(any('acknowledgement' in w for w in why))
-
-
-class TestTheApprovedTextIsNeverDiscarded(unittest.TestCase):
-    """
-    The text the HUMAN approved is always a candidate plan of record.
-
-    `_await_plan_approval` already holds it: `wait_for_plan_approval`
-    returns the last assistant message before the approval turn, which
-    is the document the human read and said APPROVED to. It was then
-    passed to nothing, and `select_plan_of_record` judged only the
-    consolidation reply and a SECOND read of the session.
-
-    Cost, live, on `ingestion-m2-4`: the gate returned 128,861
-    characters of approved plan; the consolidation turn answered with an
-    acknowledgement; `read_assistant_replies` came back empty -- it
-    reads a 60-item tail where the approval gate reads 200, and it
-    swallows a read error as `[]`. With no candidate left the run
-    aborted, and the 128,861 characters were discarded while sitting in
-    a local variable. The session was disposed at teardown, so the plan
-    a human had spent the evening on was gone.
-
-    A second read failing must never outrank the text already in hand.
-    """
-
-    @staticmethod
-    def _plan() -> str:
-        return _plan_text(4000)
-
-    def test_the_approved_text_is_used_when_no_reply_is_readable(self):
-        # The live failure: replies empty, consolidation an ack.
-        plan = self._plan()
-        self.assertEqual(
-            R.select_plan_of_record('The plan is complete.', [], plan),
-            plan,
-        )
-
-    def test_it_no_longer_raises_when_the_approved_text_is_a_plan(self):
-        # The regression raised PipelineRunError here, discarding an
-        # approved plan it was holding.
-        plan = self._plan()
-        self.assertEqual(
-            R.select_plan_of_record('Approved and complete.', [], plan),
-            plan,
-        )
-
-    def test_a_compliant_consolidation_still_wins(self) -> None:
-        # The common case must not move: a consolidation turn that
-        # returned the document is still the plan of record.
-        good = self._plan()
-        self.assertEqual(
-            R.select_plan_of_record(good, [], 'ignored'), good
-        )
-
-    def test_it_still_raises_when_nothing_anywhere_is_a_plan(self) -> None:
-        # The guard must keep its teeth: an acknowledgement everywhere
-        # is still fatal, which is the whole reason it exists.
-        with self.assertRaises(R.PipelineRunError):
-            R.select_plan_of_record('done', ['ok'], 'approved, thanks')
-
-    def test_an_absent_approved_text_is_not_a_candidate(self) -> None:
-        with self.assertRaises(R.PipelineRunError):
-            R.select_plan_of_record('done', [], None)
-
-    def test_it_never_outranks_a_later_reply_that_is_a_plan(self) -> None:
-        # It is captured BEFORE the consolidation turn, so it is older
-        # than anything in `replies`. Treating it as the latest
-        # candidate made a pre-Q&A draft beat the revision that
-        # superseded it -- caught by
-        # test_short_ack_recovers_the_real_plan_for_builders.
-        revision = _plan_text(4000, 'the revision')
-        stale = _plan_text(4000, 'the first draft')
-        self.assertEqual(
-            R.select_plan_of_record('done', [stale, revision], stale),
-            revision,
-        )
-
-
-class TestASummaryOfAPlanIsNotAPlan(unittest.TestCase):
-    """
-    A well-formed SUMMARY of a design is not the design.
-
-    The recap check catches a reply that reads as an acknowledgement.
-    It does not catch a reply that is genuinely structured — headings,
-    bullets, file names, real technical content — but whose substance
-    lives in a document it only POINTS AT: "§3 package layout", "§11
-    migration 0002", nine such references and not one of those sections
-    present.
-
-    That passed every structural check and became the plan of record
-    for [m2] attempt 3. Both implementers and the test author were
-    handed 3,006 characters of table of contents; the planner's closing
-    line was "I wrote nothing to disk".
-
-    The signal is that a plan CONTAINS its sections and a summary
-    REFERS to them. Measured over this project's committed plans:
-
-        ingestion-m0                    8 refs, 8 resolved
-        ingestion-m0b                   6 refs, 6 resolved
-        ingestion-m2-attempt-1         14 refs, 14 resolved
-        ingestion-m1 (the acknowledgement)  2 refs, 0 resolved
-        m2-3 planner output             9 refs, 0 resolved
-
-    Every real plan resolves every reference it makes. Both failures
-    resolve none — including the m1 acknowledgement this module already
-    names, found independently by this check.
-    """
-
-    @staticmethod
-    def _numbered(body: str) -> str:
-        return (
-            '## 1. Files\n'
-            '- src/core.rs — the parser\n'
-            '- src/lib.rs — exports it\n'
-            '- tests/parse_test.rs — the cases\n\n'
-            '## 2. Interfaces\n'
-            '`parse` takes a spec and returns whole seconds.\n\n'
-            '## 3. Algorithm\n'
-            '1. Read the spec\n2. Split the units\n3. Sum them\n\n'
-            '## 4. Edge cases\n'
-            'An invalid suffix must fail; a malformed spec raises.\n\n'
-            '## 5. Test strategy\n'
-            'Unit tests cover each fixture.\n\n'
-            + body
-        )
-
-    def test_a_plan_citing_its_own_sections_passes(self) -> None:
-        # The common case: a real plan cross-references itself
-        # constantly, and every reference resolves.
-        text = self._numbered(
-            'The parser in §1 is driven by the algorithm in §3, and '
-            '§4 names the failure modes §5 must cover.\n'
-        ) + 'Detail. ' * 400
-        self.assertEqual(R.plan_shape_failures(text), [])
-
-    def test_a_summary_citing_absent_sections_is_rejected(self) -> None:
-        summary = (
-            'Plan of record released.\n\n'
-            '## What is frozen for the downstream stages\n'
-            '- **Design** — §3 package layout, §4 the core module '
-            'interfaces, §6 the six catalogs, §9 transport and the '
-            'watermark grammar, §11 migration `0002`.\n'
-            '- **Work items 1-25** with mechanical done-criteria.\n'
-            '- **Gates G1-G22**, each with its named mutation.\n'
-            '- The three closed questions (§19) and the fifteen '
-            'departures (§2).\n\n'
-            '## Where the tests stage starts\n'
-            '- Items 2, 3, 7 need no SDK: the allow-list load in '
-            '`catalogs/read_only_sdk_allowlist.yaml`, the transport '
-            'protocol in `acme/component/transport.py`, and the '
-            'watermark ordering property.\n'
-            '- Items 4 and 17 need the pinned fixture on a real '
-            'cluster; invalid input must raise.\n\n'
-            "I wrote nothing to disk - this session is the plan's "
-            'record.\n'
-        ) + 'Everything above is settled and frozen. ' * 60
-        why = R.plan_shape_failures(summary)
-        self.assertTrue(
-            any('section' in w for w in why),
-            f'a summary of a plan must be rejected, got {why}',
-        )
-
-    def test_the_rejection_says_which_sections_are_missing(self) -> None:
-        # The halt has to tell a human what to go get.
-        summary = (
-            '## Summary\n'
-            '- The design is in §3 and §11 of the session.\n'
-            '- Files: `src/core.rs`, `src/lib.rs`, `tests/t.rs`.\n'
-            '- Steps: 1. read 2. split 3. sum\n'
-            '- Edge cases: invalid input raises.\n'
-            '- Test strategy: unit tests per fixture.\n'
-            '- Interfaces: `parse` returns whole seconds.\n'
-            '- Gates: each ships its own mutation.\n'
-            '- Work items: 1 through 25, with done-criteria.\n'
-            '- Escalation: a frozen edit halts the stage.\n'
-        ) + 'Detail. ' * 400
-        why = R.plan_shape_failures(summary)
-        joined = ' '.join(why)
-        self.assertIn('3', joined)
-        self.assertIn('11', joined)
-
-    def test_a_plan_that_cites_no_sections_is_unaffected(self) -> None:
-        # Most plans never write "§" at all. The check must not invent
-        # a requirement to number your headings.
-        self.assertEqual(R.plan_shape_failures(_plan_text(4000)), [])
-
-    def test_a_mostly_resolving_plan_passes(self) -> None:
-        # A real plan may cite the BRIEF's section numbering alongside
-        # its own. Only a document that resolves NOTHING is a summary.
-        text = self._numbered(
-            'Per §7 of the brief, the parser in §1 must reject a '
-            'malformed spec, and §3 says how.\n'
-        ) + 'Detail. ' * 400
-        self.assertEqual(R.plan_shape_failures(text), [])
-
-
-class TestPlanShapeCheck(unittest.TestCase):
-    """A plan is recognised by SHAPE, never by length."""
-
-    def test_a_real_plan_passes(self) -> None:
-        self.assertEqual(R.plan_shape_failures(_plan_text(4000)), [])
-
-    def test_the_live_recap_is_rejected(self) -> None:
-        # Verbatim shape of the reply that became the design of record
-        # for an entire Kubernetes provider. It cleared the old
-        # 1500-char floor by 274 characters.
-        recap = (
-            'The design plan for **`[m4] Kubernetes provider`** has been '
-            'finalized and **APPROVED** by the user.\n\n'
-            '### Final Summary of the Approved Design Plan\n\n'
-            '1. Module architecture\n2. Authentication\n3. Scope '
-            'hierarchy\n4. Identities\n\n'
-            'The plan phase for module `[m4]` is complete.\n'
-        ) + ('padding to clear the old length floor. ' * 40)
-        why = R.plan_shape_failures(recap)
-        self.assertTrue(why)
-        self.assertTrue(
-            any('acknowledgement' in w for w in why), why
-        )
-
-    def test_length_alone_is_never_enough(self) -> None:
-        # The whole point: a long reply that is not a design fails.
-        why = R.plan_shape_failures('words. ' * 3000)
-        self.assertTrue(why)
-
-    def test_a_plan_that_names_no_files_is_rejected(self) -> None:
-        # "The exact files to add or change" is the FIRST thing
-        # templates/planner.md asks for.
-        text = _plan_text(4000).replace('src/core.rs', 'the core module')
-        text = text.replace('src/lib.rs', 'the library root')
-        text = text.replace('tests/parse_test.rs', 'the parser tests')
-        self.assertTrue(
-            any('names' in w and 'file' in w
-                for w in R.plan_shape_failures(text))
-        )
-
-    def test_the_ingestion_m1_acknowledgement_is_rejected(self) -> None:
-        """The reply that became an entire module's plan of record.
-
-        Verbatim shape, and it beat every check that existed: 1,800
-        characters against a 1,500 floor, it names files so the file
-        check passes, and it scores exactly the three word-level
-        signals needed — because an acknowledgement ABOUT a plan reuses
-        the plan's own vocabulary. What it does not do is decompose.
-        """
-        ack = (
-            'Released as the plan of record for [m1].\n\n'
-            '**No files written.** The plan stage is interactive and '
-            'read-only, so the document lives in this transcript for the '
-            'pipeline to publish as `docs/plans/ingestion-m1.md`; I did '
-            'not create it, and I touched nothing in the worktree.\n\n'
-            '**What the tests stage inherits.** Thirteen work items, each '
-            'with done-criteria written to be turned straight into '
-            'failing tests. Three properties must fail when the property '
-            'is removed: deleting the ledger insert must break '
-            'idempotency, moving the checkpoint advance out of the '
-            'transaction must break crash recovery, and a denied-event '
-            'fixture must never produce a tuple.\n\n'
-            '**Four frozen-artifact changes are pre-authorised** and no '
-            'others: the `tests/unit/test_models.py` discovery rewrite, '
-            'the `tests/support/schema.py` consistency check, the '
-            '`acme/component/sdk_allowlist.py` fixes, and the '
-            '`pyproject.toml` promotion. Anything else frozen that '
-            'appears to need changing is a halt-and-escalate.\n\n'
-            '**The single item worth disproportionate attention** is the '
-            'confinement of permission-string construction. Everything '
-            'else can be repaired by a later module; a vocabulary '
-            'divergence cannot. If the tests stage writes only one scan '
-            'test carefully, that is the one.\n\n'
-            'The one thing I did persist is outside the repo: a memory '
-            'note recording that the runner matches guarded paths with '
-            '`fnmatch` rather than `glob`, since `runner.py` is not in '
-            'this repository and that fact cannot be re-derived here. '
-            'Every work item is mapped to at least one test file, and '
-            'the done-criteria are written so the test author can turn '
-            'each straight into a failing test rather than interpreting '
-            'it. Nothing else in the worktree was touched.\n'
-        )
-        self.assertGreater(len(ack), R._PLAN_MIN_CHARS)
-
-        why = R.plan_shape_failures(ack)
-
-        self.assertTrue(why, 'the acknowledgement was accepted as a plan')
-        self.assertTrue(
-            any('heading/bullet/step' in w for w in why), why
-        )
-
-    def test_prose_alone_is_not_a_plan_however_long(self) -> None:
-        # The same failure in its general form: a reply carrying every
-        # word-level signal but no structure is not decomposed, so it
-        # cannot be handed to a test author as a specification.
-        flat = '\n'.join(
-            line.lstrip('#-* 0123456789.)')
-            for line in _plan_text(6000).splitlines()
-        )
-
-        why = R.plan_shape_failures(flat)
-
-        self.assertTrue(
-            any('heading/bullet/step' in w for w in why), why
-        )
-
-    def test_a_plan_with_sections_clears_the_structure_floor(self) -> None:
-        # The other side of it: the check must not reject a real design.
-        # Every published plan on this project carries 100+ such lines.
-        self.assertEqual(R.plan_shape_failures(_plan_text(4000)), [])
-
-    def test_empty_is_rejected(self) -> None:
-        self.assertEqual(R.plan_shape_failures(''), ['it is empty'])
-        self.assertEqual(R.plan_shape_failures(None), ['it is empty'])
-
-
-class TestPlanOfRecordSelection(unittest.TestCase):
-    """A chat acknowledgement must never become the plan of record."""
-
-    def test_substantive_consolidation_is_used(self) -> None:
-        doc = _plan_text(4000, 'FINAL')
-        self.assertIn(
-            'FINAL', R.select_plan_of_record(doc, [_plan_text(3000), doc])
-        )
-
-    def test_short_ack_falls_back_to_the_real_plan(self) -> None:
-        # THE live regression, at the observed sizes: a 371-char "the
-        # plan is released and frozen" blurb replaced a 12,412-char
-        # design and was handed to every builder as the plan.
-        draft = _plan_text(14618, 'DRAFT')
-        plan = _plan_text(12412, 'PLAN')
-        ack = 'The plan is released and frozen. ' * 11
-        replies = [draft, 'just checking in. ' * 130, plan,
-                   'still working on it. ' * 70, ack]
-        self.assertIn('PLAN', R.select_plan_of_record(ack, replies))
-
-    def test_latest_substantive_wins_not_longest(self) -> None:
-        # A post-Q&A revision supersedes the first draft and is often
-        # SHORTER — picking the longest would resurrect the draft.
-        draft = _plan_text(14618, 'DRAFT')
-        revised = _plan_text(12412, 'REVISED')
-        ack = 'The plan is approved. ' * 5
-        self.assertIn(
-            'REVISED', R.select_plan_of_record(ack, [draft, revised, ack])
-        )
-
-    def test_consolidated_plan_shorter_than_the_draft_is_kept(self):
-        # THE live regression: the consolidation turn DID emit a real
-        # "Final Approved Design Plan" (5165), but an earlier verbose
-        # draft (15088) had scaled the old bar to 7544, so it was
-        # discarded for a PRE-approval draft (10276). A consolidated
-        # plan is legitimately shorter than a rambling first draft.
-        draft = _plan_text(15088, 'DRAFT')
-        revised = _plan_text(10276, 'REVISED')
-        final = _plan_text(5165, 'FINAL')
-        self.assertIn(
-            'FINAL',
-            R.select_plan_of_record(final, [draft, revised, 'ok', final]),
-        )
-
-    def test_mid_session_chatter_is_never_promoted(self) -> None:
-        # Once the reply is known NOT to be a plan, a chatty status
-        # update clears any length floor while being nothing like a
-        # design. It has to fail on SHAPE.
-        plan = _plan_text(12412, 'PLAN')
-        chatter = 'I have designed the plan and will now summarise. ' * 40
-        ack = 'The plan is approved. ' * 5
-        self.assertIn(
-            'PLAN', R.select_plan_of_record(ack, [plan, chatter, ack])
-        )
-
-    def test_no_plan_anywhere_halts_the_run(self) -> None:
-        # A plan that does not exist used to be indistinguishable from
-        # one that does, and the run continued into eight agents' worth
-        # of work either way.
-        with self.assertRaises(R.PipelineRunError) as caught:
-            R.select_plan_of_record('the plan is approved', ['hi', 'ok'])
-        self.assertIn('no design plan', str(caught.exception))
-
-    def test_the_halt_says_what_was_wrong(self) -> None:
-        # A refusal that does not say why just moves the mystery.
-        with self.assertRaises(R.PipelineRunError) as caught:
-            R.select_plan_of_record('short', [])
-        msg = str(caught.exception)
-        self.assertIn('planner.md', msg)
-        self.assertIn('characters', msg)
 
 
 class _Usage:
@@ -13133,8 +12226,8 @@ class TestDiskPreflight(_Base):
         # mounts the writer's).
         need = (
             5_000_000_000
-            + 2 * R._VM_DISK_BYTES
-            + 1 * R._WORKTREE_DISK_BYTES
+            + 2 * _VM_DISK_BYTES
+            + 1 * _WORKTREE_DISK_BYTES
         )
         R.preflight_disk(self._cfg(_LINEAR), usage=_Usage(need))
         with self.assertRaises(click.ClickException):
@@ -13144,7 +12237,7 @@ class TestDiskPreflight(_Base):
         # THE gap this closes: room for every microVM, but not for
         # the build trees they mount. The VM-only estimate said yes here
         # and the host filled two modules later.
-        vms_only = 5_000_000_000 + 2 * R._VM_DISK_BYTES
+        vms_only = 5_000_000_000 + 2 * _VM_DISK_BYTES
         R.preflight_disk(
             self._cfg(_LINEAR), usage=_Usage(vms_only), per_worktree_bytes=0
         )
@@ -13175,8 +12268,8 @@ class TestDiskPreflight(_Base):
         cfg = self._cfg(_PER_MODULE)  # 2 modules, 3 VMs + 2 writers each
         one_module = (
             5_000_000_000
-            + 3 * R._VM_DISK_BYTES
-            + 2 * R._WORKTREE_DISK_BYTES
+            + 3 * _VM_DISK_BYTES
+            + 2 * _WORKTREE_DISK_BYTES
         )
         R.preflight_disk(cfg, usage=_Usage(one_module))
         with self.assertRaises(click.ClickException) as ctx:
@@ -13190,8 +12283,8 @@ class TestDiskPreflight(_Base):
         cfg = self._cfg(_LINEAR)
         need = (
             5_000_000_000
-            + 3 * R._VM_DISK_BYTES
-            + 1 * R._WORKTREE_DISK_BYTES
+            + 3 * _VM_DISK_BYTES
+            + 1 * _WORKTREE_DISK_BYTES
         )
         R.preflight_disk(cfg, keep=True, usage=_Usage(need))
 
@@ -15133,70 +14226,6 @@ class TestPartialWorkSalvage(_Base):
         self.assertIn('failed', str(ctx.exception))
 
 
-def _plan_with_decisions(*decisions: str, header: str | None = None) -> str:
-    head = header or 'DECISIONS FOR LATER MODULES:'
-    body = '\n'.join(f'- {d}' for d in decisions)
-    return f'# Module design\n\nprose here\n\n{head}\n{body}\n'
-
-
-class TestParseDecisions(unittest.TestCase):
-    """A decision reached in one module's session reaches no other
-    unless it is lifted out and carried forward."""
-
-    def test_parses_items_in_order(self) -> None:
-        text = _plan_with_decisions('use ULIDs', 'diff in the DB')
-        self.assertEqual(
-            R.parse_decisions(text), ['use ULIDs', 'diff in the DB']
-        )
-
-    def test_tolerates_a_decorated_header(self) -> None:
-        # Models routinely wrap a requested header in ## or ** —
-        # losing the whole block to a stray asterisk would silently
-        # drop the decisions it names.
-        for head in (
-            '## DECISIONS FOR LATER MODULES:',
-            '**DECISIONS FOR LATER MODULES:**',
-            'decisions for later modules',
-        ):
-            with self.subTest(head=head):
-                self.assertEqual(
-                    R.parse_decisions(_plan_with_decisions('x', header=head)),
-                    ['x'],
-                )
-
-    def test_blank_lines_tolerated_prose_ends_the_block(self) -> None:
-        text = (
-            'DECISIONS FOR LATER MODULES:\n'
-            '- one\n'
-            '\n'
-            '- two\n'
-            'Some closing prose.\n'
-            '- not a decision\n'
-        )
-        self.assertEqual(R.parse_decisions(text), ['one', 'two'])
-
-    def test_numbered_items_accepted(self) -> None:
-        text = 'DECISIONS FOR LATER MODULES:\n1. first\n2) second\n'
-        self.assertEqual(R.parse_decisions(text), ['first', 'second'])
-
-    def test_last_header_wins(self) -> None:
-        text = (
-            'DECISIONS FOR LATER MODULES:\n- stale\n\nmore prose\n\n'
-            'DECISIONS FOR LATER MODULES:\n- current\n'
-        )
-        self.assertEqual(R.parse_decisions(text), ['current'])
-
-    def test_absent_or_empty_yields_nothing(self) -> None:
-        # A module that settled nothing cross-cutting is the normal
-        # case, not a failure.
-        self.assertEqual(R.parse_decisions('just a plan'), [])
-        self.assertEqual(R.parse_decisions(''), [])
-        self.assertEqual(R.parse_decisions(None), [])
-        self.assertEqual(
-            R.parse_decisions('DECISIONS FOR LATER MODULES:\n\nprose'), []
-        )
-
-
 class TestCrossModuleContext(_Base):
     """What a per-module planner is told about the OTHER modules."""
 
@@ -15256,7 +14285,7 @@ class TestCrossModuleContext(_Base):
     def test_decisions_from_one_module_reach_the_next(self) -> None:
         _, sc, _ = self._per_module(
             {
-                'm0-plan': _plan_with_decisions('ULIDs for every id'),
+                'm0-plan': plan_with_decisions('ULIDs for every id'),
                 'm1-plan': 'D1',
             }
         )
@@ -15269,14 +14298,14 @@ class TestCrossModuleContext(_Base):
 
     def test_first_module_gets_no_ledger(self) -> None:
         _, sc, _ = self._per_module(
-            {'m0-plan': _plan_with_decisions('x'), 'm1-plan': 'D1'}
+            {'m0-plan': plan_with_decisions('x'), 'm1-plan': 'D1'}
         )
         self.assertNotIn('BINDING', sc.message_for_label('m0-plan'))
 
     def test_ledger_committed_on_each_published_module(self) -> None:
         _, _sc, wt = self._per_module(
             {
-                'm0-plan': _plan_with_decisions('ULIDs everywhere'),
+                'm0-plan': plan_with_decisions('ULIDs everywhere'),
                 'm1-plan': 'D1',
             }
         )
@@ -15304,8 +14333,8 @@ class TestCrossModuleContext(_Base):
     def test_a_repeated_decision_is_recorded_once(self) -> None:
         _, sc, _ = self._per_module(
             {
-                'm0-plan': _plan_with_decisions('one rule'),
-                'm1-plan': _plan_with_decisions('one rule'),
+                'm0-plan': plan_with_decisions('one rule'),
+                'm1-plan': plan_with_decisions('one rule'),
             }
         )
         m1 = sc.message_for_label('m1-plan')
@@ -15315,7 +14344,7 @@ class TestCrossModuleContext(_Base):
         # No modules, no later module to bind: the ledger is inert.
         _, _sc, wt = self._run(
             _LINEAR,
-            {'plan': _plan_with_decisions('x'), 'build': 'b',
+            {'plan': plan_with_decisions('x'), 'build': 'b',
              'review-sec': 'VERDICT: APPROVED'},
         )
         self.assertEqual(
@@ -15762,7 +14791,6 @@ class TestProvisionOnly(_Base):
             by_node['review-sec']['worktree'],
             by_node['build']['worktree'],
         )
-
 
 
 _PUB_TMPL = """\

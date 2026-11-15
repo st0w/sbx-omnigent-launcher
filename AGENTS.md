@@ -28,8 +28,9 @@ declarative multi-agent pipelines. `README.md` explains what it does;
   the code it explains.
 - Never suppress a finding (`noqa`, `type: ignore`, `nosemgrep`): change
   the code so the rule no longer matches, or ask.
-- Tests come first and use `unittest`. `tests/` is not a package, so a
-  test module never imports another.
+- Tests come first and use `unittest`. `tests/` is a package: helpers
+  several test modules share go in `tests/support/`, and a test module
+  never imports another test module. Run tests from the repository root.
 - Use uv, never pip. Pin every new dependency to an exact version at
   least seven days old, and update `uv.lock`.
 - Documentation never contains real filesystem paths: use placeholders
