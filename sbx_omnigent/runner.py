@@ -209,6 +209,39 @@ _UNVERIFIED = 'UNVERIFIED'
 #: Default max review rounds before a gate gives up (blocked).
 _DEFAULT_MAX_ROUNDS = 3
 
+#: Stage kinds that check a writer's branch, and so run again after a
+#: verify-gate fix changes it (see ``PipelineRunner._rechecks_after``).
+_RECHECK_KINDS = frozenset({'review', 'scan', 'verify'})
+
+
+def _depends_on(
+    stage_id: str,
+    target: str,
+    by_id: dict[str, pipeline.PipelineStage],
+) -> bool:
+    """
+    Whether *stage_id* depends on *target*, by ``needs`` or ``from``.
+
+    :param stage_id: The stage to ask about.
+    :param target: The stage it may depend on.
+    :param by_id: The stages to follow edges through.
+    :returns: ``True`` when *target* is upstream of *stage_id*.
+    """
+    seen: set[str] = set()
+    pending = [stage_id]
+    while pending:
+        stage = by_id.get(pending.pop())
+        if stage is None or stage.id in seen:
+            continue
+        seen.add(stage.id)
+        upstream = [*stage.needs]
+        if stage.from_branch:
+            upstream.append(stage.from_branch)
+        if target in upstream:
+            return True
+        pending.extend(upstream)
+    return False
+
 #: How many times a review that produced NO verdict is re-run before
 #: its silence is finally treated as blocking. Cheap compared to the
 #: alternative: a spurious loop-back costs a coder turn AND a full
@@ -3922,7 +3955,7 @@ class PipelineRunner:
                     else:
                         for stage in build:
                             self._exec_top_level(stage)
-                        self._verify_publish_target()
+                        self._verify_publish_target(build)
                         self._publish()
                 finished = True
             except _Blocked as exc:
@@ -4022,7 +4055,7 @@ class PipelineRunner:
             # Gate BEFORE the thread advances: a chunk that cannot pass
             # verification must not become the base every later module
             # is built on.
-            self._verify_winner(winner)
+            self._verify_winner(winner, staged)
             # Advance the campaign thread to this chunk's winner so the
             # next chunk builds on it.
             self._wt.alias_node_branch(self._run_id, 'campaign', winner)
@@ -4340,7 +4373,9 @@ class PipelineRunner:
         with self._lock:
             self._wt.write_run_state(self._run_id, self._state_payload())
 
-    def _verify_winner(self, winner: str) -> None:
+    def _verify_winner(
+        self, winner: str, stages: Sequence[pipeline.PipelineStage]
+    ) -> None:
         """
         Run the mechanical pre-publish gate; loop back until it passes.
 
@@ -4353,10 +4388,14 @@ class PipelineRunner:
         A failure is closed by the writer that PRODUCED the branch (the
         refactor node, typically): it is the only writer that runs after
         an implementation exists, so adding tests there cannot
-        invalidate a competition that already happened. Its review gate
-        then votes again on the changed branch before the gate re-runs.
+        invalidate a competition that already happened. Then every stage
+        after it that checks its branch (review, scan, triage) runs
+        again in pipeline order, on the changed branch, before the gate
+        re-runs (see :meth:`_rechecks_after`).
 
         :param winner: The node whose branch is about to publish.
+        :param stages: The stages that ran, in order: the module's in a
+            campaign, else the build stages.
         :raises PipelineRunError: If the gate cannot be run, cannot be
             fixed by anyone, or still fails after the round cap — in
             every case WITHOUT publishing.
@@ -4407,13 +4446,12 @@ class PipelineRunner:
                 self._verify_findings(spec, outcome, winner),
                 message=f'{fixer}: close the verification gap',
             )
-            gate = self._review_gate_for(fixer)
-            if gate is not None:
-                # The branch changed, so its reviewers must vote again
-                # before the gate re-runs. Clear the completion first —
-                # _exec_stage skips anything already recorded done.
-                self._completed.discard(gate.id)
-                self._exec_stage(gate)
+            # The branch changed, so everything that checked it checks
+            # it again before the gate re-runs. Clear each completion
+            # first: _exec_stage skips anything already recorded done.
+            for stage in self._rechecks_after(fixer, stages):
+                self._completed.discard(stage.id)
+                self._exec_stage(stage)
 
     def _run_verification(
         self, winner: str, spec: pipeline.VerifySpec
@@ -4482,17 +4520,34 @@ class PipelineRunner:
             return winner
         return None
 
-    def _review_gate_for(
-        self, node_id: str
-    ) -> pipeline.PipelineStage | None:
-        """The review stage that gates *node_id*, if any."""
-        for stage in self._stage_by_id.values():
-            if (
-                stage.on_block == node_id
-                and self._stage_kind(stage) == 'review'
-            ):
-                return stage
-        return None
+    def _rechecks_after(
+        self, fixer: str, stages: Sequence[pipeline.PipelineStage]
+    ) -> list[pipeline.PipelineStage]:
+        """
+        The stages that check *fixer*'s branch, in the order they run.
+
+        Every review, scan and triage (``verifies:``) stage that depends
+        on *fixer*, through ``needs`` or ``from``, directly or through
+        other stages. A gate fix changes the branch each of them
+        checked, so each runs again. Only the first review used to,
+        which let a gate fix ship unscanned and untriaged. Writers,
+        judges and readers are left alone: they produce work rather
+        than check it, and re-running a judge could change what ships.
+
+        :param fixer: The writer the gate re-drove.
+        :param stages: The stages that ran, in order.
+        :returns: The stages to run again, in pipeline order.
+        """
+        flat = [
+            stage for stage in pipeline._iter_stages(tuple(stages))
+            if stage.run and not stage.parallel
+        ]
+        by_id = {stage.id: stage for stage in flat}
+        return [
+            stage for stage in flat
+            if self._stage_kind(stage) in _RECHECK_KINDS
+            and _depends_on(stage.id, fixer, by_id)
+        ]
 
     def _verify_findings(
         self,
@@ -4556,8 +4611,14 @@ class PipelineRunner:
             + self._setup_block()
         )
 
-    def _verify_publish_target(self) -> None:
-        """Run the gate on the branch a single-pass run will publish."""
+    def _verify_publish_target(
+        self, stages: Sequence[pipeline.PipelineStage]
+    ) -> None:
+        """
+        Run the gate on the branch a single-pass run will publish.
+
+        :param stages: The stages that ran, in order.
+        """
         if self._config.verify is None:
             return
         node_id = self._resolve_publish_node()
@@ -4566,7 +4627,7 @@ class PipelineRunner:
             return
         branch_node = node.selected if node.kind == 'judge' else node_id
         if branch_node:
-            self._verify_winner(branch_node)
+            self._verify_winner(branch_node, stages)
 
     def _release_completed_session(
         self, stage: pipeline.PipelineStage, kind: str
@@ -7669,9 +7730,12 @@ class PipelineRunner:
             self._completed.add(stage.id)
             return
         agent = stage.run[0]
+        # Always a fresh clone: after a verify-gate fix this stage runs
+        # again, and must read the branch as it now is, not the clone
+        # its first run left behind.
         wt = self._wt.create_node_worktree(
             self._run_id, stage.id, from_node=self._seed_from(stage),
-            replace=self._resume,
+            replace=True,
         )
         session = self._create_session(agent, wt, 'ro', stage.id)
         out = self._drive(
