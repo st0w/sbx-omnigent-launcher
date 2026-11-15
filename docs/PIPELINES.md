@@ -1569,8 +1569,9 @@ verify:
 A gate failure is closed by the writer that PRODUCED the branch, which after a
 judge is the refactor node: it is the only writer running once an
 implementation exists, so tests added there cannot invalidate a competition
-that already happened, and its review stage votes again on the changed branch
-before the gate re-runs. Write an `acceptance:` that forbids that repair — *"the
+that already happened. Then every stage after it that checks its branch runs
+again on the changed branch, in pipeline order, before the gate re-runs. Write
+an `acceptance:` that forbids that repair — *"the
 test suite is frozen after the tests stage"* — and any module below
 `coverage_min` becomes unpublishable: the gate fails, the runner routes the fix
 to the refactor node, and that fix is the thing the reviewers were told to
@@ -1578,6 +1579,17 @@ refuse. Live, this halted a module at review-r with both readings defensible
 and neither actionable. If your contract freezes tests, say which half is
 which — weakening an existing test (changing, deleting, relaxing, skipping) is
 a frozen-artifact change; adding coverage the gate demands is not.
+
+**What runs again after a gate fix.** Every review, `scans:` and `verifies:`
+stage that depends on the fixing writer, through `needs` or `from`, runs again
+in the order the pipeline lists them. In a refactor → bug review → scan →
+triage pipeline that's all three, so a gate fix is bug-reviewed, scanned and
+triaged like the refactor's first version, and the scan records a new round.
+If one of them blocks, it sends the fix back as it would have the first time,
+within its own round cap. Writers, judges and readers don't run again: they
+produce work rather than check it, and re-running a judge could change which
+branch ships. Neither do stages that check a different branch, such as the
+other candidate's review in a race.
 
 ### Declared egress
 

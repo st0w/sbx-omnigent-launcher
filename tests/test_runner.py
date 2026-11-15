@@ -14037,6 +14037,183 @@ def _outcome(ok, code=0, output='', timed_out=False):
     )
 
 
+#: _SCANNED_PIPELINE with triage after the scan and a verify gate.
+_GATED_SCAN = _SCANNED_PIPELINE.replace(
+    'publish: local\n',
+    'publish: local\n'
+    'verify:\n'
+    '  coverage_min: 95\n'
+    '  command: cov --fail-under {coverage_min}\n',
+).replace(
+    '  sec: {template: security-reviewer, model: claude-mythos-5-2}\n',
+    '  sec: {template: security-reviewer, model: claude-mythos-5-2}\n'
+    '  tri: {template: verifier, model: claude-sonnet-5}\n',
+).replace(
+    '  - {id: scan, run: sec, scans: build, needs: [review], '
+    'on_block: build}\n',
+    '  - {id: scan, run: sec, scans: build, needs: [review], '
+    'on_block: build}\n'
+    '  - {id: triage, run: tri, verifies: findings, from: build, '
+    'needs: [scan]}\n',
+)
+
+#: Two candidates, each with its own review, and a judge whose pick is
+#: what publishes and is gated.
+_GATED_RACE = """\
+name: race
+repo: ./proj
+publish:
+  mode: local
+  branch: pick
+verify:
+  coverage_min: 95
+  command: cov --fail-under {coverage_min}
+task: |
+  implement parse_ports
+acceptance: |
+  handles ranges
+agents:
+  ca: {template: coder, model: claude-sonnet-5}
+  cb: {template: coder, model: claude-sonnet-5}
+  jg: {template: judge, model: claude-opus-4-8}
+  sec: {template: security-reviewer, model: claude-fable-5}
+stages:
+  - id: impl
+    parallel:
+      - {id: impl-a, run: ca, write: true}
+      - {id: impl-b, run: cb, write: true}
+  - id: review-a
+    run: [sec]
+    needs: [impl-a]
+    gate: consensus
+    on_block: impl-a
+  - id: review-b
+    run: [sec]
+    needs: [impl-b]
+    gate: consensus
+    on_block: impl-b
+  - {id: pick, run: jg, needs: [impl-a, impl-b], selects: branch}
+"""
+
+
+class TestAGateFixIsCheckedAgainInOrder(_Base):
+    """
+    When the verify gate fails, the writer that produced the branch
+    fixes it, and every stage after that writer that checks its branch
+    (bug review, security scan, triage) runs again in pipeline order
+    before the gate re-runs. Before this only the first review ran
+    again, so a gate fix shipped unscanned and untriaged.
+    """
+
+    _REPLIES: ClassVar[dict[str, str]] = {
+        **_SCAN_REPLIES, 'triage': 'nothing further to add',
+    }
+
+    def _go(self, scans, gates, *, text=_GATED_SCAN, replies=None):
+        sc = FakeSC(dict(replies or self._REPLIES))
+        sc.raw_writer_replies = True
+        wt = FakeWT()
+        reports = [
+            _scan_report(jsonl, f'20261114-12000{i}')
+            for i, jsonl in enumerate(scans, start=1)
+        ]
+        outcomes = list(gates)
+
+        def scan(_worktree):
+            return reports.pop(0) if len(reports) > 1 else reports[0]
+
+        def gate(**_kwargs):
+            return outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
+
+        with mock.patch.object(
+            R.security_scan, 'collect_report', side_effect=scan
+        ), mock.patch.object(
+            R.verify, 'run_verification', side_effect=gate
+        ) as gate_calls, mock.patch('sbx_omnigent.runner.click.echo'):
+            result = self._run(text, {}, sc=sc, wt=wt)[0]
+        return result, sc, wt, gate_calls
+
+    @staticmethod
+    def _order(sc, labels):
+        return [
+            sc._label[s] for s, _m in sc.sent if sc._label[s] in labels
+        ]
+
+    _STAGES = ('build', 'review-bugs', 'scan', 'triage')
+
+    def test_review_scan_and_triage_run_again_in_order(self) -> None:
+        result, sc, _wt, gate = self._go(
+            [_scan_jsonl('MEDIUM')],
+            [_outcome(False, 2, 'lines 71% < 95%'), _outcome(True)],
+        )
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(gate.call_count, 2)
+        self.assertEqual(self._order(sc, self._STAGES), [*self._STAGES] * 2)
+
+    def test_a_passing_gate_runs_nothing_again(self) -> None:
+        _r, sc, _wt, gate = self._go(
+            [_scan_jsonl('MEDIUM')], [_outcome(True)]
+        )
+        self.assertEqual(gate.call_count, 1)
+        self.assertEqual(self._order(sc, self._STAGES), [*self._STAGES])
+
+    def test_the_scan_records_a_new_round(self) -> None:
+        _r, _sc, wt, _gate = self._go(
+            [_scan_jsonl('MEDIUM')],
+            [_outcome(False, 2, 'short'), _outcome(True)],
+        )
+        self.assertIn('reviews/scan-sec-r2.md', wt.artifacts)
+
+    def test_triage_reads_a_fresh_clone_of_the_fixed_branch(self) -> None:
+        _r, _sc, wt, _gate = self._go(
+            [_scan_jsonl('MEDIUM')],
+            [_outcome(False, 2, 'short'), _outcome(True)],
+        )
+        self.assertEqual(wt.node_from['triage'], 'build')
+        self.assertTrue(wt.replaced['triage'])
+
+    def test_a_scan_that_blocks_on_the_fix_is_fixed_before_the_gate(
+        self,
+    ) -> None:
+        result, sc, _wt, gate = self._go(
+            [_scan_jsonl('MEDIUM'), _scan_jsonl('HIGH'),
+             _scan_jsonl('MEDIUM')],
+            [_outcome(False, 2, 'short'), _outcome(True)],
+        )
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(gate.call_count, 2)
+        self.assertEqual(
+            self._order(sc, self._STAGES),
+            ['build', 'review-bugs', 'scan', 'triage',
+             'build', 'review-bugs', 'scan',
+             'build', 'review-bugs', 'scan', 'triage'],
+        )
+
+    def test_stages_that_check_another_branch_are_left_alone(self) -> None:
+        _r, sc, _wt, gate = self._go(
+            [''],
+            [_outcome(False, 2, 'short'), _outcome(True)],
+            text=_GATED_RACE,
+            replies={
+                'impl-a': 'A\n\nWORK COMPLETE',
+                'impl-b': 'B\n\nWORK COMPLETE',
+                'review-a-sec': 'VERDICT: APPROVED',
+                'review-b-sec': 'VERDICT: APPROVED',
+                'pick': 'SELECT: impl-a',
+            },
+        )
+        self.assertEqual(gate.call_count, 2)
+        counts = {
+            label: self._order(sc, (label,)).count(label)
+            for label in ('impl-a', 'impl-b', 'review-a-sec',
+                          'review-b-sec', 'pick')
+        }
+        self.assertEqual(counts, {
+            'impl-a': 2, 'impl-b': 1, 'review-a-sec': 2,
+            'review-b-sec': 1, 'pick': 1,
+        })
+
+
 class TestChunkWorktreeReclaim(_Base):
     """A published chunk's clones are dead weight — keeping them makes
     disk cost cumulative across a campaign."""
