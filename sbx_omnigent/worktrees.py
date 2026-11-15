@@ -60,6 +60,10 @@ _SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9._-]+$')
 GIT_PROBE_EXCLUDE = '/mtime-test-*/'
 
 
+#: The directory under the canonical root that holds the bundles of
+#: implementations a judge did not choose.
+RETAINED_DIR = '_retained'
+
 #: A git object id, short or full, SHA-1 or SHA-256.
 _OBJECT_ID_RE = re.compile(r'[0-9a-f]{7,64}')
 
@@ -2328,7 +2332,7 @@ class WorktreeManager:
         ``_retained`` would otherwise have collided with this directory
         and taken every retained bundle with it at teardown.
         """
-        return os.path.join(self._canonical_root, '_retained')
+        return os.path.join(self._canonical_root, RETAINED_DIR)
 
     def retained_bundle_path(self, run_id: str, node_id: str) -> str:
         """

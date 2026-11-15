@@ -84,6 +84,7 @@ from sbx_omnigent.swarm_session import (
     looks_like_rate_limit,
 )
 from sbx_omnigent.worktrees import (
+    RETAINED_DIR,
     WorktreeManager,
     github_slug,
     pr_number,
@@ -2677,13 +2678,37 @@ def render_judge_decision(
                 '### The implementation(s) not chosen',
                 '',
                 'Kept as git bundles — they are complete, reviewed and '
-                'test-passing, and this is the only copy. Restore one '
-                'with `git fetch <bundle> '
+                'test-passing, and this is the only copy. Each is under '
+                "the runner's `--canonical-root`, on the machine that ran "
+                'it. Restore one with `git fetch <bundle> '
                 'refs/heads/<branch>:refs/heads/<name>`.',
                 '',
             ]
-            parts += [f'- `{node}` — `{path}`' for node, path in pick.retained]
+            parts += [
+                f'- `{node}` — `{retained_bundle_ref(path)}`'
+                for node, path in pick.retained
+            ]
     return '\n'.join(parts) + '\n'
+
+
+def retained_bundle_ref(path: str) -> str:
+    """
+    A retained bundle's path relative to the canonical root.
+
+    The selection record and the PR description are published, so they
+    must not carry the runner host's own directories. The full path
+    stays in the console and the run state, on that host.
+
+    :param path: The bundle's absolute path, e.g.
+        ``/<canonical root>/_retained/<run>/<node>.bundle``.
+    :returns: ``_retained/<run>/<node>.bundle``, or the file name alone
+        for a bundle outside that tree.
+    """
+    parts = PurePosixPath(path).parts
+    if RETAINED_DIR in parts:
+        tail = parts[len(parts) - 1 - parts[::-1].index(RETAINED_DIR):]
+        return str(PurePosixPath(*tail))
+    return PurePosixPath(path).name
 
 
 def render_turn_capture(
@@ -3199,10 +3224,14 @@ def _pr_selection_lines(
         parts += [
             '',
             'The implementation(s) not chosen were kept for comparison '
-            '(complete, reviewed, and the only copy):',
+            '(complete, reviewed, and the only copy), under the '
+            "runner's `--canonical-root` on the machine that ran it:",
             '',
         ]
-        parts += [f'- `{node}` — `{path}`' for node, path in kept]
+        parts += [
+            f'- `{node}` — `{retained_bundle_ref(path)}`'
+            for node, path in kept
+        ]
     if pick_doc:
         parts += ['', f'The judge reasoning in full: `{pick_doc}`']
     return parts
