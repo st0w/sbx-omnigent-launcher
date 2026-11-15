@@ -119,6 +119,32 @@ SWAP_HOSTS: tuple[str, ...] = (
     'www.googleapis.com',
 )
 
+#: Locations whose Vertex AI host is already in :data:`SWAP_HOSTS`.
+_COVERED_LOCATIONS = frozenset({'us', 'eu', 'global'})
+
+#: A GCP location, e.g. ``us-central1``.
+_LOCATION_RE = re.compile(r'[a-z][a-z0-9]*(?:-[a-z0-9]+)*')
+
+
+def swap_hosts_for(location: str | None) -> tuple[str, ...]:
+    """
+    The hosts an agy VM's swap secret covers, for its GCP location.
+
+    :data:`SWAP_HOSTS`, plus ``<location>-aiplatform.googleapis.com``
+    for a regional location, which is the Vertex AI host agy calls
+    there. The multi-region and global locations need nothing extra.
+
+    :param location: ``sandbox.sbx.agy_gcp_location``; ``None`` is the
+        default, ``us``.
+    :returns: The hosts.
+    :raises ValueError: If *location* is not a GCP location name.
+    """
+    if location is None or location in _COVERED_LOCATIONS:
+        return SWAP_HOSTS
+    if not _LOCATION_RE.fullmatch(location):
+        raise ValueError(f'not a GCP location: {location!r}')
+    return (*SWAP_HOSTS, f'{location}-aiplatform.googleapis.com')
+
 #: Minimal STEADY-STATE egress for the trusted box (Stage 0): refresh +
 #: the ``agy models`` backend. Everything else is deniable post-login.
 TRUSTED_BOX_EGRESS: tuple[str, ...] = (
@@ -191,6 +217,11 @@ HARVEST_LOG = Path.home() / '.sbx-swarm' / 'agy-harvest.log'
 #: harvester running at all, so the secret's token has expired and every
 #: agy turn dies unauthenticated.
 MAX_SWAP_AGE_S = DEFAULT_INTERVAL_S * 1.5
+
+#: How long a new agy VM waits for a fresh token before its launch
+#: fails: about one refresh on a box that is up, which covers a server
+#: whose harvester is still on its first cycle.
+FIRST_REFRESH_WAIT_S = 180.0
 
 
 class AgyHarvestError(RuntimeError):
@@ -1083,14 +1114,105 @@ def poke_command(
     ]
 
 
+#: Markers the in-box token read prints first.
+_READ_OK = 'AGY_READ_OK'
+_READ_NOFILE = 'AGY_READ_NOFILE'
+
+#: Prints the box's token file after a marker. Reads only: it never
+#: runs agy, so it never refreshes (:meth:`Harvester.current_token`).
+_READ_SCRIPT = """\
+import os, sys
+path = os.path.expanduser({token_file!r})
+try:
+    with open(path, encoding='utf-8') as handle:
+        body = handle.read()
+except FileNotFoundError:
+    print({nofile!r})
+    sys.exit(0)
+print({ok!r})
+sys.stdout.write(body)
+"""
+
+
+def read_token_command(box: str, *, token_file: str = TOKEN_FILE) -> list[str]:
+    """
+    The ``sbx exec`` argv that prints the trusted box's token file.
+
+    :param box: Trusted-box sandbox name.
+    :param token_file: In-box token path.
+    :returns: Full argv for :func:`subprocess.run`.
+    """
+    return [
+        'sbx', 'exec', box, 'python3', '-c',
+        _READ_SCRIPT.format(
+            token_file=token_file, ok=_READ_OK, nofile=_READ_NOFILE
+        ),
+    ]
+
+
+def install_swap_secret(
+    sandbox: str,
+    *,
+    hosts: Sequence[str] = SWAP_HOSTS,
+    box: str = TRUSTED_BOX_DEFAULT,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    echo: Callable[[str], None] = click.echo,
+    stamp_path: Path | None = None,
+    wait: Callable[..., bool] | None = None,
+    deadline_s: float = FIRST_REFRESH_WAIT_S,
+) -> None:
+    """
+    Give a new agy VM its own swap secret, before its host starts.
+
+    With the token the trusted box holds now, read rather than poked.
+    The harvester rewrites the secret every cycle from then on, and
+    ``sbx rm`` deletes it with the VM (#130).
+
+    :param sandbox: The agy VM.
+    :param hosts: The hosts its secret covers (:func:`swap_hosts_for`).
+    :param box: Trusted-box sandbox name.
+    :param run: Process runner; ``None`` runs the real one.
+    :param echo: Line logger.
+    :param stamp_path: Harvest stamp; ``None`` uses the default.
+    :param wait: Freshness waiter (injected in tests).
+    :param deadline_s: How long to wait for a fresh token.
+    :raises AgyReloginNeeded: If the box has no token file.
+    :raises AgyHarvestError: If no harvester has refreshed the token
+        recently, or it cannot be read or installed.
+    """
+    age = harvest_age_s(path=stamp_path)
+    if (age is None or age > MAX_SWAP_AGE_S) and not (
+        wait or wait_for_fresh_swap
+    )(deadline_s=deadline_s, stamp_path=stamp_path):
+        raise AgyHarvestError(
+            f'no fresh agy token to give {sandbox!r}: no harvester has '
+            f'refreshed it in the last {int(MAX_SWAP_AGE_S // 60)} '
+            f'minutes. See {HARVEST_LOG}; if it says RE-LOGIN REQUIRED, '
+            f"run 'sbx exec -it {box} agy', then /login."
+        )
+    harvester = Harvester(
+        box=box, run=run or _run_subprocess, echo=echo,
+        stamp_path=stamp_path,
+    )
+    harvester.update_secret(
+        harvester.current_token(), sandbox=sandbox, hosts=hosts
+    )
+
+
 def set_custom_argv(
     *,
+    sandbox: str,
     placeholder: str = PLACEHOLDER_TOKEN,
     env: str = SWAP_ENV,
     hosts: Sequence[str] = SWAP_HOSTS,
 ) -> list[str]:
     """
-    Build the ``sbx secret set-custom`` argv for the swap secret.
+    The ``sbx secret set-custom`` argv for one agy VM's swap secret.
+
+    Scoped to that VM with ``--sandbox``: a global secret is usable from
+    every sandbox on the machine, Claude and Codex VMs included (#130).
+    Each agy VM gets its own at launch, and the harvester rewrites every
+    one each cycle; ``sbx rm`` deletes it with the VM.
 
     Deliberately **omits** ``--value``: the token comes on **stdin**
     (``set-custom`` reads it from its hidden prompt when the flag is
@@ -1098,9 +1220,9 @@ def set_custom_argv(
     **fixed** ``--placeholder`` makes re-runs *update in place* (same
     entry, new value) rather than pile up duplicate placeholders; the
     host list is replaced too (checked on sbx v0.46.0), so a narrowed
-    list takes effect on the next refresh. Global, sbx's default; ``-g``
-    is deprecated as of sbx v0.46.0 and no longer passed.
+    list takes effect on the next refresh.
 
+    :param sandbox: The agy VM the secret is for.
     :param placeholder: The fixed placeholder token (must equal what agy
         agent VMs emit).
     :param env: sbx env var to pin the placeholder to.
@@ -1108,15 +1230,91 @@ def set_custom_argv(
     :returns: The argv (feed the token via ``input=`` on
         :func:`subprocess.run`).
     :raises ValueError: If *hosts* is empty (a secret with no target
-        would silently swap nothing).
+        would silently swap nothing), or *sandbox* is not a sandbox
+        name.
     """
     if not hosts:
         raise ValueError('set_custom_argv requires at least one host')
-    argv = ['sbx', 'secret', 'set-custom']
+    if not _SANDBOX_NAME_RE.fullmatch(sandbox):
+        raise ValueError(f'not a sandbox name: {sandbox!r}')
+    argv = ['sbx', 'secret', 'set-custom', '--sandbox', sandbox]
     for host in hosts:
         argv += ['--host', host]
     argv += ['--env', env, '--placeholder', placeholder]
     return argv
+
+
+#: The argv that lists every secret sbx holds, values masked.
+LIST_SECRETS_ARGV: tuple[str, ...] = ('sbx', 'secret', 'ls', '--json')
+
+#: An exact host name: no wildcard, no scheme, no port.
+_HOST_LABEL = r'[a-z0-9](?:[a-z0-9-]*[a-z0-9])?'
+_HOST_RE = re.compile(rf'{_HOST_LABEL}(?:\.{_HOST_LABEL})+')
+
+#: A sandbox name sbx accepts, safe to pass as an argument.
+_SANDBOX_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+
+
+def swap_secret_scopes(
+    listing: str, *, placeholder: str = PLACEHOLDER_TOKEN
+) -> tuple[list[tuple[str, tuple[str, ...]]], bool]:
+    """
+    The swap secrets that exist, from ``sbx secret ls --json``.
+
+    sbx is the registry of live agy VMs: each has a secret scoped to it
+    carrying the swap placeholder, and ``sbx rm`` deletes it with the
+    VM. Secrets with any other placeholder are not ours.
+
+    :param listing: The command's output.
+    :param placeholder: The swap placeholder.
+    :returns: ``(sandbox, hosts)`` for each scoped swap secret, in
+        listing order, and whether a global one exists (left from
+        before secrets were scoped).
+    :raises AgyHarvestError: If the listing is not the shape sbx prints,
+        a scope is not a sandbox name, or a secret's hosts are not a
+        list of exact host names.
+    """
+    try:
+        data = json.loads(listing)
+    except ValueError as exc:
+        raise AgyHarvestError(
+            f'sbx secret ls --json printed something that is not JSON: '
+            f'{detail(listing)}'
+        ) from exc
+    secrets = data.get('custom_secrets') if isinstance(data, dict) else None
+    if not isinstance(secrets, list) or not all(
+        isinstance(item, dict) for item in secrets
+    ):
+        raise AgyHarvestError(
+            'sbx secret ls --json has no list of custom secrets'
+        )
+    sandboxes: list[tuple[str, tuple[str, ...]]] = []
+    has_global = False
+    for item in secrets:
+        if item.get('placeholder') != placeholder:
+            continue
+        scope = item.get('scope')
+        if scope == 'global':
+            has_global = True
+            continue
+        if not (isinstance(scope, str) and _SANDBOX_NAME_RE.fullmatch(scope)):
+            raise AgyHarvestError(
+                f'a swap secret has a scope that is not a sandbox name: '
+                f'{scope!r}'
+            )
+        targets = item.get('targets')
+        if not (
+            isinstance(targets, list) and targets
+            and all(
+                isinstance(t, str) and _HOST_RE.fullmatch(t) for t in targets
+            )
+        ):
+            raise AgyHarvestError(
+                f'the swap secret of {scope!r} does not name exact hosts: '
+                f'{targets!r}'
+            )
+        sandboxes.append((scope, tuple(targets)))
+    return sandboxes, has_global
 
 
 def _classify_poke(stdout: str) -> str:
@@ -1207,7 +1405,6 @@ class Harvester:
     box: str = TRUSTED_BOX_DEFAULT
     placeholder: str = PLACEHOLDER_TOKEN
     env: str = SWAP_ENV
-    hosts: tuple[str, ...] = SWAP_HOSTS
     interval_s: float = DEFAULT_INTERVAL_S
     poke_timeout_s: float = DEFAULT_POKE_TIMEOUT_S
     run: Callable[..., subprocess.CompletedProcess[str]] = _run_subprocess
@@ -1216,11 +1413,73 @@ class Harvester:
     #: Freshness stamp written after each successful cycle; ``None``
     #: uses :data:`HARVEST_STAMP` (injected in tests).
     stamp_path: Path | None = None
+    #: Whether a leftover global swap secret was reported already.
+    _warned_global: bool = field(default=False, init=False, repr=False)
 
     #: Extra wall-clock margin over the in-box timeout for the outer
     #: ``sbx exec`` (box auto-start + transport), so the host-side call
     #: doesn't time out before the in-box one reports.
     _EXEC_MARGIN_S: ClassVar[float] = 60.0
+
+    def _exec_in_box(
+        self, argv: list[str]
+    ) -> subprocess.CompletedProcess[str]:
+        """
+        Run *argv* against the trusted box, recovering a lost workspace.
+
+        A workspace that vanished under the box is not an agy problem
+        and needs no human: restore the placeholder and retry ONCE.
+        Once only — a second identical failure means something else is
+        wrong, and a loop would just bury it.
+
+        :param argv: The ``sbx exec`` argv to run.
+        :returns: The completed process (any return code).
+        :raises AgyHarvestError: On timeout, or if sbx cannot be run.
+        """
+        proc = self._exec_poke(argv)
+        if proc.returncode != 0:
+            restored = restore_missing_workspace(proc.stderr or '')
+            if restored is not None:
+                self.echo(
+                    f'[agy-harvest] {self.box!r} lost its workspace '
+                    f'placeholder ({restored}) — recreated it; retrying.'
+                )
+                proc = self._exec_poke(argv)
+        return proc
+
+    def current_token(self) -> str:
+        """
+        The access token the trusted box holds now, without a refresh.
+
+        Only the harvester refreshes the box: two refreshers race on
+        its token file. This reads it, which is safe at any moment: the
+        token read is either the newest or the one before it, and the
+        harvester replaces it long before it expires.
+
+        :returns: The real access token (never logged raw).
+        :raises AgyReloginNeeded: If the box has no token file.
+        :raises AgyHarvestError: If the box cannot be read, or what it
+            holds is not a token file.
+        """
+        proc = self._exec_in_box(read_token_command(self.box))
+        if proc.returncode != 0:
+            raise AgyHarvestError(
+                f'sbx exec on {self.box!r} failed (rc={proc.returncode}): '
+                f'{detail(proc.stderr or "")}'
+            )
+        head, _, body = (proc.stdout or '').partition('\n')
+        if head.strip() == _READ_NOFILE:
+            raise AgyReloginNeeded(
+                f'trusted box {self.box!r} has no token file — run '
+                f"'agy /login' on it"
+            )
+        if head.strip() != _READ_OK:
+            raise AgyHarvestError(
+                f'unrecognized output reading the token on {self.box!r}: '
+                f'{detail(proc.stdout or "")}'
+            )
+        access, _expiry = parse_access_token(body)
+        return access
 
     def _exec_poke(
         self, argv: list[str]
@@ -1262,19 +1521,7 @@ class Harvester:
         :raises AgyHarvestError: For any other poke/parse failure.
         """
         argv = poke_command(self.box, timeout_s=self.poke_timeout_s)
-        proc = self._exec_poke(argv)
-        if proc.returncode != 0:
-            # A workspace that vanished under the box is not an agy
-            # problem and needs no human: restore the placeholder and
-            # retry ONCE. Once only — a second identical failure means
-            # something else is wrong, and a loop would just bury it.
-            restored = restore_missing_workspace(proc.stderr or '')
-            if restored is not None:
-                self.echo(
-                    f'[agy-harvest] {self.box!r} lost its workspace '
-                    f'placeholder ({restored}) — recreated it; retrying.'
-                )
-                proc = self._exec_poke(argv)
+        proc = self._exec_in_box(argv)
         if proc.returncode != 0:
             raise AgyHarvestError(
                 f'sbx exec on {self.box!r} failed (rc={proc.returncode}): '
@@ -1316,18 +1563,25 @@ class Harvester:
             f'unrecognized poke output from {self.box!r}: {detail(tail)}'
         )
 
-    def update_secret(self, token: str) -> None:
+    def update_secret(
+        self, token: str, *, sandbox: str,
+        hosts: Sequence[str] = SWAP_HOSTS,
+    ) -> None:
         """
-        Write *token* into the swap secret's value via ``set-custom``.
+        Write *token* into one agy VM's swap secret via ``set-custom``.
 
         The token is passed on **stdin** (never argv). The fixed
-        placeholder makes this update the existing secret in place.
+        placeholder makes this update the VM's secret in place, or
+        create it if the VM has none yet.
 
         :param token: Real access token to install as the swap value.
+        :param sandbox: The agy VM.
+        :param hosts: The hosts the secret covers.
         :raises AgyHarvestError: If ``set-custom`` exits non-zero.
         """
         argv = set_custom_argv(
-            placeholder=self.placeholder, env=self.env, hosts=self.hosts
+            sandbox=sandbox, placeholder=self.placeholder, env=self.env,
+            hosts=hosts,
         )
         try:
             proc = self.run(
@@ -1352,6 +1606,78 @@ class Harvester:
                 f'{detail(proc.stderr or "")}'
             )
 
+    def swap_sandboxes(
+        self,
+    ) -> tuple[list[tuple[str, tuple[str, ...]]], bool]:
+        """
+        The agy VMs holding a swap secret, and whether a global one is
+        left over.
+
+        :returns: See :func:`swap_secret_scopes`.
+        :raises AgyHarvestError: If the listing fails or is unreadable.
+        """
+        argv = list(LIST_SECRETS_ARGV)
+        try:
+            proc = self.run(
+                argv, capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=sbx_cli.MANAGE_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise AgyHarvestError(
+                sbx_cli.not_responding_message(
+                    argv, sbx_cli.MANAGE_TIMEOUT_S
+                )
+            ) from exc
+        except OSError as exc:
+            raise AgyHarvestError(
+                f'could not exec sbx secret ls: {exc}'
+            ) from exc
+        if proc.returncode != 0:
+            raise AgyHarvestError(
+                f'sbx secret ls failed (rc={proc.returncode}): '
+                f'{detail(proc.stderr or "")}'
+            )
+        return swap_secret_scopes(
+            proc.stdout or '', placeholder=self.placeholder
+        )
+
+    def update_secrets(self, token: str) -> int:
+        """
+        Write *token* into every agy VM's swap secret.
+
+        Only the value changes: each VM keeps the hosts its launch chose
+        (see :func:`swap_hosts_for`). One VM that cannot be updated
+        (say, removed since the listing) is reported and does not stop
+        the rest. A global swap secret
+        left from before secrets were scoped is never written, and is
+        reported once with the command that removes it.
+
+        :param token: Real access token to install.
+        :returns: How many VMs were updated.
+        :raises AgyHarvestError: If the secrets cannot be listed.
+        """
+        sandboxes, has_global = self.swap_sandboxes()
+        if has_global and not self._warned_global:
+            self._warned_global = True
+            self.echo(
+                '[agy-harvest] a GLOBAL swap secret still exists, so every '
+                'sandbox can use the Google token on the swap hosts. Each '
+                'agy VM now has its own; remove the global one with: '
+                f'sbx secret rm --placeholder {self.placeholder} -f'
+            )
+        updated = 0
+        for sandbox, hosts in sandboxes:
+            try:
+                self.update_secret(token, sandbox=sandbox, hosts=hosts)
+            except AgyHarvestError as exc:
+                self.echo(
+                    f'[agy-harvest] could not refresh the swap secret of '
+                    f'{sandbox!r}: {exc}'
+                )
+                continue
+            updated += 1
+        return updated
+
     def cycle_once(self) -> str:
         """
         Run one full harvest cycle: poke → update secret → stamp.
@@ -1366,7 +1692,7 @@ class Harvester:
             :meth:`update_secret` (including :class:`AgyReloginNeeded`).
         """
         token = self.poke()
-        self.update_secret(token)
+        self.update_secrets(token)
         fingerprint = redact(token)
         record_harvest(fingerprint, path=self.stamp_path)
         return fingerprint
@@ -1456,13 +1782,6 @@ def cli() -> None:
 )
 @click.option('--env', default=SWAP_ENV, show_default=True)
 @click.option(
-    '--host', 'hosts', multiple=True,
-    help=(
-        'Swap secret host scope (repeatable); default: '
-        f'{", ".join(SWAP_HOSTS)}.'
-    ),
-)
-@click.option(
     '--interval', 'interval_s', type=float, default=DEFAULT_INTERVAL_S,
     show_default=True, help='Seconds between successful refreshes.',
 )
@@ -1475,7 +1794,7 @@ def cli() -> None:
     help='Run a single cycle then exit (verification/cron mode).',
 )
 def harvest(
-    box: str, placeholder: str, env: str, hosts: tuple[str, ...],
+    box: str, placeholder: str, env: str,
     interval_s: float, poke_timeout_s: float, once: bool,
 ) -> None:
     """
@@ -1495,7 +1814,6 @@ def harvest(
         box=box,
         placeholder=placeholder,
         env=env,
-        hosts=tuple(hosts) or SWAP_HOSTS,
         interval_s=interval_s,
         poke_timeout_s=poke_timeout_s,
     )
@@ -1540,10 +1858,9 @@ def bootstrap(
     Stand up the locked-down trusted box and guide the one-time login.
 
     Creates an isolated ``sbx`` sandbox (empty workspace, not an
-    Omnigent host), applies its login-capable egress allowlist, seeds
-    the swap secret with the inert placeholder, and prints the one-time
-    ``agy /login`` steps. Browser login is interactive — this cannot
-    complete it, only prepare for it.
+    Omnigent host), applies its login-capable egress allowlist, and
+    prints the one-time ``agy /login`` steps. Browser login is
+    interactive — this cannot complete it, only prepare for it.
     """
     if image is None:
         image = DEFAULT_HOST_IMAGE
@@ -1567,11 +1884,8 @@ def bootstrap(
         action=f'apply login egress allowlist to {box!r}',
         timeout_s=sbx_cli.MANAGE_TIMEOUT_S,
     )
-    # Seed the swap secret with the inert placeholder value so the entry
-    # exists (harvest then updates its value). Placeholder-as-value is
-    # harmless: no agent can authenticate until harvest installs a real
-    # token, which is the intended gate.
-    Harvester(box=box).update_secret(PLACEHOLDER_TOKEN)
+    # No swap secret here: each agy VM gets its own at launch, scoped to
+    # it, and a global one would be usable from every sandbox (#130).
 
     click.echo(
         '\n'.join(
@@ -1582,8 +1896,8 @@ def bootstrap(
                 f'      sbx exec -it {box} agy',
                 "      then run '/login' in agy and complete the browser "
                 'consent.',
-                '  After login succeeds, start the harvester:',
-                f'      omni-sbx-agy harvest --box {box}',
+                '  After login succeeds, start the server with '
+                'sandbox.sbx.agy_enabled: true; it runs the harvester.',
                 '  (Optional) tighten egress to the steady-state set:',
                 f'      sbx policy allow network --sandbox {box} '
                 f'{",".join(TRUSTED_BOX_EGRESS)}',

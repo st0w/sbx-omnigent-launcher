@@ -378,6 +378,31 @@ def _global_allow_rules(stdout: str) -> list[tuple[str, int]] | None:
     return found
 
 
+def _as_agy_location(value: object, agy_enabled: bool) -> str:
+    """
+    Resolve ``sbx.agy_gcp_location``, default ``us``.
+
+    It names a host each agy VM's swap secret covers
+    (:func:`agy.swap_hosts_for`), so with agy enabled a malformed one is
+    refused here rather than at every agy VM's launch.
+
+    :param value: Raw config value.
+    :param agy_enabled: Whether ``sbx.agy_enabled`` is on.
+    :returns: The location.
+    :raises ValueError: If it is not a string, or names no GCP location
+        while agy is enabled.
+    """
+    location = _as_opt_str(value, 'sbx.agy_gcp_location') or 'us'
+    if agy_enabled:
+        try:
+            agy.swap_hosts_for(location)
+        except ValueError as exc:
+            raise ValueError(
+                f"server config 'sandbox.sbx.agy_gcp_location': {exc}"
+            ) from exc
+    return location
+
+
 def _as_agy_update(
     value: object, agy_enabled: bool, gcp_project: str | None
 ) -> bool:
@@ -846,9 +871,8 @@ def _build_sbx_config(raw: dict[str, Any]) -> ManagedSandboxConfig:
     agy_gcp_project = _as_opt_str(
         sbx.get('agy_gcp_project'), 'sbx.agy_gcp_project'
     )
-    agy_gcp_location = (
-        _as_opt_str(sbx.get('agy_gcp_location'), 'sbx.agy_gcp_location')
-        or 'us'
+    agy_gcp_location = _as_agy_location(
+        sbx.get('agy_gcp_location'), agy_enabled
     )
     if agy_enterprise:
         install_agy_enterprise_onboarding_patch()

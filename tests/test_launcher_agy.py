@@ -21,6 +21,28 @@ import click
 from sbx_omnigent import agy
 from sbx_omnigent.launcher import SbxLauncher
 
+
+def _no_real_swap_secret(*_args: object, **_kwargs: object) -> None:
+    raise AssertionError(
+        'a test reached agy.install_swap_secret, which reads the real '
+        'trusted box and writes a real sbx secret: stub '
+        'SbxLauncher._install_agy_swap_secret instead'
+    )
+
+
+#: Every test here builds agy VMs; none may reach the real trusted box.
+_SWAP_SECRET_GUARD = mock.patch.object(
+    agy, 'install_swap_secret', _no_real_swap_secret
+)
+
+
+def setUpModule() -> None:
+    _SWAP_SECRET_GUARD.start()
+
+
+def tearDownModule() -> None:
+    _SWAP_SECRET_GUARD.stop()
+
 _RUN = 'sbx_omnigent.launcher.subprocess.run'
 
 
@@ -147,10 +169,14 @@ class TestInjectionCallSite(unittest.TestCase):
                 self.launcher, '_inject_agy_credentials'
             ) as inj,
             mock.patch.object(
+                self.launcher, '_install_agy_swap_secret'
+            ) as secret,
+            mock.patch.object(
                 self.launcher, '_seed_claude_settings'
             ) as seed,
         ):
             self.launcher.start_host('box', **{**defaults, **kwargs})
+        self.secret = secret
         return inj, seed
 
     def test_injects_on_agy_tagged_sentinel(self) -> None:
@@ -158,6 +184,7 @@ class TestInjectionCallSite(unittest.TestCase):
             repo_url=_sentinel(self.swarm), repo_branch='rw-agy'
         )
         inj.assert_called_once_with('box')
+        self.secret.assert_called_once_with('box')
         # An agy VM never launches Claude, so it must not be given
         # Claude's bypass-permissions pre-acceptance either.
         seed.assert_not_called()
@@ -167,6 +194,7 @@ class TestInjectionCallSite(unittest.TestCase):
             repo_url=_sentinel(self.swarm), repo_branch='rw'
         )
         inj.assert_not_called()
+        self.secret.assert_not_called()
         # A plain sentinel IS the Claude VM: it gets no credential (the
         # sbx proxy carries that) but it does need the launch-gate
         # pre-acceptance, or `bypassPermissions` stops on a dialog no
@@ -182,6 +210,44 @@ class TestInjectionCallSite(unittest.TestCase):
         )
         inj.assert_not_called()
         seed.assert_not_called()
+
+
+class TestAnAgyVmGetsItsOwnSwapSecret(unittest.TestCase):
+    """Each agy VM gets a swap secret scoped to it before its host
+    starts; no other VM gets one, and no secret is global (#130)."""
+
+    def test_it_installs_the_vms_secret(self) -> None:
+        launcher = SbxLauncher(agy_enabled=True)
+        with mock.patch.object(agy, 'install_swap_secret') as install:
+            launcher._install_agy_swap_secret('box')
+        install.assert_called_once_with('box', hosts=agy.SWAP_HOSTS)
+
+    def test_a_regional_location_adds_its_endpoint(self) -> None:
+        launcher = SbxLauncher(
+            agy_enabled=True, agy_gcp_location='us-central1'
+        )
+        with mock.patch.object(agy, 'install_swap_secret') as install:
+            launcher._install_agy_swap_secret('box')
+        self.assertIn(
+            'us-central1-aiplatform.googleapis.com',
+            install.call_args.kwargs['hosts'],
+        )
+
+    def test_nothing_without_agy_enabled(self) -> None:
+        launcher = SbxLauncher(agy_enabled=False)
+        with mock.patch.object(agy, 'install_swap_secret') as install:
+            launcher._install_agy_swap_secret('box')
+        install.assert_not_called()
+
+    def test_a_failure_fails_the_launch_naming_the_vm(self) -> None:
+        launcher = SbxLauncher(agy_enabled=True)
+        with mock.patch.object(
+            agy, 'install_swap_secret',
+            side_effect=agy.AgyHarvestError('no fresh agy token'),
+        ), self.assertRaises(click.ClickException) as caught:
+            launcher._install_agy_swap_secret('box')
+        self.assertIn('box', caught.exception.message)
+        self.assertIn('no fresh agy token', caught.exception.message)
 
 
 if __name__ == '__main__':
