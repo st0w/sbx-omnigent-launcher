@@ -11921,12 +11921,37 @@ class TestLosingImplementationsAreKept(_Base):
         written = {t[1]: t[2] for t in wt.tracked_files}
         doc = written['docs/plans/race-selection.md']
         self.assertIn('not chosen', doc)
-        self.assertIn('/can/_retained/r1/impl-a.bundle', doc)
+        self.assertIn('`_retained/r1/impl-a.bundle`', doc)
+        self.assertIn('--canonical-root', doc)
 
     def test_the_pr_says_where_the_loser_lives(self) -> None:
         _r, _sc, wt = self._race()
         body = wt.pr_bodies[-1]
-        self.assertIn('/can/_retained/r1/impl-a.bundle', body)
+        self.assertIn('`_retained/r1/impl-a.bundle`', body)
+        self.assertIn('--canonical-root', body)
+
+    def test_neither_publishes_the_hosts_own_path(self) -> None:
+        # Live, a PR description carried the runner host's home
+        # directory. The record and the PR are published; the full path
+        # stays in the console and the run state, on that host.
+        _r, _sc, wt = self._race()
+        written = {t[1]: t[2] for t in wt.tracked_files}
+        for name, text in (
+            ('record', written['docs/plans/race-selection.md']),
+            ('pr', wt.pr_bodies[-1]),
+        ):
+            with self.subTest(name):
+                self.assertNotIn('/can/', text)
+
+    def test_a_bundle_outside_the_retained_tree_shows_its_name(self) -> None:
+        self.assertEqual(
+            R.retained_bundle_ref('/elsewhere/x/impl-a.bundle'),
+            'impl-a.bundle',
+        )
+        self.assertEqual(
+            R.retained_bundle_ref('/home/u/can/_retained/r1/impl-a.bundle'),
+            '_retained/r1/impl-a.bundle',
+        )
 
     def test_a_loser_that_wrote_nothing_is_not_archived(self) -> None:
         # git refuses an empty bundle, and a writer that produced

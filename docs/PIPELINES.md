@@ -447,7 +447,9 @@ vanish with the run:
   test-passing — an independent implementation of the same frozen contract — and
   the run hub holds the only copy until teardown deletes it. Deliberately kept
   OUTSIDE `worktree_root`, since everything the launcher removes is constrained
-  to that root, so no teardown can sweep it.
+  to that root, so no teardown can sweep it. The selection record and the pull
+  request name it relative to the canonical root (`_retained/<run>/<node>.bundle`),
+  since both are published; the console line names the full path.
 
   A delta against the base branch, so it is small (hundreds of bytes, not the
   repo). Restore one with:
