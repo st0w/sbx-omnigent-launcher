@@ -112,6 +112,10 @@ class FakeWT:
         #: (pr_url, body) per edit_pr_body call.
         self.pr_edits: list[tuple[str, str]] = []
         self.edit_raises = False
+        #: (repo_url, branch, commit) per base_contains call, and its
+        #: answer: True, False, or None for "could not tell".
+        self.base_queries: list[tuple[str, str, str]] = []
+        self.base_holds: bool | None = False
         #: (node_id, remote_branch) for every publish_node call.
         self.publishes: list[tuple[str, str | None]] = []
         #: Each run-state snapshot written, in order.
@@ -314,6 +318,10 @@ class FakeWT:
         self.pr_edits.append((pr_url, body))
         if self.edit_raises:
             raise click.ClickException('gh: HTTP 403')
+
+    def base_contains(self, repo_url, *, branch, commit):
+        self.base_queries.append((repo_url, branch, commit))
+        return self.base_holds
 
     def metrics_path(self, run_id) -> str:
         return f'/can/_metrics/{run_id}.jsonl'
@@ -5015,6 +5023,35 @@ class TestAChunkPullRequestLinksItsOwnChanges(_Base):
         )
         self.assertIn('#602', m2_body)
         self.assertNotIn('#601', m2_body)
+
+    def test_it_asks_whether_the_base_holds_the_start(self) -> None:
+        _r, wt, _said = self._race()
+        seed = wt.states[-1]['chunk_publishes']['m0']['seed']
+        self.assertIn(
+            ('https://github.com/org/proj.git', 'main', seed),
+            wt.base_queries,
+        )
+
+    def test_no_note_once_the_base_holds_what_it_was_built_on(
+        self,
+    ) -> None:
+        # Live: [k2] was merged before [k3] started, and [k3]'s PR still
+        # said "Merge #292 first", linking a range that also took in
+        # three unrelated PRs merged since.
+        wt = FakeWT()
+        wt.base_holds = True
+        _r, wt, said = self._race(wt=wt)
+        self.assertNotIn('part of a series', wt.pr_bodies[1].lower())
+        self.assertEqual(wt.pr_edits, [])
+        self.assertTrue(
+            [ln for ln in said if 'already in' in ln and 'm1' in ln], said
+        )
+
+    def test_the_note_stays_when_it_cannot_be_told(self) -> None:
+        wt = FakeWT()
+        wt.base_holds = None
+        _r, wt, _said = self._race(wt=wt)
+        self.assertIn('part of a series', wt.pr_bodies[1].lower())
 
     def test_a_failed_edit_keeps_the_pr_and_says_so(self) -> None:
         wt = FakeWT()

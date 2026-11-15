@@ -830,11 +830,12 @@ class TestEditPrBody(unittest.TestCase):
             'https://github.com/org/repo/pull/640\n',
             'the body',
         )
+        self.assertEqual(len(self.calls), 1)
         self.assertEqual(
-            self.calls,
-            [['gh', 'pr', 'edit', '640', '-R', 'org/repo',
-              '--body', 'the body']],
+            self.calls[0][:5],
+            ['gh', 'api', '--method', 'PATCH', 'repos/org/repo/pulls/640'],
         )
+        self.assertEqual(self.calls[0][5], '--input')
 
     def test_a_url_that_is_not_a_pr_of_that_repo_is_refused(self) -> None:
         for url in (
