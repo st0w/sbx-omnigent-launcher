@@ -4772,6 +4772,83 @@ def _three_modules() -> str:
     )
 
 
+class _CampaignTipWT(FakeWT):
+    """A FakeWT that notes the campaign tip each node was cut from."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cut_at: dict[str, str | None] = {}
+
+    def create_node_worktree(self, run_id, node_id, **kwargs) -> str:
+        self.cut_at.setdefault(node_id, self.tips.get('campaign'))
+        self.events.append(('cut', node_id))
+        return super().create_node_worktree(run_id, node_id, **kwargs)
+
+
+class TestALaterModuleIsBuiltOnTheEarlierRecords(_Base):
+    """
+    The campaign branch advances to a module's winner only after that
+    module's plan, decisions and reviews are committed on it, so the
+    next module's planner finds them under docs/plans/ as its turn says.
+    Before, it advanced first, and a later module saw an earlier one's
+    records only if that module's PR had been merged into the base.
+    """
+
+    def _modules(self, text=None):
+        wt = _CampaignTipWT()
+        self._run(
+            text or _PER_MODULE, {'m0-plan': 'D0', 'm1-plan': 'D1'},
+            interactive_plan=False, wt=wt,
+        )
+        return wt
+
+    def test_the_next_planner_is_cut_after_the_records(self) -> None:
+        wt = self._modules()
+        self.assertEqual(
+            wt.cut_at['m1-plan'], wt.hub_branch_tip('r1', 'm0-build')
+        )
+
+    def test_the_plan_of_record_is_committed_before_that_cut(self) -> None:
+        wt = self._modules()
+        commits = [
+            i for i, event in enumerate(wt.events)
+            if event == ('commit', 'm0-build')
+        ]
+        cut = wt.events.index(('cut', 'm1-plan'))
+        self.assertTrue(commits)
+        self.assertLess(max(commits), cut)
+        self.assertIn(
+            ('m0-build', 'docs: add plan of record',
+             'planner <planner@pipeline.local>'),
+            wt.commits,
+        )
+
+    def test_without_publishing_the_thread_still_advances(self) -> None:
+        wt = self._modules(
+            _PER_MODULE.replace('publish: local', 'publish: none')
+        )
+        self.assertEqual(
+            wt.cut_at['m1-plan'], wt.hub_branch_tip('r1', 'm0-build')
+        )
+
+    def test_a_chunk_is_still_gated_before_it_becomes_the_thread(
+        self,
+    ) -> None:
+        text = _PER_MODULE.replace(
+            'publish: local',
+            'publish: local\nverify:\n  command: cov\n',
+        )
+        wt = _CampaignTipWT()
+        with mock.patch.object(
+            R.verify, 'run_verification',
+            return_value=_outcome(False, 2, 'short'),
+        ), self.assertRaises(R.PipelineRunError):
+            self._run(
+                text, {'m0-plan': 'D0'}, interactive_plan=False, wt=wt,
+            )
+        self.assertNotIn('campaign', wt.tips)
+
+
 class TestChunkPullRequestsTargetTheBaseBranch(_Base):
     """Every chunk's PR targets `base_branch`, never another chunk.
 
@@ -4882,9 +4959,9 @@ class TestAChunkPullRequestLinksItsOwnChanges(_Base):
         )
 
     def test_the_link_covers_exactly_this_chunk(self) -> None:
-        # From the commit the chunk was BUILT on (the campaign branch
-        # when the previous chunk published, before its doc commits)
-        # to the commit this PR pushed.
+        # From the commit the chunk was BUILT on (the previous chunk's
+        # winner, with its records committed) to the commit this PR
+        # pushed.
         _r, wt, _said = self._race()
         seed = wt.states[-1]['chunk_publishes']['m0']['seed']
         tip = self._tip(wt, 'm1-build')
@@ -4895,16 +4972,15 @@ class TestAChunkPullRequestLinksItsOwnChanges(_Base):
             body,
         )
 
-    def test_the_start_is_before_the_prior_chunks_doc_commits(
+    def test_the_start_is_after_the_prior_chunks_doc_commits(
         self,
     ) -> None:
-        # The next chunk is cut from the campaign branch, which moved to
-        # [m0]'s winner BEFORE its plan and review records were
-        # committed. Starting from [m0]'s final commit would name one
-        # that is not in [m1]'s history at all.
+        # The campaign branch moves to [m0]'s winner AFTER its plan and
+        # review records are committed, so [m1] is built on [m0]'s
+        # final commit and its own changes start there.
         _r, wt, _said = self._race()
         seed = wt.states[-1]['chunk_publishes']['m0']['seed']
-        self.assertNotEqual(seed, self._tip(wt, 'm0-build'))
+        self.assertEqual(seed, self._tip(wt, 'm0-build'))
         self.assertIn(
             ('m0-build', 'docs: add plan of record',
              'planner <planner@pipeline.local>'),

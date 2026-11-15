@@ -211,8 +211,10 @@ Or a mapping to publish a specific node's branch: `publish: { mode: pr, branch: 
 `base_branch`, so you never choose what to merge into, and merging one with its
 branch deleted never affects another.
 
-A module is built on the one before it, so while the earlier request is still
-open, a later one also shows the earlier module's changes. From the second
+A module is built on the one before it, records included: its plan, decisions,
+reviews and security folder under `docs/plans/`, which is how the next module's
+planner reads them. So while the earlier request is still open, a later one also
+shows the earlier module's changes and records. From the second
 module on, the description starts with a note that names the earlier request and
 links **that module's changes only**: GitHub's view of this request's own commits,
 which you can review and comment on as usual. The link is built from commit ids,
