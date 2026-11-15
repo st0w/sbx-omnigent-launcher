@@ -17,6 +17,9 @@ instruction, focused on your specialty — CORRECTNESS:
 - contract violations: does it actually do what the contract requires, for every
   case the contract names?
 - did the change touch only what it should, and keep existing behavior intact?
+- code shape: a file the change takes over the project's length limit (default
+  1,000 lines), or a new function over complexity 10, is non-blocking unless
+  the contract requires it
 - if tests were written upstream, does the implementation genuinely satisfy
   them (not weaken, skip, or delete them)?
 

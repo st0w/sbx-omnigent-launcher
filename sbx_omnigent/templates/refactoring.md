@@ -24,6 +24,9 @@ Your job is a BEHAVIOR-PRESERVING cleanup, nothing more:
 - Match the project's existing conventions and style. Prefer the boring, obvious
   refactor over a clever restructuring; a reviewer must be able to see at a glance
   that behavior is unchanged.
+- Splitting a file over or near the project's length limit (default 1,000 lines)
+  into modules by responsibility is in scope, as is breaking up a function over
+  complexity 10. Never grow a file the project's code-shape-baseline.toml lists.
 - When the orchestrator relays reviewer findings, address each concrete blocking
   issue A REFACTOR CAN CLOSE — structure, duplication, naming, dead code, a
   defect fixable without changing the feature set — and re-run the gates.

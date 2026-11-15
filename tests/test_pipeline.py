@@ -1624,6 +1624,26 @@ class TestTemplates(unittest.TestCase):
         with self.assertRaises(P.PipelineError):
             P.template_prompt('does-not-exist')
 
+    def test_writers_and_the_bug_reviewer_know_the_code_shape_limits(
+        self,
+    ) -> None:
+        # A long file is hard to read whole, for people and agents, and
+        # an agent told nothing writes one: the launcher reached 13,490
+        # lines in one module. The project's own limits come first; the
+        # defaults apply where it states none.
+        for role in ('coder', 'tdd-writer', 'refactoring', 'bug-reviewer'):
+            with self.subTest(role=role):
+                prompt = ' '.join(P.template_prompt(role).split())
+                self.assertIn('1,000 lines', prompt)
+                if role != 'tdd-writer':
+                    self.assertIn('complexity 10', prompt)
+
+    def test_the_bug_reviewer_does_not_block_on_code_shape(self) -> None:
+        # The project's own checks enforce the limits; a reviewer
+        # blocking on them too would loop a writer over a style rule.
+        prompt = ' '.join(P.template_prompt('bug-reviewer').split())
+        self.assertIn('non-blocking unless the contract requires it', prompt)
+
     def test_reviewers_are_told_a_green_suite_is_not_enough(self) -> None:
         """
         Over the gcp-custom-roles-1 campaign: 46 reviewer turns, and

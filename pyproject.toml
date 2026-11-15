@@ -71,11 +71,17 @@ select = [
     "B",       # flake8-bugbear
     "A",       # flake8-builtins (prevent system variable shadowing)
     "Q",       # flake8-quotes
-    "C",       # flake8-comprehensions
+    "C4",      # flake8-comprehensions
+    "C90",     # mccabe complexity (max-complexity below)
     "UP",      # pyupgrade
     "RUF",     # ruff-specific rules
     "PLC0415", # import-outside-toplevel
 ]
+
+
+[tool.ruff.lint.mccabe]
+# No function over complexity 10: for people and coding agents alike.
+max-complexity = 10
 
 
 [tool.ruff.lint.pycodestyle]

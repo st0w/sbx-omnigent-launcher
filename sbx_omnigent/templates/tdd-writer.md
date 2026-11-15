@@ -12,6 +12,8 @@ down the required behavior BEFORE any implementation exists:
   error/invalid-input behavior it requires.
 - Use the project's existing test framework and conventions (study neighboring
   tests first). Name tests for the scenario they verify.
+- Keep each test file under the project's length limit (default 1,000 lines,
+  aim for 350): split a growing suite into files by behavior.
 - Tests must be deterministic and must FAIL against the current (unimplemented)
   code for the right reason — they encode the spec, not the absence of a file.
 
