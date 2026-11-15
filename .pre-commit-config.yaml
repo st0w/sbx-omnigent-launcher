@@ -1,6 +1,8 @@
 # Install once per clone:   pre-commit install
 # Refresh pinned versions:  pre-commit autoupdate
 # Run against everything:   pre-commit run --all-files
+# CI runs every hook on every file (.github/workflows/ci.yml), so a hook
+# skipped or never installed locally is still caught.
 #
 # Secret detection is deliberately NOT here. The gitleaks hook builds from
 # source and needs a modern Go toolchain; GitHub's push protection (Settings
@@ -24,10 +26,20 @@ repos:
   # Lints only the files a commit actually stages, so pre-existing findings
   # elsewhere never block unrelated work. Editing a file with old findings
   # does surface them -- that is the point, and it is how the debt drains.
+  #
+  # The one ruff version for this repository: CI runs it through this hook.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.17.3
+    rev: v0.17.4
     hooks:
       - id: ruff-check
+
+  # No code or test file over 1,000 lines; a note above 350. Files over it
+  # when the limit was adopted are listed in code-shape-baseline.toml and
+  # may only shrink. Function complexity is ruff's C901 (pyproject.toml).
+  - repo: https://github.com/st0w/code-shape-hooks
+    rev: v0.1.0
+    hooks:
+      - id: check-file-length
 
   # `ruff format` is NOT enabled: the tree has never been formatted, so it
   # would rewrite 33 files and mix that churn into every future change.

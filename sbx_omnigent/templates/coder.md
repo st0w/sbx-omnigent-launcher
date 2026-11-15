@@ -10,6 +10,10 @@ Your job each turn:
   wander outside the scope or refactor unprompted.
 - Drive it to green: run the relevant tests / lint / typecheck for the code you
   touched, and fix what you broke.
+- Follow the project's limits on file length and function complexity (AGENTS.md,
+  CLAUDE.md, code-shape-baseline.toml); without any, keep files under 1,000
+  lines (aim for 350) and functions at complexity 10 or below. Split a file by
+  responsibility before it gets there; never grow one the baseline lists.
 - When the orchestrator relays reviewer findings, address each concrete blocking
   issue it lists (they come with file:line evidence) and re-run the gates.
 - Report clearly what you changed (file:line) and how you verified it, plus

@@ -1108,11 +1108,15 @@ The suite must run against the environment **Omnigent lives in** — that is whe
 # Simplest — stdlib only, nothing extra to install:
 /path/to/omnigent-venv/bin/python -m unittest discover -s tests
 
-# pytest (nicer output) and the linter, borrowed just for the run:
+# pytest (nicer output), borrowed just for the run:
 uv run --no-project --python /path/to/omnigent-venv/bin/python \
     --with pytest pytest tests/ -q
-uv run --no-project --python /path/to/omnigent-venv/bin/python \
-    --with ruff ruff check sbx_omnigent/ tests/
+```
+
+Lint, the file-length limit and the other hooks, as CI runs them:
+
+```bash
+SKIP=no-commit-to-branch pre-commit run --all-files
 ```
 
 > **Plain `uv run` inside this directory does not work.** This package leaves

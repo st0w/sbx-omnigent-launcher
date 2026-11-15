@@ -38,8 +38,12 @@ jobs:
           enable-cache: true
       # Pinned in pyproject under [tool.ruff]; line-length 79 and the rule
       # selection both come from there, so local and CI cannot disagree.
-      - name: ruff check
-        run: uvx ruff check --output-format=github .
+      # Every pre-commit hook on every file: ruff at the version the
+      # config pins, and the file-length limit with its baseline.
+      - name: pre-commit
+        env:
+          SKIP: no-commit-to-branch
+        run: uvx pre-commit@4.7.0 run --all-files --show-diff-on-failure
 
   build:
     name: Build

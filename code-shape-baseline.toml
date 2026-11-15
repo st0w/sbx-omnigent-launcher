@@ -1,0 +1,18 @@
+# Files over the 1,000-line limit when it was adopted (2026-11-15). Each
+# may shrink but never grow: lower its entry as it shrinks, and remove it
+# once the file is within the limit. Checked by check-file-length from
+# st0w/code-shape-hooks.
+
+[file-length]
+"sbx_omnigent/agy.py" = 1915
+"sbx_omnigent/entrypoint.py" = 1206
+"sbx_omnigent/launcher.py" = 1568
+"sbx_omnigent/pipeline.py" = 2005
+"sbx_omnigent/runner.py" = 13490
+"sbx_omnigent/swarm.py" = 1715
+"sbx_omnigent/swarm_session.py" = 2608
+"sbx_omnigent/worktrees.py" = 2541
+"tests/test_agy.py" = 1302
+"tests/test_pipeline.py" = 1813
+"tests/test_runner.py" = 17089
+"tests/test_swarm_session.py" = 2615
