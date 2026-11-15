@@ -4857,6 +4857,73 @@ class TestALaterModuleIsBuiltOnTheEarlierRecords(_Base):
         self.assertNotIn('campaign', wt.tips)
 
 
+class TestEachModulesPullRequestListsItsOwnFindings(_Base):
+    """
+    A module's pull request lists the issues filed for that module only.
+    The list was kept for the whole run and never reset, so when two
+    modules published from one runner (k3 and k4, after a resume), k4's
+    PR also listed every one of k3's issues.
+    """
+
+    def _modules(self):
+        text = _pr_modules().replace(
+            '  build: {template: coder, model: claude-sonnet-5}\n',
+            '  build: {template: coder, model: claude-sonnet-5}\n'
+            '  sec: {template: security-reviewer, model: claude-sonnet-5}\n',
+        ) + (
+            '  - {id: review, run: [sec], needs: [build], '
+            'gate: consensus, on_block: build}\n'
+        )
+        wt = FakeWT()
+        wt.return_pr_urls = True
+        with mock.patch.object(R.click, 'echo'):
+            self._run(text, {
+                'm0-plan': 'D0', 'm1-plan': 'D1',
+                'm0-review-sec':
+                    'FINDINGS:\n- m0 leaks a handle\n\nVERDICT: APPROVED',
+                'm1-review-sec':
+                    'FINDINGS:\n- m1 skips pagination\n\nVERDICT: APPROVED',
+            }, interactive_plan=False, wt=wt)
+        return wt
+
+    @staticmethod
+    def _url_of(wt, needle):
+        index = next(
+            i for i, issue in enumerate(wt.issues)
+            if needle in issue['title']
+        )
+        return f'https://github.com/org/proj/issues/{index + 1}'
+
+    def test_the_second_module_lists_only_its_own(self) -> None:
+        wt = self._modules()
+        m0_url = self._url_of(wt, 'm0 leaks a handle')
+        m1_url = self._url_of(wt, 'm1 skips pagination')
+        self.assertIn(m1_url, wt.pr_bodies[1])
+        self.assertNotIn(m0_url + ' ', wt.pr_bodies[1])
+        self.assertNotIn('m0 leaks a handle', wt.pr_bodies[1])
+
+    def test_the_first_module_still_lists_its_own(self) -> None:
+        wt = self._modules()
+        self.assertIn(self._url_of(wt, 'm0 leaks a handle'), wt.pr_bodies[0])
+
+    def test_filing_records_start_empty_for_each_module(self) -> None:
+        cfg = self._cfg(_pr_modules())
+        runner = R.PipelineRunner(
+            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
+            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
+            swap_age_s=lambda: 0.0,
+        )
+        runner._filed_findings.append(('https://x/issues/1', 'old'))
+        runner._filing_outcomes['m0/-/sec/r1#1'] = 'Filed: https://x/1'
+        runner._blocking_summary_url = 'https://x/issues/2'
+        runner._start_chunk_records()
+        self.assertEqual(
+            (runner._filed_findings, runner._filing_outcomes,
+             runner._blocking_summary_url),
+            ([], {}, None),
+        )
+
+
 class TestChunkPullRequestsTargetTheBaseBranch(_Base):
     """Every chunk's PR targets `base_branch`, never another chunk.
 

@@ -4068,6 +4068,7 @@ class PipelineRunner:
                 continue
             self._active_subtask = sub
             self._active_is_first = index == 0
+            self._start_chunk_records()
             mark = len(self._sessions)
             staged = self._namespace_stages(
                 sub.id, loop_stages, planner_ids, writer_ids,
@@ -5062,6 +5063,20 @@ class PipelineRunner:
         if span is not None:
             self._link_chunk_changes(span, result, body)
         self._save_state()
+
+    def _start_chunk_records(self) -> None:
+        """
+        Forget the previous chunk's filing records as a chunk starts.
+
+        Each chunk publishes its own pull request, which lists the
+        issues filed for that chunk, and its own security summary, which
+        names that chunk's outcomes. Kept for the whole run, they piled
+        up: when two chunks published from one runner (after a resume),
+        the second PR also listed every issue of the first.
+        """
+        self._filed_findings = []
+        self._filing_outcomes = {}
+        self._blocking_summary_url = None
 
     def _chunk_remote_branch(self, chunk_id: str) -> str:
         """:returns: The remote branch a module publishes to."""
