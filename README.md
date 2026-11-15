@@ -76,7 +76,7 @@ Three pieces:
    Omnigent's normal CLI. You run `omni-sbx server ...` in place of `omni server
    ...`.
 
-3. **The pipeline runner** (`sbx_omnigent/runner.py`, `python -m
+3. **The pipeline runner** (`sbx_omnigent/runner/`, `python -m
    sbx_omnigent.runner` / `omni-sbx-pipeline`) — a client-side orchestrator that
    binds the registered agents, provisions each DAG node's isolated worktree +
    microVM, drives the stages to completion, does all git on the trusted host
@@ -1169,7 +1169,7 @@ sbx-omnigent-launcher/
     ├── launcher.py           # SbxLauncher: sbx transport + worktree mounting
     ├── entrypoint.py         # provider wrap + agent auto-register + `omni-sbx`
     ├── pipeline.py           # pipeline.yaml parser, templates, agent materialization
-    ├── runner.py             # PipelineRunner: the DAG executor + `omni-sbx-pipeline`
+    ├── runner/               # PipelineRunner: the DAG executor + `omni-sbx-pipeline`
     ├── worktrees.py          # host-side git: canonical mirror, worktrees, publish
     ├── swarm_session.py      # create/drive managed sessions over HTTP+SSE
     ├── swarm.py              # SwarmOrchestrator + `omni-sbx-swarm` CLI (coordinator)

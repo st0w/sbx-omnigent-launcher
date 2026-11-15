@@ -67,3 +67,11 @@ jobs:
           print(f'{len(md)} template(s) packaged')
           sys.exit(0 if md else 'templates missing from the wheel')
           "
+      - name: Confirm subpackages are in the wheel
+        run: |
+          python -c "
+          import glob, zipfile, sys
+          names = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist()
+          need = 'sbx_omnigent/runner/__main__.py'
+          sys.exit(0 if need in names else need + ' missing from the wheel')
+          "

@@ -180,8 +180,8 @@ class Subtask:
     One ordered build increment (a campaign chunk / module).
 
     Either proposed by the planner (flat campaign — see
-    :func:`sbx_omnigent.runner.parse_subtasks`) or supplied by the human
-    via the config ``subtasks:`` / ``subtask_file:`` (per-module mode).
+    :func:`sbx_omnigent.runner.run.parse_subtasks`) or supplied by
+    the human in the config's ``subtasks:`` / ``subtask_file:``.
 
     :param id: Sanitized, unique chunk id used to namespace the chunk's
         node branches/worktrees (e.g. ``m0`` → ``pl/<run>/m0-tests``).
@@ -268,7 +268,7 @@ class DiskSpec:
         clone plus whatever the agent builds inside it. Reader, judge,
         and reviewer worktrees are checkouts with no build output and
         are not counted (see
-        :func:`sbx_omnigent.runner.writer_worktrees`).
+        :func:`sbx_omnigent.runner.run.writer_worktrees`).
     :param headroom_gb: Space left for the host itself.
     """
 
@@ -431,7 +431,7 @@ class PipelineConfig:
     :param generated: Glob patterns for files that do NOT count as
         implementation (lockfiles and other build output). Empty uses
         the runner's default set. See
-        :meth:`sbx_omnigent.runner.PipelineRunner._require_implementation`.
+        :meth:`sbx_omnigent.runner.run.PipelineRunner._require_implementation`.
     :param test_paths: Glob patterns a ``tests_only`` stage may change.
         Unset uses the built-in default. Dependency manifests are NOT
         listed here: a test needing a new dev-dependency must edit

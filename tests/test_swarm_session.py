@@ -29,7 +29,7 @@ from unittest import mock
 import click
 
 from sbx_omnigent import pipeline, swarm_session
-from sbx_omnigent.runner import main as runner_main
+from sbx_omnigent.runner.run import main as runner_main
 from sbx_omnigent.swarm_session import (
     _DEFAULT_TERMINAL_SETTLE_S,
     _PLAN_APPROVAL_PHRASES,

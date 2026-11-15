@@ -13484,7 +13484,3 @@ def _drive(
         click.echo(f'blocked at: {result.blocked_stage}')
     if result.published:
         click.echo(f'published: {result.published}')
-
-
-if __name__ == '__main__':
-    main()

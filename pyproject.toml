@@ -34,13 +34,15 @@ omni-sbx = "sbx_omnigent.entrypoint:main"
 omni-sbx-swarm = "sbx_omnigent.swarm:main"
 omni-sbx-worktrees = "sbx_omnigent.worktrees:main"
 # Fire a declarative pipeline.yaml to completion (the DAG runner).
-omni-sbx-pipeline = "sbx_omnigent.runner:main"
+omni-sbx-pipeline = "sbx_omnigent.runner.run:main"
 # The Antigravity (agy) token harvester: bootstrap the trusted auth-agy box
 # and run the always-on refresh loop that keeps the wire-swap secret fresh.
 omni-sbx-agy = "sbx_omnigent.agy:main"
 
 [tool.setuptools]
-packages = ["sbx_omnigent"]
+# Every package, subpackages included: a missing one is left out of the
+# wheel (tests/test_packaging.py checks the list).
+packages = ["sbx_omnigent", "sbx_omnigent.runner"]
 
 [tool.setuptools.package-data]
 # Role prompt templates shipped inside the package (read Path-relative;
