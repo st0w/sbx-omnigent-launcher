@@ -218,7 +218,14 @@ shows the earlier module's changes and records. From the second
 module on, the description starts with a note that names the earlier request and
 links **that module's changes only**: GitHub's view of this request's own commits,
 which you can review and comment on as usual. The link is built from commit ids,
-so deleting branches never breaks it.
+so deleting branches never breaks it. The note is left out when `base_branch` on
+GitHub already contains everything the module was built on (the earlier request
+merged before this module started): the request then shows only its own changes.
+
+The request opens with a link to GitHub's comparison view, because its number
+isn't known until it exists, and the runner then edits the description to the
+in-request view. That edit uses GitHub's REST API, so a classic publish token
+needs only the `repo` scope (`gh pr edit` would also need `read:org`).
 
 Once the earlier request has merged, the later one shows only its own changes. A
 merge commit does that by itself. After a squash or rebase merge, press **Update

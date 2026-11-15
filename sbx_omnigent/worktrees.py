@@ -29,6 +29,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.parse
 from collections.abc import Sequence
@@ -57,6 +58,14 @@ _SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9._-]+$')
 #: ``git add -A`` committed it into a writer's branch and a tests-only
 #: stage was failed for it. Anchored to the top, where git makes it.
 GIT_PROBE_EXCLUDE = '/mtime-test-*/'
+
+
+#: A git object id, short or full, SHA-1 or SHA-256.
+_OBJECT_ID_RE = re.compile(r'[0-9a-f]{7,64}')
+
+#: A branch name safe to put in a GitHub API path: no spaces, no query
+#: or fragment characters, no leading dash, no ``..``.
+_API_BRANCH_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._/-]*')
 
 
 def _run_default(
@@ -2170,11 +2179,18 @@ class WorktreeManager:
         """
         Replace the description of a pull request this run opened.
 
+        Through the REST endpoint, which needs only the ``repo`` scope.
+        ``gh pr edit`` also reads the PR's reviewers and teams over
+        GraphQL, which a classic token needs ``read:org`` for; live,
+        the publish token had only ``repo`` and ``workflow``, so every
+        edit failed. The description goes in a private temporary JSON
+        file rather than argv, so a failure never prints it.
+
         :param repo_url: The push target the PR was opened on.
         :param pr_url: The URL ``gh pr create`` printed.
         :param body: The new description.
         :raises click.ClickException: If *pr_url* is not a PR of
-            *repo_url*, or ``gh`` fails.
+            *repo_url*, or the edit fails.
         """
         slug = github_slug(repo_url)
         number = pr_number(pr_url, slug)
@@ -2182,10 +2198,51 @@ class WorktreeManager:
             raise click.ClickException(
                 f'{pr_url.strip()!r} is not a pull request of {slug}'
             )
-        self._run_publish(
-            ['gh', 'pr', 'edit', str(number), '-R', slug,
-             '--body', neutralize_mentions(body)]
-        )
+        payload = json.dumps({'body': neutralize_mentions(body)})
+        with tempfile.TemporaryDirectory(prefix='omni-sbx-pr-') as tmp:
+            path = os.path.join(tmp, 'body.json')
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                handle.write(payload)
+            self._run_publish([
+                'gh', 'api', '--method', 'PATCH',
+                f'repos/{slug}/pulls/{number}', '--input', path,
+            ])
+
+    def base_contains(
+        self, repo_url: str, *, branch: str, commit: str
+    ) -> bool | None:
+        """
+        Whether *branch* on GitHub already contains *commit*.
+
+        GitHub's compare endpoint counts the commits reachable from
+        *commit* that *branch* lacks (``ahead_by``); none means the
+        branch holds it. Asked of GitHub, not the run's hub, whose
+        ``origin`` may be a local checkout that has not seen a merge.
+
+        :param repo_url: The publish repository URL.
+        :param branch: The base branch, e.g. ``"main"``.
+        :param commit: A commit id.
+        :returns: ``True`` or ``False``, or ``None`` when it cannot be
+            told: an id or branch name not safe to send, or a failed or
+            unreadable answer.
+        """
+        if not _OBJECT_ID_RE.fullmatch(commit):
+            return None
+        if not _API_BRANCH_RE.fullmatch(branch) or '..' in branch:
+            return None
+        slug = github_slug(repo_url)
+        try:
+            out = self._run_publish([
+                'gh', 'api', f'repos/{slug}/compare/{branch}...{commit}',
+                '--jq', '.ahead_by',
+            ])
+        except click.ClickException:
+            return None
+        text = out.strip()
+        if not text.isdigit():
+            return None
+        return int(text) == 0
 
     def _remove_under_root(self, path: str) -> None:
         """

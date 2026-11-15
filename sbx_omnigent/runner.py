@@ -5065,9 +5065,13 @@ class PipelineRunner:
         What the active chunk's PR adds on top of the previous chunk.
 
         :param winner: The node whose branch this chunk publishes.
-        :returns: The span, or ``None`` for the first chunk. Its commits
-            are ``''`` when either end is unknown or not a git object
-            id, and the PR then goes without the link.
+        :returns: The span, or ``None`` for the first chunk, and when
+            the base branch already holds the commit this chunk was
+            built on: the PR then shows only its own changes, and a
+            note telling the reviewer to merge the earlier PR first
+            would be false. Its commits are ``''`` when either end is
+            unknown or not a git object id, and the PR then goes
+            without the link.
         """
         prior = self._prior_chunk()
         active = self._active_subtask
@@ -5079,6 +5083,18 @@ class PipelineRunner:
         linkable = bool(
             _COMMIT_RE.fullmatch(start) and _COMMIT_RE.fullmatch(end)
         )
+        base = self._config.base_branch or 'main'
+        if linkable and self._publish_repo and self._wt.base_contains(
+            self._publish_repo, branch=base, commit=start
+        ):
+            # Live: [k2] was merged before [k3] started, and [k3]'s PR
+            # still said to merge [k2]'s first. Unknown keeps the note.
+            click.echo(
+                f'[publish] {active.id}: everything it was built on is '
+                f'already in {base}, so its PR shows only its own '
+                f'changes; no series note.'
+            )
+            return None
         return ChunkSpan(
             chunk=active.id,
             prior=prior,
@@ -5086,7 +5102,7 @@ class PipelineRunner:
             start=start if linkable else '',
             end=end if linkable else '',
             slug=github_slug(self._publish_repo),
-            base=self._config.base_branch or 'main',
+            base=base,
         )
 
     @staticmethod
