@@ -70,5 +70,24 @@ class TestDependenciesAreDeclared(unittest.TestCase):
         self.assertNotIn('omnigent', _declared())
 
 
+
+class TestEveryPackageShips(unittest.TestCase):
+    """``pyproject.toml`` names its packages, so a new subpackage is
+    left out of the wheel until it is listed: an editable install still
+    works, and only a real install finds the code missing."""
+
+    def test_every_package_directory_is_listed(self) -> None:
+        config = tomllib.loads(
+            (_ROOT / 'pyproject.toml').read_text(encoding='utf-8')
+        )
+        listed = config['tool']['setuptools']['packages']
+        found = sorted(
+            '.'.join(init.parent.relative_to(_ROOT).parts)
+            for init in (_ROOT / 'sbx_omnigent').rglob('__init__.py')
+        )
+        self.assertIn('sbx_omnigent.runner', found)
+        self.assertEqual(sorted(listed), found)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -76,14 +76,29 @@ class TestModuleEntryPoints(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr[-800:])
 
     def test_list_names_every_main_block(self) -> None:
-        # Guards the guard: a module that gains a __main__ block but
-        # is missing from _MAIN_MODULES would regress unnoticed.
-        found = sorted(
+        # Guards the guard: a module that gains a __main__ block, or a
+        # package that gains a __main__.py, but is missing from
+        # _MAIN_MODULES would regress unnoticed.
+        modules = [
             path.stem
             for path in _PACKAGE_DIR.glob('*.py')
             if "if __name__ == '__main__'" in path.read_text(encoding='utf-8')
-        )
-        self.assertEqual(found, sorted(_MAIN_MODULES))
+        ]
+        packages = [
+            path.parent.name for path in _PACKAGE_DIR.glob('*/__main__.py')
+        ]
+        self.assertEqual(sorted(modules + packages), sorted(_MAIN_MODULES))
+
+    def test_only_a_package_entry_point_has_a_main_block_inside(self) -> None:
+        # A module inside a package is never run with -m; its package's
+        # __main__.py is the entry point.
+        inside = [
+            str(path.relative_to(_PACKAGE_DIR))
+            for path in _PACKAGE_DIR.glob('*/*.py')
+            if path.name != '__main__.py'
+            and "if __name__ == '__main__'" in path.read_text(encoding='utf-8')
+        ]
+        self.assertEqual(inside, [])
 
 
 class TestEveryModuleImportsOnItsOwn(unittest.TestCase):
@@ -98,10 +113,12 @@ class TestEveryModuleImportsOnItsOwn(unittest.TestCase):
         self,
     ) -> None:
         modules = sorted(
-            path.stem for path in _PACKAGE_DIR.glob('*.py')
-            if path.stem != '__init__'
+            '.'.join(path.relative_to(_PACKAGE_DIR).with_suffix('').parts)
+            for path in _PACKAGE_DIR.rglob('*.py')
+            if path.name not in ('__init__.py', '__main__.py')
         )
         self.assertIn('defaults', modules)
+        self.assertIn('runner.run', modules)
         for name in modules:
             with self.subTest(module=name):
                 result = _python('-c', f'import sbx_omnigent.{name}')

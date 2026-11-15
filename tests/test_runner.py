@@ -29,7 +29,7 @@ import click
 from click.testing import CliRunner, Result
 
 from sbx_omnigent import egress, pipeline
-from sbx_omnigent import runner as R
+from sbx_omnigent.runner import run as R
 from sbx_omnigent.swarm_session import (
     PlanDecision,
     SwarmRunnerUnavailable,
@@ -1092,7 +1092,7 @@ class TestAnUnverifiedReviewGoesBackToTheReviewers(_Base):
     )
 
     def _go(self, text, replies):
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             result, sc, wt = self._run(text, replies)
         printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
         return result, sc, wt, printed
@@ -1446,7 +1446,7 @@ class TestAReaderDisputeHaltsTheRun(_Base):
         self.assertEqual(result.status, 'completed')
 
     def test_a_near_miss_is_reported_not_halted_on(self) -> None:
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             result, _sc, _wt = self._run(
                 _CONTRACT_CHECK,
                 {**_CONTRACT_CHECK_REPLIES, 'check': _NEAR_MISS_REPLY},
@@ -1544,7 +1544,7 @@ class TestTheRunnerWaitsForBackgroundWork(_Base):
         ))
         sc.items_for_label['check'] = items
         sc.status_for_label['check'] = {'status': 'idle'}
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             result, sc, wt = self._run(_CHECKS_TESTS, {}, sc=sc)
         printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
         return result, sc, wt, printed
@@ -1566,7 +1566,7 @@ class TestTheRunnerWaitsForBackgroundWork(_Base):
     def test_a_finished_reply_does_not_wait_on_a_server(self) -> None:
         sc = FakeSC(dict(_CHECKS_TESTS_REPLIES))
         sc.items_for_label['check'] = [[], [_bg_launch(1)]]
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             result, _sc, _wt = self._run(_CHECKS_TESTS, {}, sc=sc)
         printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
         self.assertEqual(result.status, 'completed')
@@ -1579,7 +1579,7 @@ class TestTheRunnerWaitsForBackgroundWork(_Base):
         sc.raw_writer_replies = True
         sc.items_for_label['build'] = [[], started, woke, woke]
         sc.status_for_label['build'] = {'status': 'idle'}
-        with mock.patch('sbx_omnigent.runner.click.echo'):
+        with mock.patch('sbx_omnigent.runner.run.click.echo'):
             result, sc, wt = self._run(_LINEAR, {}, sc=sc)
         self.assertEqual(result.status, 'completed')
         self.assertNotIn(R._WRITER_FINISH_ASK, _messages_for(sc, 'build'))
@@ -1804,7 +1804,7 @@ class TestAContractCheck(_Base):
             '- test_parse_empty already passes on the unmodified tree\n'
             '- requirement 4 has no test\n\nCHECK COMPLETE'
         )
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             result, _sc, _wt = self._go(reply)
         self.assertEqual(result.status, 'completed')
         printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
@@ -1957,7 +1957,7 @@ class TestTwoContractChecks(_Base):
     def _halted(self, **replies: str):
         sc = FakeSC({**_TWO_CHECKS_REPLIES, **replies})
         wt = self._wt()
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             with self.assertRaises(R.PipelineRunError) as caught:
                 self._run(_TWO_CHECKS, {}, sc=sc, wt=wt)
         printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
@@ -2112,7 +2112,7 @@ class TestThePlanCheckInsideApproval(_Base):
             'tests': 't', 'build': 'b',
         })
         sc.approval_phrases = list(phrases)
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             result, sc, wt = self._run(
                 _PLAN_CHECKED, {}, sc=sc, wt=wt,
                 interactive_plan=interactive,
@@ -2661,7 +2661,7 @@ class TestAResumeRerunsACheckThatNeverFinished(_Base):
             agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0, resume=True,
         )
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             result = runner.run()
         printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
         return result, sc, printed
@@ -2928,7 +2928,7 @@ class TestReviewVerdict(_Base):
         # The verdict lands only on a LATER settled poll (agy's reply
         # lags well past the first read). The deadline loop must keep
         # polling past the first read to catch it — not give up early.
-        with mock.patch('sbx_omnigent.runner.time.sleep'):
+        with mock.patch('sbx_omnigent.runner.run.time.sleep'):
             result, sc, wt = self._run(
                 _AGY_REVIEW,
                 {'build': 'impl', 'review-bugs': 'narrating...'},
@@ -2957,8 +2957,8 @@ class TestReviewVerdict(_Base):
         # poll deadline. Patch the deadline to 0 so the loop makes one
         # read then breaks instead of polling for real minutes.
         with mock.patch(
-            'sbx_omnigent.runner._VERDICT_POLL_DEADLINE_S', 0.0
-        ), mock.patch('sbx_omnigent.runner.time.sleep'):
+            'sbx_omnigent.runner.run._VERDICT_POLL_DEADLINE_S', 0.0
+        ), mock.patch('sbx_omnigent.runner.run.time.sleep'):
             result, _sc, _ = self._run(
                 _AGY_REVIEW,
                 {'build': 'impl', 'review-bugs': 'Still analyzing.'},
@@ -3091,8 +3091,8 @@ class TestSilentReviewerIsAsked(_Base):
         # Deadline 0 so the poll loop reads once and falls through to
         # the nudge instead of polling for real minutes.
         with mock.patch(
-            'sbx_omnigent.runner._VERDICT_POLL_DEADLINE_S', 0.0
-        ), mock.patch('sbx_omnigent.runner.time.sleep'):
+            'sbx_omnigent.runner.run._VERDICT_POLL_DEADLINE_S', 0.0
+        ), mock.patch('sbx_omnigent.runner.run.time.sleep'):
             return self._run(_LINEAR, replies, **kw)
 
     def test_a_verdict_given_when_asked_is_not_a_block(self) -> None:
@@ -3516,8 +3516,8 @@ class TestTheNudgeReachesAnAgyReviewer(_Base):
 
     def _nudged(self, **kw):
         with mock.patch(
-            'sbx_omnigent.runner._VERDICT_POLL_DEADLINE_S', 0.0
-        ), mock.patch('sbx_omnigent.runner.time.sleep'):
+            'sbx_omnigent.runner.run._VERDICT_POLL_DEADLINE_S', 0.0
+        ), mock.patch('sbx_omnigent.runner.run.time.sleep'):
             return self._run(
                 _AGY_REVIEW,
                 {'build': 'impl', 'review-bugs': [
@@ -3559,8 +3559,8 @@ class TestTheNudgeReachesAnAgyReviewer(_Base):
 
     def test_a_claude_reviewer_is_unaffected(self) -> None:
         with mock.patch(
-            'sbx_omnigent.runner._VERDICT_POLL_DEADLINE_S', 0.0
-        ), mock.patch('sbx_omnigent.runner.time.sleep'):
+            'sbx_omnigent.runner.run._VERDICT_POLL_DEADLINE_S', 0.0
+        ), mock.patch('sbx_omnigent.runner.run.time.sleep'):
             _r, sc, _wt = self._run(
                 _LINEAR,
                 {'plan': 'P', 'build': 'b', 'review-sec': [
@@ -3596,12 +3596,12 @@ class TestAWorkingReviewerIsNotSilent(_Base):
             sc.busy_labels.add('review-sec')
         began = time.monotonic()
         with mock.patch(
-            'sbx_omnigent.runner._VERDICT_POLL_DEADLINE_S', 0.05
+            'sbx_omnigent.runner.run._VERDICT_POLL_DEADLINE_S', 0.05
         ), mock.patch(
-            'sbx_omnigent.runner._VERDICT_POLL_CEILING_S', 0.6
+            'sbx_omnigent.runner.run._VERDICT_POLL_CEILING_S', 0.6
         ), mock.patch(
-            'sbx_omnigent.runner._VERDICT_POLL_INTERVAL_S', 0.0
-        ), mock.patch('sbx_omnigent.runner.time.sleep'):
+            'sbx_omnigent.runner.run._VERDICT_POLL_INTERVAL_S', 0.0
+        ), mock.patch('sbx_omnigent.runner.run.time.sleep'):
             with contextlib.suppress(R.PipelineRunError):
                 R.PipelineRunner(
                     cfg, session_client=sc, worktree_manager=wt,
@@ -3639,8 +3639,8 @@ class TestASilentReviewerIsAFailedReview(_Base):
     def _silent_run(self, **kw):
         # No verdict anywhere: streamed, settled, or after the nudge.
         with mock.patch(
-            'sbx_omnigent.runner._VERDICT_POLL_DEADLINE_S', 0.0
-        ), mock.patch('sbx_omnigent.runner.time.sleep'):
+            'sbx_omnigent.runner.run._VERDICT_POLL_DEADLINE_S', 0.0
+        ), mock.patch('sbx_omnigent.runner.run.time.sleep'):
             return self._run(
                 _LINEAR,
                 {'plan': 'P', 'build': 'b',
@@ -3695,8 +3695,8 @@ class TestASilentReviewerIsAFailedReview(_Base):
             '    model: claude-fable-5\n  sec:\n',
         ).replace('    run: [sec]', '    run: [sec, bugs]')
         with mock.patch(
-            'sbx_omnigent.runner._VERDICT_POLL_DEADLINE_S', 0.0
-        ), mock.patch('sbx_omnigent.runner.time.sleep'):
+            'sbx_omnigent.runner.run._VERDICT_POLL_DEADLINE_S', 0.0
+        ), mock.patch('sbx_omnigent.runner.run.time.sleep'):
             _r, sc, _wt = self._run(
                 text,
                 {'plan': 'P', 'build': 'b',
@@ -5718,7 +5718,7 @@ class TestEnvironmentLimitsAreSurfacedOncePerStage(_Base):
 
     def _run_env(self, replies, source=_COMPETE_REVIEWED, wt=None):
         wt = wt if wt is not None else FakeWT()
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             self._run(source, dict(replies), wt=wt)
         said = [
             str(c.args[0]) for c in echo.call_args_list if c.args
@@ -6278,7 +6278,7 @@ class TestFindingsAreFiledAsIssues(_Base):
         # basis is exactly how a tracker fills with duplicates.
         wt = FakeWT()
         wt.issue_bodies = None
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             self._run_gh(wt=wt)
         self.assertEqual(wt.issues, [])
         said = ' '.join(str(c.args[0]) for c in echo.call_args_list)
@@ -6586,7 +6586,7 @@ class TestAReviewerThatLostItsRunner(_Base):
 
     def test_the_retry_is_announced_with_why_nothing_is_lost(self) -> None:
         sc = self._sc_failing_first()
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             self._run(_LINEAR, {}, sc=sc)
         said = ' '.join(str(c.args[0]) for c in echo.call_args_list)
         self.assertIn('attempt 1 died', said)
@@ -6914,7 +6914,7 @@ class TestABlockingReportIsKeptOnTheRecord(_Base):
         # no report is the one a writer cannot act on, and it was
         # recorded as silently as a good one.
         runner = self._runner()
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             runner._record_review(
                 'review', 'bugs', 1, 'BLOCKING', 'sess-1',
                 'VERDICT: BLOCKING',
@@ -8285,7 +8285,7 @@ class TestADisputeNearMissIsReported(_Base):
         runner._nodes['build'] = R.NodeResult(
             'build', 'writer', output=text
         )
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             runner._halt_on_writer_dispute(runner._stage_by_id['build'])
         return ' '.join(str(c.args[0]) for c in echo.call_args_list)
 
@@ -8368,7 +8368,7 @@ class TestADisputeNearMissIsReported(_Base):
 
     def test_a_blocking_reviewers_near_miss_is_reported(self) -> None:
         runner = self._runner()
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             runner._halt_on_dispute(
                 runner._stage_by_id['review'],
                 {'sec': _NEAR_MISS_REPLY},
@@ -8382,7 +8382,7 @@ class TestADisputeNearMissIsReported(_Base):
         # Only a BLOCKING reviewer's dispute counts — one raised beside
         # an approval is an observation, and the run is not stuck.
         runner = self._runner()
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             runner._halt_on_dispute(
                 runner._stage_by_id['review'],
                 {'sec': _NEAR_MISS_REPLY},
@@ -9119,7 +9119,7 @@ class TestAWriterMustSayItFinished(_Base):
         sc = FakeSC({'plan': 'PLAN', 'build': build, 'review-sec': review})
         sc.raw_writer_replies = True
         wt = FakeWT()
-        with mock.patch('sbx_omnigent.runner.click.echo'):
+        with mock.patch('sbx_omnigent.runner.run.click.echo'):
             try:
                 result = self._run(_LINEAR, {}, sc=sc, wt=wt)[0]
             except R.PipelineRunError as exc:
@@ -9182,7 +9182,7 @@ class TestAWriterMustSayItFinished(_Base):
             agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0,
         )
-        with mock.patch('sbx_omnigent.runner.click.echo'):
+        with mock.patch('sbx_omnigent.runner.run.click.echo'):
             with self.assertRaises(R.PipelineRunError):
                 runner.run()
         self.assertNotIn('build', runner._completed)
@@ -9263,7 +9263,7 @@ class TestCtrlCStopsTheRunNow(_Base):
         started = time.monotonic()
         with mock.patch.object(
             R.concurrent.futures, 'as_completed', side_effect=interrupted
-        ), mock.patch('sbx_omnigent.runner.click.echo'):
+        ), mock.patch('sbx_omnigent.runner.run.click.echo'):
             with self.assertRaises(KeyboardInterrupt):
                 runner._parallel('review', [('a', busy), ('b', busy)])
         self.assertLess(time.monotonic() - started, 2.0)
@@ -9281,7 +9281,7 @@ class TestCtrlCStopsTheRunNow(_Base):
         with mock.patch.object(
             R.concurrent.futures, 'as_completed', side_effect=interrupted
         ), mock.patch.object(runner, '_capture_turn') as capture, \
-                mock.patch('sbx_omnigent.runner.click.echo'):
+                mock.patch('sbx_omnigent.runner.run.click.echo'):
             with self.assertRaises(KeyboardInterrupt):
                 runner._parallel(
                     'review',
@@ -9332,7 +9332,7 @@ class TestCtrlCStopsTheRunNow(_Base):
         sc.turn_outcomes['review-sec'] = ['lost']
         runner = self._runner(sc)
         holder['runner'] = runner
-        with mock.patch('sbx_omnigent.runner.click.echo'):
+        with mock.patch('sbx_omnigent.runner.run.click.echo'):
             with self.assertRaises(KeyboardInterrupt):
                 runner.run()
         reviews = [
@@ -9486,7 +9486,7 @@ class _ScanBase(_Base):
 
         with mock.patch.object(
             R.security_scan, 'collect_report', side_effect=read
-        ) as reader, mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        ) as reader, mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             try:
                 result = self._run(_SCANNED_PIPELINE, {}, sc=sc, wt=wt)[0]
             except R.PipelineRunError as exc:
@@ -9633,7 +9633,7 @@ class TestASecurityScanStage(_ScanBase):
         with mock.patch.object(
             R.security_scan, 'collect_report',
             return_value=_scan_report('', '20261114-120001'),
-        ), mock.patch('sbx_omnigent.runner.click.echo'):
+        ), mock.patch('sbx_omnigent.runner.run.click.echo'):
             self._run(text, {}, sc=sc)
         self.assertIn('at high effort', sc.message_for_label('scan'))
 
@@ -9707,7 +9707,7 @@ class TestTheScanReportsAreKept(_ScanBase):
         with mock.patch.object(
             R.security_scan, 'collect_report',
             side_effect=R.security_scan.ScanReportError('x is a symlink'),
-        ), mock.patch('sbx_omnigent.runner.click.echo'):
+        ), mock.patch('sbx_omnigent.runner.run.click.echo'):
             with self.assertRaises(R.PipelineRunError) as caught:
                 self._run(_SCANNED_PIPELINE, {}, sc=sc)
         self.assertIn('x is a symlink', str(caught.exception))
@@ -9732,7 +9732,7 @@ class TestTheScanReportsAreKept(_ScanBase):
                 'security/scan/r1-1/CLAUDE-SECURITY-RESULTS.sarif',
             ),
         ))
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             path = runner._commit_security_reports(
                 'build', 'docs/plans/demo.md'
             )
@@ -9806,7 +9806,7 @@ class TestScanFindingsAreLabelled(_Base):
         )
 
     def _publish(self, runner):
-        with mock.patch('sbx_omnigent.runner.click.echo'):
+        with mock.patch('sbx_omnigent.runner.run.click.echo'):
             runner._publish_findings('build', 'docs/plans/demo-reviews.md')
 
     def _labels_of(self, wt, needle):
@@ -9898,7 +9898,7 @@ class TestScanFindingsAreLabelled(_Base):
     def test_a_local_ledger_leaves_out_earlier_rounds(self) -> None:
         wt = FakeWT()
         runner = self._runner(wt, text=_SCANNED_PIPELINE)
-        with mock.patch('sbx_omnigent.runner.click.echo'):
+        with mock.patch('sbx_omnigent.runner.run.click.echo'):
             runner._publish_findings('build', 'docs/plans/demo-reviews.md')
         ledger = '\n'.join(text for _t, _rel, text in wt.tracked_files)
         self.assertIn('Medium problem', ledger)
@@ -9936,7 +9936,7 @@ class TestTheSecuritySummary(_Base):
             runner._stage_by_id['scan'], round_no, report
         )
         findings = R.security_scan.parse_report(jsonl)
-        with mock.patch('sbx_omnigent.runner.click.echo'):
+        with mock.patch('sbx_omnigent.runner.run.click.echo'):
             runner._record_scan(
                 runner._stage_by_id['scan'], round_no, findings,
                 'a' * 40, saved,
@@ -9944,7 +9944,7 @@ class TestTheSecuritySummary(_Base):
         return runner._reviews.pop()
 
     def _summary(self, runner, wt):
-        with mock.patch('sbx_omnigent.runner.click.echo'):
+        with mock.patch('sbx_omnigent.runner.run.click.echo'):
             runner._publish_findings('build', 'docs/plans/demo-reviews.md')
             path = runner._commit_security_summary(
                 'build', 'docs/plans/demo.md'
@@ -10062,7 +10062,7 @@ class TestTheSecuritySummary(_Base):
             return_value=_scan_report(
                 _scan_jsonl('MEDIUM'), '20261114-120001'
             ),
-        ), mock.patch('sbx_omnigent.runner.click.echo'):
+        ), mock.patch('sbx_omnigent.runner.run.click.echo'):
             result, _sc, wt = self._run(
                 text, {}, sc=sc, interactive_plan=False
             )
@@ -10539,7 +10539,7 @@ class TestAPlanCheckReadsItsPlansTree(_Base):
             agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0, resume=True,
         )
-        with mock.patch('sbx_omnigent.runner.click.echo'):
+        with mock.patch('sbx_omnigent.runner.run.click.echo'):
             runner.run()
         self.assertIn('D1', sc.message_for_label('m1-plan-check'))
         self.assertEqual(
@@ -14334,7 +14334,7 @@ class TestAGateFixIsCheckedAgainInOrder(_Base):
             R.security_scan, 'collect_report', side_effect=scan
         ), mock.patch.object(
             R.verify, 'run_verification', side_effect=gate
-        ) as gate_calls, mock.patch('sbx_omnigent.runner.click.echo'):
+        ) as gate_calls, mock.patch('sbx_omnigent.runner.run.click.echo'):
             result = self._run(text, {}, sc=sc, wt=wt)[0]
         return result, sc, wt, gate_calls
 
@@ -15026,7 +15026,7 @@ class TestALostWriterTurnIsRetried(_Base):
         self.assertEqual(result.status, 'completed')
 
     def test_the_retry_is_announced(self) -> None:
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             self._run(_TDD, {}, sc=self._sc('lost'))
         said = ' '.join(str(c.args[0]) for c in echo.call_args_list)
         self.assertIn('[retry] build', said)
@@ -16543,7 +16543,7 @@ class TestAVmThatNeverStartedIsRetriedApart(_Base):
 
     def test_the_retry_says_the_vm_never_started(self) -> None:
         sc = self._sc('review-sec', 'unavailable')
-        with mock.patch('sbx_omnigent.runner.click.echo') as echo:
+        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             self._run(_LINEAR, {}, sc=sc)
         said = ' '.join(str(c.args[0]) for c in echo.call_args_list)
         self.assertIn('never started', said)
