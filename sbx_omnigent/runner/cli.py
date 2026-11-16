@@ -11,6 +11,7 @@ import click
 
 from sbx_omnigent import agy, pipeline
 from sbx_omnigent.defaults import DEFAULT_EGRESS_ALLOW
+from sbx_omnigent.runner.agents import resolve_agent_ids
 from sbx_omnigent.runner.preflight.disk import preflight_disk
 from sbx_omnigent.runner.preflight.egress import (
     preflight_egress,
@@ -30,7 +31,7 @@ from sbx_omnigent.runner.resume import (
     _resume_worktree_count,
     reclaim_for_resume,
 )
-from sbx_omnigent.runner.run import PipelineRunner, resolve_agent_ids
+from sbx_omnigent.runner.run import PipelineRunner
 from sbx_omnigent.swarm_session import SwarmSessionClient
 from sbx_omnigent.worktrees import WorktreeManager
 

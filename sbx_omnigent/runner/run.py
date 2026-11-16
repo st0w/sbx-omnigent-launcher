@@ -171,6 +171,7 @@ from sbx_omnigent.runner.render.sessions import (
 from sbx_omnigent.runner.repo_records import RepoRecords
 from sbx_omnigent.runner.review_book import ReviewBook
 from sbx_omnigent.runner.security_records import SecurityRecords
+from sbx_omnigent.runner.session_registry import SessionRegistry
 from sbx_omnigent.runner.stage_kinds import (
     is_planner,
     stage_kind,
@@ -212,46 +213,6 @@ def _recorded_version(entry: dict[str, object], cli: str) -> str | None:
         return None
     version = versions.get(cli)
     return version if isinstance(version, str) else None
-
-
-def resolve_agent_ids(
-    config: pipeline.PipelineConfig, catalog: list[dict[str, object]]
-) -> dict[str, str]:
-    """
-    Map each declared agent to its registered id from the catalog.
-
-    Agents register at server start (``--pipeline``) under their
-    namespaced names, so this matches ``namespaced_agent_name`` against
-    ``GET /v1/agents``.
-
-    :param config: The parsed pipeline.
-    :param catalog: ``GET /v1/agents`` objects (``id``/``name``).
-    :returns: ``{agent_name: agent_id}``.
-    :raises PipelineRunError: When any agent is not registered (with the
-        fix: start the server with ``--pipeline``).
-    """
-    by_name = {
-        a.get('name'): a.get('id')
-        for a in catalog
-        if isinstance(a.get('name'), str) and isinstance(a.get('id'), str)
-    }
-    ids: dict[str, str] = {}
-    missing: list[str] = []
-    for name in config.agents:
-        spec_name = pipeline.namespaced_agent_name(config.name, name)
-        agent_id = by_name.get(spec_name)
-        if agent_id is None:
-            missing.append(spec_name)
-        else:
-            ids[name] = agent_id
-    if missing:
-        raise PipelineRunError(
-            'pipeline agents not registered: '
-            + ', '.join(sorted(missing))
-            + '. Start the server with '
-            f'`omni-sbx server --pipeline {config.source_path}`.'
-        )
-    return ids
 
 
 def _session_failure_note(snap: dict | None) -> str:
@@ -334,7 +295,7 @@ class PipelineRunner:
         ``worktree_root`` MUST equal the server's worktree_root).
     :param run_id: Unique run id (dir + branch component).
     :param agent_ids: ``{agent_name: registered_id}`` (see
-        :func:`resolve_agent_ids`).
+        :func:`~sbx_omnigent.runner.agents.resolve_agent_ids`).
     :param publish_repo: Push target for publish; defaults to the
         pipeline's ``repo``.
     :param max_review_rounds: Review loop-back cap before blocking.
@@ -367,6 +328,7 @@ class PipelineRunner:
     ) -> None:
         self._config = config
         self._progress = RunProgress()
+        self._registry = SessionRegistry()
         self._sc = session_client
         self._wt = worktree_manager
         self._run_id = run_id
@@ -402,10 +364,6 @@ class PipelineRunner:
         #: CLIs already reported as off the known-good set, THIS
         #: PROCESS: once per CLI, not once per session.
         self._known_good_reported: set[str] = set()
-        #: Sessions a PREVIOUS attempt of this run left behind, read
-        #: from its state on resume. For DISPOSAL ONLY — never driven,
-        #: never treated as live (see :meth:`_dispose_stale_sessions`).
-        self._stale_sessions: list[str] = []
         #: Writer nodes whose review stage reached APPROVED consensus.
         #: Read by :meth:`_all_reviewed` so a judge can be told its
         #: candidates are already verified and need not be re-built.
@@ -421,48 +379,15 @@ class PipelineRunner:
         #: only when built outside ``main()``, which keeps the default.
         self._gate_egress = gate_egress
         self._nodes: dict[str, NodeResult] = {}
-        self._sessions: list[str] = []
-        #: Sessions already freed at stage completion (a finished
-        #: reader or judge). Held as a SET rather than removed from
-        #: :attr:`_sessions`, because the campaign frees a module's
-        #: sessions by slicing that list by index — dropping an
-        #: element from the middle would shift the marks and free the
-        #: wrong sessions.
-        self._released: set[str] = set()
         #: node id -> its transcript, captured just before the session
         #: was freed. Disposing DELETES a session, so a reader whose
         #: conversation is committed later (the planner) must have it
         #: read out first.
         self._reader_turns: dict[str, tuple[tuple[str, str], ...]] = {}
-        #: The agent spec behind each session, so a launch can be
-        #: checked against what was actually requested for it.
-        self._session_agent: dict[str, pipeline.PipelineAgent] = {}
-        #: Sessions whose delete FAILED. Kept so they stay in the run
-        #: state and get another chance — at teardown, and again on the
-        #: next --resume. Held apart from :attr:`_sessions` so the
-        #: campaign's mark-based slicing (see
-        #: :meth:`Campaign._release_sessions`) keeps its index
-        #: semantics.
-        self._undisposed: list[str] = []
-        #: agy sessions get the native-TUI first-turn hardening (settle
-        #: + resubmit); tracked so only each session's FIRST turn pays.
-        self._agy_sessions: set[str] = set()
-        #: session id → its node worktree path, so an agy turn can be
-        #: staged as a file the agent reads (see _agy_deliverable).
-        self._session_worktree: dict[str, str] = {}
-        #: session -> node label, for naming a captured transcript.
-        self._session_label: dict[str, str] = {}
-        #: label -> how many captures it already has, so a writer that
-        #: is re-driven twice does not overwrite its own first record.
-        self._captures: dict[str, int] = {}
-        self._driven: set[str] = set()
         #: Set on Ctrl-C. Only the main thread sees the interrupt; the
         #: workers of a parallel stage read this before booting a VM or
         #: driving a turn, and stop instead.
         self._interrupted = threading.Event()
-        #: Sessions with a turn running now, so an interrupt can keep
-        #: what each one was doing before teardown deletes it.
-        self._in_turn: set[str] = set()
         self._bindings: list[dict[str, str]] = []
         #: Node ids pre-warmed during planning — disposed at campaign
         #: start (their un-namespaced VMs are replaced per chunk).
@@ -544,9 +469,11 @@ class PipelineRunner:
                 gate=self._verify_winner,
                 save_state=self._save_state,
                 dispose_prewarmed=self._dispose_prewarmed,
-                session_count=lambda: len(self._sessions),
+                session_count=lambda: len(self._registry.sessions),
                 dispose_sessions_since=(
-                    lambda mark: self._dispose_sessions(self._sessions[mark:])
+                    lambda mark: self._dispose_sessions(
+                        self._registry.sessions[mark:]
+                    )
                 ),
                 sample_disk=self._sample_disk,
             ),
@@ -649,7 +576,7 @@ class PipelineRunner:
         self._progress.completed_chunks = restored.completed_chunks
         self._publisher.chunk_publishes = restored.chunk_publishes
         self._reviewed_ok = restored.reviewed_ok
-        self._stale_sessions = restored.sessions
+        self._registry.stale = restored.sessions
         self._ledger.decisions = restored.decisions
         self._ledger.referrals = restored.referrals
         self._triage.dispositions = restored.dispositions
@@ -696,7 +623,7 @@ class PipelineRunner:
         success), and ``--keep`` is honored, since the human asked for
         the previous attempt's VMs to stay.
         """
-        stale, self._stale_sessions = self._stale_sessions, []
+        stale, self._registry.stale = self._registry.stale, []
         if not stale:
             return
         if self._keep:
@@ -741,11 +668,7 @@ class PipelineRunner:
                 ),
                 active_is_first=self._progress.active_is_first,
                 completed=self._completed,
-                sessions=[
-                    s
-                    for s in dict.fromkeys(self._sessions + self._undisposed)
-                    if s not in self._released
-                ],
+                sessions=list(self._registry.outstanding()),
                 decisions=self._ledger.decisions,
                 referrals=self._ledger.referrals,
                 dispositions=self._triage.dispositions,
@@ -874,7 +797,7 @@ class PipelineRunner:
             self._reconcile_late_writes(stage.id)
         node = self._nodes.get(stage.id)
         session = node.session if node is not None else None
-        if session is None or session in self._released:
+        if session is None or session in self._registry.released:
             return
         if kind == 'reader':
             # The planner's whole conversation is committed beside its
@@ -907,7 +830,7 @@ class PipelineRunner:
         Dispose one session and stop treating it as live.
 
         The single place a VM is handed back early. A delete that FAILS
-        deliberately leaves the session in :attr:`_sessions`, so the
+        deliberately leaves the session in the registry, so the
         chunk disposal and teardown both try again — a microVM that may
         still be running must never stop being tracked.
 
@@ -915,15 +838,14 @@ class PipelineRunner:
         :param why: One line for the log, naming what was freed and why.
         :returns: Whether the microVM was actually released.
         """
-        if self._keep or session in self._released:
+        if self._keep or session in self._registry.released:
             return False
         try:
             self._sc.dispose(session)
         except SwarmSessionError:
             return False
-        self._released.add(session)
-        self._agy_sessions.discard(session)
-        self._session_worktree.pop(session, None)
+        self._registry.released.add(session)
+        self._registry.forget(session)
         click.echo(f'[cleanup] {why}')
         return True
 
@@ -955,11 +877,11 @@ class PipelineRunner:
         The identity-based counterpart to
         :meth:`Campaign._release_sessions`. Two review stages running at
         the same time cannot both free their guests by an index mark:
-        each takes its mark as ``len(self._sessions)``, so the stage
-        that finishes second slices from ITS mark and deletes the
-        sessions the first one is still driving. Naming the sessions
-        removes the ambiguity — a stage frees what it created and
-        nothing else.
+        each takes its mark as the length of the registry's session
+        list, so the stage that finishes second slices from ITS mark
+        and deletes the sessions the first one is still driving.
+        Naming the sessions removes the ambiguity — a stage frees what
+        it created and nothing else.
 
         Outstanding marks survive this. A mark is taken when a chunk
         begins and the sessions removed here are always created after
@@ -980,10 +902,10 @@ class PipelineRunner:
             return
         with self._lock:
             doomed = set(sessions)
-            live = [s for s in sessions if s not in self._released]
+            live = [s for s in sessions if s not in self._registry.released]
             # Freed already by the turn that owned them; forget the
             # bookkeeping now that nothing will ask about them again.
-            self._released.difference_update(doomed)
+            self._registry.released.difference_update(doomed)
         failed: list[str] = []
         for session in live:
             try:
@@ -998,13 +920,12 @@ class PipelineRunner:
                 failed.append(session)
         with self._lock:
             for session in live:
-                self._agy_sessions.discard(session)
-                self._session_worktree.pop(session, None)
-            self._sessions[:] = [
-                s for s in self._sessions if s not in doomed
+                self._registry.forget(session)
+            self._registry.sessions[:] = [
+                s for s in self._registry.sessions if s not in doomed
             ]
             if failed:
-                self._undisposed.extend(failed)
+                self._registry.undisposed.extend(failed)
         if failed:
             click.echo(
                 f'[cleanup] {len(failed)} microVM(s) refused to '
@@ -1096,7 +1017,7 @@ class PipelineRunner:
         # thing to do, with the picker dumped raw at the end of a
         # RuntimeError. They are watching this console; they may never
         # open the failed message bubble.
-        label = self._session_label.get(session, session)
+        label = self._registry.label_of(session)
         prompt = pane.modal_prompt(text)
         if prompt is not None:
             guidance = pane.blocked_on_prompt_message(label, prompt)
@@ -1137,13 +1058,13 @@ class PipelineRunner:
         :returns: The pane artifact's path when one was written, so the
             caller can name it in the error a human will actually read.
         """
-        label = self._session_label.get(session, session)
+        label = self._registry.label_of(session)
         try:
             turns = self._sc.read_transcript(session)
         except SwarmSessionError:
             turns = []
-        seen = self._captures.get(label, 0) + 1
-        self._captures[label] = seen
+        seen = self._registry.captures.get(label, 0) + 1
+        self._registry.captures[label] = seen
         suffix = '' if seen == 1 else f'-{seen}'
         artifact = f'turns/{label}{suffix}.md'
         # Transcript FIRST, so the guarantee this method already made is
@@ -1473,7 +1394,7 @@ class PipelineRunner:
         :param deadline: When the turn's own timeout runs out.
         :returns: The reply, with any woken replies appended.
         """
-        label = self._session_label.get(session, session)
+        label = self._registry.label_of(session)
         try:
             return background.await_background(
                 self._sc,
@@ -1504,7 +1425,7 @@ class PipelineRunner:
         sessions. A second Ctrl-C stops this too.
         """
         with self._lock:
-            running = sorted(self._in_turn)
+            running = sorted(self._registry.in_turn)
         for session in running:
             self._capture_turn(
                 session, 'interrupted (Ctrl-C) mid-turn', with_pane=True
@@ -4273,10 +4194,10 @@ class PipelineRunner:
 
         :param session: The session whose first turn just completed.
         """
-        agent = self._session_agent.get(session)
+        agent = self._registry.agents.get(session)
         if agent is None:
             return
-        label = self._session_label.get(session, session)
+        label = self._registry.label_of(session)
         sandbox = self._sandbox_for_session(session)
         if sandbox is None:
             return
@@ -4357,10 +4278,10 @@ class PipelineRunner:
         :param session: The session the versions were read from.
         :param versions: ``{cli: version}`` from its VM.
         """
-        agent = self._session_agent.get(session)
+        agent = self._registry.agents.get(session)
         if agent is None or not versions:
             return
-        label = self._session_label.get(session, session)
+        label = self._registry.label_of(session)
         cli = harness_versions.cli_for_harness(agent.harness)
         with self._lock:
             recorded = self._harness_versions.get(label)
@@ -4468,10 +4389,9 @@ class PipelineRunner:
         # save below snapshots exactly these collections, so a node
         # registering concurrently must not land halfway through.
         with self._lock:
-            self._sessions.append(session)
-            self._session_worktree[session] = worktree
-            self._session_label[session] = label
-            self._session_agent[session] = agent
+            self._registry.register(
+                session, label=label, agent=agent, worktree=worktree
+            )
         # Persist NOW, not at the next stage boundary. State is
         # otherwise written only when a stage or review round
         # completes, so a session created inside that window is
@@ -4483,7 +4403,7 @@ class PipelineRunner:
         # One cheap write buys a VM that can always be reclaimed.
         self._save_state()
         if is_agy:
-            self._agy_sessions.add(session)
+            self._registry.agy.add(session)
             # Warm the just-created agy TUI before it is driven, so the
             # first turn's paste hits a ready composer (see the module
             # note + wait_for_terminal_ready).
@@ -4519,9 +4439,9 @@ class PipelineRunner:
         :raises PipelineRunError: If the turn failed.
         """
         self._refuse_if_interrupted(
-            self._session_label.get(session, session)
+            self._registry.label_of(session)
         )
-        is_agy = session in self._agy_sessions
+        is_agy = session in self._registry.agy
         # agy drops a multi-line paste before it renders AND collapses
         # an over-long paste into an unsubmittable placeholder — so an
         # agy turn is never pasted whole: it is handed over as a file
@@ -4538,12 +4458,11 @@ class PipelineRunner:
                 if inline
                 else self._agy_deliverable(session, instruction)
             )
-        first_turn = session not in self._driven
-        self._driven.add(session)
+        first_turn = self._registry.first_turn(session)
         since = self._newest_item_id(session)
         deadline = time.monotonic() + self._turn_timeout
         with self._lock:
-            self._in_turn.add(session)
+            self._registry.in_turn.add(session)
         try:
             result = self._sc.send_and_wait(
                 session,
@@ -4590,7 +4509,7 @@ class PipelineRunner:
             raise
         finally:
             with self._lock:
-                self._in_turn.discard(session)
+                self._registry.in_turn.discard(session)
         if first_turn and result.ok:
             # AFTER the first turn, not at create: the TUI has not
             # finished drawing when a session is created, so the pane
@@ -4692,7 +4611,7 @@ class PipelineRunner:
             if phrase is None:
                 return ''
             where = f'the runner log in {sandbox}'
-        agent = self._session_agent.get(session)
+        agent = self._registry.agents.get(session)
         harness = agent.harness if agent is not None else ''
         return (
             f' ({where} shows an authentication failure, "{phrase}": '
@@ -4725,7 +4644,7 @@ class PipelineRunner:
             error, reported if isinstance(reported, str) else None
         ):
             return ''
-        agent = self._session_agent.get(session)
+        agent = self._registry.agents.get(session)
         harness = agent.harness if agent is not None else ''
         return (
             f' (this reads like a usage or rate limit, not a defect in '
@@ -4836,7 +4755,7 @@ class PipelineRunner:
             flattened turn if the session has no worktree to stage
             into).
         """
-        worktree = self._session_worktree.get(session)
+        worktree = self._registry.worktrees.get(session)
         if worktree is None:
             # No worktree to stage into (should not happen — every
             # session is created with one): flatten and paste, so the
@@ -5700,9 +5619,7 @@ class PipelineRunner:
         """
         if self._keep:
             return
-        for session in dict.fromkeys(self._sessions + self._undisposed):
-            if session in self._released:
-                continue
+        for session in self._registry.outstanding():
             try:
                 self._sc.dispose(session)
             except SwarmSessionError:
