@@ -50,6 +50,7 @@ packages = [
     "sbx_omnigent.runner.prompts",
     "sbx_omnigent.runner.records",
     "sbx_omnigent.runner.render",
+    "sbx_omnigent.runner.stages",
 ]
 
 [tool.setuptools.package-data]
