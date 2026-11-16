@@ -63,6 +63,7 @@ from sbx_omnigent.runner.preflight.harnesses import (
     preflight_codex_login,
 )
 from sbx_omnigent.runner.preflight.sandbox import ensure_pipeline_image
+from sbx_omnigent.runner.progress import RunProgress
 from sbx_omnigent.runner.prompts.checks import (
     _CHECK_FINISH,
 )
@@ -4940,39 +4941,6 @@ class TestChunkPullRequestsTargetTheBaseBranch(_Base):
         _r, _sc, wt = self._modules()
         self.assertEqual([b for _r, b in wt.pr_bases], [None, None])
 
-    def _runner_at(self, active: str, published: set[str]):
-        cfg = self._cfg(_PER_MODULE)
-        runner = R.PipelineRunner(
-            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
-            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
-            swap_age_s=lambda: 0.0,
-        )
-        runner._subtasks = list(cfg.subtasks)
-        runner._completed_chunks = set(published)
-        runner._active_subtask = next(
-            s for s in cfg.subtasks if s.id == active
-        )
-        return runner
-
-    def test_the_prior_chunk_is_the_last_one_published(self) -> None:
-        self.assertEqual(self._runner_at('m1', {'m0'})._prior_chunk(), 'm0')
-
-    def test_the_first_chunk_has_no_prior(self) -> None:
-        self.assertIsNone(self._runner_at('m0', set())._prior_chunk())
-
-    def test_the_prior_is_taken_in_ORDER_not_sorted(self) -> None:
-        # A set of ids alone would pick the wrong one: 'm10' sorts
-        # before 'm2'. The module list supplies the real order.
-        runner = self._runner_at('m1', {'m0'})
-        runner._subtasks = [
-            pipeline.Subtask(id=i, title=i) for i in ('m2', 'm10', 'm1')
-        ]
-        runner._completed_chunks = {'m2', 'm10'}
-        self.assertEqual(runner._prior_chunk(), 'm10')
-
-    def test_an_unpublished_chunk_is_never_the_prior(self) -> None:
-        self.assertIsNone(self._runner_at('m1', set())._prior_chunk())
-
 
 class TestAChunkPullRequestLinksItsOwnChanges(_Base):
     """A PR against `main` also shows every unmerged chunk before it.
@@ -5604,8 +5572,8 @@ class TestDispositionsDecideWhatIsFiled(_Base):
             run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0, publish_repo='https://gh/org/proj',
         )
-        runner._subtasks = list(cfg.subtasks)
-        runner._active_subtask = cfg.subtasks[0]
+        runner._progress.subtasks = list(cfg.subtasks)
+        runner._progress.active_subtask = cfg.subtasks[0]
         runner._reviews = [
             R.ReviewRecord(
                 chunk='m0', stage='review', reviewer='sec', round_no=1,
@@ -5721,8 +5689,8 @@ class TestTheLedgerSurvivesARun(_Base):
             run_id='r2', agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0,
         )
-        runner._subtasks = list(cfg.subtasks)
-        runner._active_subtask = cfg.subtasks[-1]
+        runner._progress.subtasks = list(cfg.subtasks)
+        runner._progress.active_subtask = cfg.subtasks[-1]
         return runner
 
     def test_the_planner_stage_actually_seeds_from_the_ledger(
@@ -5832,13 +5800,13 @@ class TestLaterIncrementIsRoutedNotFiled(_Base):
             run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0,
         )
-        runner._subtasks = list(cfg.subtasks)
-        runner._active_subtask = cfg.subtasks[0]
+        runner._progress.subtasks = list(cfg.subtasks)
+        runner._progress.active_subtask = cfg.subtasks[0]
         return runner
 
     def _route(self, runner) -> None:
         runner._ledger.record_referrals(
-            runner._active_subtask.id, runner._chunk_reviews(),
+            runner._progress.module_id, runner._chunk_reviews(),
         )
 
     def _voted(self, reviewer: str, *routed: str):
@@ -5858,7 +5826,7 @@ class TestLaterIncrementIsRoutedNotFiled(_Base):
             self._voted('bugs', 'pagination belongs to [m1]'),
         ]
         self._route(runner)
-        doc = runner._ledger.document(runner._subtasks)
+        doc = runner._ledger.document(runner._progress.subtasks)
         self.assertEqual(doc.count('pagination belongs to [m1]'), 1)
 
     def test_the_ledger_says_a_routed_item_does_not_bind(self) -> None:
@@ -5869,7 +5837,7 @@ class TestLaterIncrementIsRoutedNotFiled(_Base):
         runner = self._campaign_runner()
         runner._reviews = [self._voted('sec', 'pagination belongs to [m1]')]
         self._route(runner)
-        doc = runner._ledger.document(runner._subtasks)
+        doc = runner._ledger.document(runner._progress.subtasks)
         self.assertIn('NOT binding', doc)
         self.assertIn('Raised by review', doc)
         self.assertIn('pagination belongs to [m1]', doc)
@@ -5885,7 +5853,7 @@ class TestLaterIncrementIsRoutedNotFiled(_Base):
         ]
         runner._reviews = [self._voted('sec', 'pagination belongs to [m1]')]
         self._route(runner)
-        block = runner._ledger.planner_block(runner._subtasks)
+        block = runner._ledger.planner_block(runner._progress.subtasks)
         self.assertIn('tuples are upserted, never inserted', block)
         self.assertIn('pagination belongs to [m1]', block)
         self.assertIn('NOT decisions', block)
@@ -6221,7 +6189,7 @@ class TestATestsStageMayOnlyWriteTests(_Base):
         # So a human meets this at the approval gate they already sit
         # through, rather than a campaign stopping at 3am.
         r = object.__new__(R.PipelineRunner)
-        r._active_subtask = None
+        r._progress = RunProgress()
         ask = R.PipelineRunner._plan_consolidation_instruction(r)
         self.assertIn('SURFACE:', ask)
         self.assertIn('SURFACE: none', ask)
@@ -6439,8 +6407,8 @@ class TestTheVerificationGate(_Base):
             run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0,
         )
-        runner._subtasks = list(cfg.subtasks)
-        runner._active_subtask = cfg.subtasks[0]
+        runner._progress.subtasks = list(cfg.subtasks)
+        runner._progress.active_subtask = cfg.subtasks[0]
         runner._reviews = [
             R.ReviewRecord(
                 chunk='m0', stage='review', reviewer='sec', round_no=1,
@@ -6555,8 +6523,8 @@ class TestABlockingReportIsKeptOnTheRecord(_Base):
             run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0, **kw,
         )
-        runner._subtasks = list(cfg.subtasks)
-        runner._active_subtask = cfg.subtasks[0]
+        runner._progress.subtasks = list(cfg.subtasks)
+        runner._progress.active_subtask = cfg.subtasks[0]
         return runner
 
     def test_the_report_behind_a_block_is_recorded(self) -> None:
@@ -6629,8 +6597,8 @@ class TestBlockingFindingsReachTheVerifier(_Base):
             run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0, **kw,
         )
-        runner._subtasks = list(cfg.subtasks)
-        runner._active_subtask = cfg.subtasks[0]
+        runner._progress.subtasks = list(cfg.subtasks)
+        runner._progress.active_subtask = cfg.subtasks[0]
         runner._reviews = [
             R.ReviewRecord(
                 chunk='m0', stage='review-a', reviewer='bugs', round_no=1,
@@ -6739,8 +6707,8 @@ class TestBlockingClaimsAreFiled(_Base):
             run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0, publish_repo='https://gh/org/proj',
         )
-        runner._subtasks = list(cfg.subtasks)
-        runner._active_subtask = cfg.subtasks[0]
+        runner._progress.subtasks = list(cfg.subtasks)
+        runner._progress.active_subtask = cfg.subtasks[0]
         runner._reviews = [
             R.ReviewRecord(
                 chunk='m0', stage='review-a', reviewer='bugs', round_no=1,
@@ -6854,13 +6822,13 @@ class TestTheIncrementBoundsEveryRole(_Base):
             run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0,
         )
-        runner._subtasks = [
+        runner._progress.subtasks = [
             pipeline.Subtask(id=i, title=f'do the {i} work')
             for i in self._SUBTASKS
         ]
-        runner._completed_chunks = set(published)
-        runner._active_subtask = next(
-            s for s in runner._subtasks if s.id == active
+        runner._progress.completed_chunks = set(published)
+        runner._progress.active_subtask = next(
+            s for s in runner._progress.subtasks if s.id == active
         )
         return runner
 
@@ -6967,7 +6935,7 @@ class TestTheIncrementBoundsEveryRole(_Base):
         # No increments means no boundary to police, and the whole brief
         # really is this branch's job.
         r = self._runner()
-        r._active_subtask = None
+        r._progress.active_subtask = None
         stage = r._stage_by_id['review-a']
         self.assertEqual(r._chunk_preamble(), '')
         self.assertNotIn('LATER INCREMENT', r._review_instruction(stage))
@@ -9341,7 +9309,9 @@ class TestAScanInACampaign(_Base):
             swap_age_s=lambda: 0.0,
         )
         if subtask:
-            runner._active_subtask = pipeline.Subtask(id='m1', title='two')
+            runner._progress.active_subtask = pipeline.Subtask(
+                id='m1', title='two',
+            )
         return runner, wt
 
     def test_a_later_module_starts_at_the_campaign_tip(self) -> None:
@@ -13151,7 +13121,7 @@ class TestChunkGranularity(unittest.TestCase):
     @staticmethod
     def _ask() -> str:
         r = object.__new__(R.PipelineRunner)
-        r._active_subtask = None
+        r._progress = RunProgress()
         return R.PipelineRunner._plan_consolidation_instruction(r)
 
     def test_the_planner_is_told_to_err_large(self) -> None:
