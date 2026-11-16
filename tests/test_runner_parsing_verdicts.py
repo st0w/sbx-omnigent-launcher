@@ -10,6 +10,7 @@ import unittest
 from sbx_omnigent.runner.parsing.verdicts import (
     parse_disputes,
     parse_select,
+    parse_verdict,
     work_finished,
 )
 
@@ -145,6 +146,48 @@ class TestTheFinishLineIsRead(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertFalse(work_finished(text))
+
+
+class TestParseVerdictAndSelect(unittest.TestCase):
+    def test_parse_verdict_last_wins(self) -> None:
+        self.assertEqual(
+            parse_verdict('VERDICT: BLOCKING\n...\nVERDICT: APPROVED'),
+            'APPROVED',
+        )
+        self.assertIsNone(parse_verdict('no verdict here'))
+
+    def test_parse_verdict_approve_synonyms(self) -> None:
+        # Models paraphrase; a real reviewer ended with "VERDICT: PASS".
+        for text in (
+            'VERDICT: PASS',
+            'VERDICT: passed',
+            'VERDICT: Approve',
+            'VERDICT: LGTM',
+            'VERDICT: ok',
+        ):
+            self.assertEqual(parse_verdict(text), 'APPROVED', text)
+
+    def test_parse_verdict_block_synonyms(self) -> None:
+        for text in (
+            'VERDICT: FAIL',
+            'VERDICT: blocked',
+            'VERDICT: Reject',
+        ):
+            self.assertEqual(parse_verdict(text), 'BLOCKING', text)
+
+    def test_parse_verdict_unknown_token_is_none(self) -> None:
+        self.assertIsNone(parse_verdict('VERDICT: maybe'))
+
+    def test_parse_verdict_unknown_does_not_clobber(self) -> None:
+        # A stray later 'verdict:' mention must not override a real one.
+        self.assertEqual(
+            parse_verdict('VERDICT: PASS\nmy earlier verdict: unsure'),
+            'APPROVED',
+        )
+
+    def test_parse_select(self) -> None:
+        self.assertEqual(parse_select('reasons\nSELECT: impl-b'), 'impl-b')
+        self.assertIsNone(parse_select('undecided'))
 
 
 if __name__ == '__main__':

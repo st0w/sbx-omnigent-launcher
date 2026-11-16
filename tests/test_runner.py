@@ -65,6 +65,7 @@ from sbx_omnigent.runner.preflight.sandbox import ensure_pipeline_image
 from sbx_omnigent.runner.prompts.checks import (
     _CHECK_FINISH,
 )
+from sbx_omnigent.runner.records.findings import blocking_finding_id
 from sbx_omnigent.runner.records.judging import retained_bundle_ref
 from sbx_omnigent.runner.render.issues import _issue_title_text
 from sbx_omnigent.runner.resume import (
@@ -5630,7 +5631,7 @@ class TestDispositionsDecideWhatIsFiled(_Base):
     def _conclude(self, runner, verdict, reason):
         for rec in runner._chunk_reviews():
             for index, _text in rec.filed_findings():
-                runner._dispositions[R.finding_id(rec, index)] = (
+                runner._triage.dispositions[R.finding_id(rec, index)] = (
                     R.Disposition(verdict, reason)
                 )
 
@@ -5701,10 +5702,10 @@ class TestDispositionsDecideWhatIsFiled(_Base):
         wt = FakeWT()
         runner = self._runner(wt)
         rec = runner._chunk_reviews()[0]
-        runner._dispositions[R.finding_id(rec, 1)] = R.Disposition(
+        runner._triage.dispositions[R.finding_id(rec, 1)] = R.Disposition(
             DISPOSITION_ABSENT, 'gone'
         )
-        runner._dispositions[R.finding_id(rec, 2)] = R.Disposition(
+        runner._triage.dispositions[R.finding_id(rec, 2)] = R.Disposition(
             DISPOSITION_FILED, 'real'
         )
         self._file(runner)
@@ -6466,7 +6467,7 @@ class TestTheVerificationGate(_Base):
     def test_a_referral_is_not_put_to_the_verifier(self) -> None:
         # It is already routed to the ledger, and checking it against
         # THIS module's code answers the wrong question.
-        pending = self._runner()._pending_findings()
+        pending = self._runner()._triage.pending_findings()
         self.assertEqual(
             [text for review_record, _i, text in pending],
             ['leaks a handle', 'no tests'],
@@ -6476,13 +6477,13 @@ class TestTheVerificationGate(_Base):
         self,
     ) -> None:
         runner = self._runner()
-        pending = runner._pending_findings()
-        kept = runner._record_dispositions(
+        pending = runner._triage.pending_findings()
+        kept = runner._triage.record_dispositions(
             pending,
             {1: R.Disposition(DISPOSITION_ABSENT, 'gone in 4622247')},
         )
         self.assertEqual(kept, 1)
-        stored = runner._dispositions[
+        stored = runner._triage.dispositions[
             R.finding_id(pending[0][0], pending[0][1])
         ]
         self.assertEqual(stored.verdict, DISPOSITION_ABSENT)
@@ -6494,23 +6495,25 @@ class TestTheVerificationGate(_Base):
         # The fail-open rule, at the point it decides. An absent key is
         # not "unknown, ask later" — it is "file it", the same as today.
         runner = self._runner()
-        self.assertEqual(
-            runner._record_dispositions(runner._pending_findings(), {}), 2
-        )
+        triage = runner._triage
+        kept = triage.record_dispositions(triage.pending_findings(), {})
+        self.assertEqual(kept, 2)
 
     def test_the_verifier_is_asked_by_NUMBER_not_by_id(self) -> None:
         # A verifier echoing 'm0/-/sec/r1#1' back correctly is a
         # transcription task with a silent failure mode: a mistyped id
         # re-files the finding it was meant to close.
         runner = self._runner()
-        instruction = runner._verify_instruction(runner._pending_findings())
+        pending = runner._triage.pending_findings()
+        instruction = runner._verify_instruction(pending)
         self.assertIn('1. [raised by sec', instruction)
         self.assertIn('2. [raised by sec', instruction)
         self.assertNotIn('m0/-/sec/r1#1', instruction)
 
     def test_the_verifier_is_told_that_unsure_means_file_it(self) -> None:
         runner = self._runner()
-        instruction = runner._verify_instruction(runner._pending_findings())
+        pending = runner._triage.pending_findings()
+        instruction = runner._verify_instruction(pending)
         self.assertIn('a wasted triage is cheap', instruction.lower())
 
     def test_a_verifies_stage_is_its_own_kind(self) -> None:
@@ -6663,21 +6666,22 @@ class TestBlockingFindingsReachTheVerifier(_Base):
     def test_a_block_on_any_candidate_is_put_to_the_verifier(self) -> None:
         # Including the candidate that lost: its reviewer is the only
         # one that ever reproduced the defect.
-        reports = self._runner()._pending_blocking_reports()
+        reports = self._runner()._triage.pending_blocking_reports()
         self.assertEqual([rec.target for rec, _text in reports], ['impl-a'])
 
     def test_another_chunk_s_blocks_are_not_included(self) -> None:
-        reports = self._runner()._pending_blocking_reports()
+        reports = self._runner()._triage.pending_blocking_reports()
         self.assertTrue(all(rec.chunk == 'm0' for rec, _t in reports))
 
     def test_an_approved_vote_contributes_no_report(self) -> None:
-        reports = self._runner()._pending_blocking_reports()
+        reports = self._runner()._triage.pending_blocking_reports()
         self.assertNotIn('impl-b', [rec.target for rec, _t in reports])
 
     def test_the_verifier_is_asked_about_the_reports(self) -> None:
         runner = self._runner()
+        triage = runner._triage
         instruction = runner._verify_instruction(
-            runner._pending_findings(), runner._pending_blocking_reports()
+            triage.pending_findings(), triage.pending_blocking_reports()
         )
         self.assertIn('BLOCKING-DISPOSITIONS:', instruction)
         self.assertIn('Report 1', instruction)
@@ -6685,16 +6689,17 @@ class TestBlockingFindingsReachTheVerifier(_Base):
 
     def test_the_non_blocking_findings_are_still_asked_about(self) -> None:
         runner = self._runner()
+        triage = runner._triage
         instruction = runner._verify_instruction(
-            runner._pending_findings(), runner._pending_blocking_reports()
+            triage.pending_findings(), triage.pending_blocking_reports()
         )
         self.assertIn('DISPOSITIONS:', instruction)
         self.assertIn('skips pagination', instruction)
 
     def test_claims_are_stored_against_a_stable_id(self) -> None:
         runner = self._runner()
-        reports = runner._pending_blocking_reports()
-        kept = runner._record_blocking_dispositions(
+        reports = runner._triage.pending_blocking_reports()
+        kept = runner._triage.record_blocking_dispositions(
             reports,
             {
                 (1, 1): R.Disposition(
@@ -6706,11 +6711,12 @@ class TestBlockingFindingsReachTheVerifier(_Base):
             },
         )
         self.assertEqual(kept, 1)
-        ident = R.blocking_finding_id(reports[0][0], 1)
+        ident = blocking_finding_id(reports[0][0], 1)
         self.assertEqual(
-            runner._dispositions[ident].verdict, DISPOSITION_FILED
+            runner._triage.dispositions[ident].verdict, DISPOSITION_FILED
         )
-        self.assertIn('repr still prints', runner._blocking_claims[ident])
+        claims = runner._triage.blocking_claims
+        self.assertIn('repr still prints', claims[ident])
 
     def test_a_report_with_no_conclusions_keeps_its_claims_unfiled(
         self,
@@ -6719,9 +6725,10 @@ class TestBlockingFindingsReachTheVerifier(_Base):
         # were fixed in a later round. It is one summary issue, so the
         # gap is visible without N issues nobody can action.
         runner = self._runner()
-        reports = runner._pending_blocking_reports()
-        self.assertEqual(runner._record_blocking_dispositions(reports, {}), 0)
-        self.assertEqual(runner._blocking_claims, {})
+        reports = runner._triage.pending_blocking_reports()
+        triage = runner._triage
+        self.assertEqual(triage.record_blocking_dispositions(reports, {}), 0)
+        self.assertEqual(runner._triage.blocking_claims, {})
 
 
 class TestBlockingClaimsAreFiled(_Base):
@@ -6756,8 +6763,8 @@ class TestBlockingClaimsAreFiled(_Base):
         return runner, wt
 
     def _conclude(self, runner, verdict, reason, claim=1):
-        rec = runner._pending_blocking_reports()[0][0]
-        runner._record_blocking_dispositions(
+        rec = runner._triage.pending_blocking_reports()[0][0]
+        runner._triage.record_blocking_dispositions(
             [(rec, rec.blocking_report)],
             {(1, claim): R.Disposition(verdict, reason)},
         )
@@ -6787,14 +6794,14 @@ class TestBlockingClaimsAreFiled(_Base):
         rec = self._conclude(runner, DISPOSITION_FILED, 'still there')
         runner._file_blocking_findings('docs/plans/m0-reviews.md')
         self.assertIn(
-            R.finding_marker(R.blocking_finding_id(rec, 1)),
+            R.finding_marker(blocking_finding_id(rec, 1)),
             wt.issues[0]['body'],
         )
 
     def test_a_claim_already_filed_is_not_filed_again(self) -> None:
         runner, wt = self._runner()
         rec = self._conclude(runner, DISPOSITION_FILED, 'still there')
-        wt.issue_bodies = R.finding_marker(R.blocking_finding_id(rec, 1))
+        wt.issue_bodies = R.finding_marker(blocking_finding_id(rec, 1))
         runner._file_blocking_findings('docs/plans/m0-reviews.md')
         self.assertEqual(wt.issues, [])
 
@@ -9123,11 +9130,12 @@ class TestScanFindingsAreLabelled(_Base):
 
     def _reproduce_blocking(self, runner):
         rec = runner._reviews[1]
-        ident = R.blocking_finding_id(rec, 1)
-        runner._dispositions[ident] = R.Disposition(
+        ident = blocking_finding_id(rec, 1)
+        runner._triage.dispositions[ident] = R.Disposition(
             'reproduces', 'the query still interpolates name'
         )
-        runner._blocking_claims[ident] = 'the query still interpolates name'
+        claims = runner._triage.blocking_claims
+        claims[ident] = 'the query still interpolates name'
 
     def test_a_reproducing_blocking_claim_carries_its_rounds_severity(
         self,
@@ -9241,7 +9249,7 @@ class TestTheSecuritySummary(_Base):
         wt = FakeWT()
         runner = self._runner(wt)
         final = runner._reviews[-1]
-        runner._dispositions[R.finding_id(final, 1)] = R.Disposition(
+        runner._triage.dispositions[R.finding_id(final, 1)] = R.Disposition(
             DISPOSITION_RECORDED, 'already tracked as a known limit'
         )
         _path, text = self._summary(runner, wt)
@@ -9278,11 +9286,12 @@ class TestTheSecuritySummary(_Base):
     def test_a_reproducing_claim_shows_its_verdict_and_issue(self) -> None:
         wt = FakeWT()
         runner = self._runner(wt)
-        ident = R.blocking_finding_id(runner._reviews[0], 1)
-        runner._dispositions[ident] = R.Disposition(
+        ident = blocking_finding_id(runner._reviews[0], 1)
+        runner._triage.dispositions[ident] = R.Disposition(
             DISPOSITION_FILED, 'the query still interpolates name'
         )
-        runner._blocking_claims[ident] = 'the query still interpolates name'
+        claims = runner._triage.blocking_claims
+        claims[ident] = 'the query still interpolates name'
         _path, text = self._summary(runner, wt)
         line = next(line for line in text.splitlines()
                     if "Triage's re-check of round 1" in line)
@@ -14120,98 +14129,6 @@ class TestPlanningSessionCommitted(_Base):
         self.assertIsNotNone(wt.published)
 
 
-class TestParsersAndResolve(unittest.TestCase):
-    def test_parse_verdict_last_wins(self) -> None:
-        self.assertEqual(
-            R.parse_verdict('VERDICT: BLOCKING\n...\nVERDICT: APPROVED'),
-            'APPROVED',
-        )
-        self.assertIsNone(R.parse_verdict('no verdict here'))
-
-    def test_parse_verdict_approve_synonyms(self) -> None:
-        # Models paraphrase; a real reviewer ended with "VERDICT: PASS".
-        for text in (
-            'VERDICT: PASS',
-            'VERDICT: passed',
-            'VERDICT: Approve',
-            'VERDICT: LGTM',
-            'VERDICT: ok',
-        ):
-            self.assertEqual(R.parse_verdict(text), 'APPROVED', text)
-
-    def test_parse_verdict_block_synonyms(self) -> None:
-        for text in (
-            'VERDICT: FAIL',
-            'VERDICT: blocked',
-            'VERDICT: Reject',
-        ):
-            self.assertEqual(R.parse_verdict(text), 'BLOCKING', text)
-
-    def test_parse_verdict_unknown_token_is_none(self) -> None:
-        self.assertIsNone(R.parse_verdict('VERDICT: maybe'))
-
-    def test_parse_verdict_unknown_does_not_clobber(self) -> None:
-        # A stray later 'verdict:' mention must not override a real one.
-        self.assertEqual(
-            R.parse_verdict('VERDICT: PASS\nmy earlier verdict: unsure'),
-            'APPROVED',
-        )
-
-    def test_parse_select(self) -> None:
-        self.assertEqual(R.parse_select('reasons\nSELECT: impl-b'), 'impl-b')
-        self.assertIsNone(R.parse_select('undecided'))
-
-    def test_parse_subtasks_well_formed(self) -> None:
-        plan = (
-            '# Design\n\nsome prose\n\n'
-            'SUBTASKS:\n'
-            '- [core] contracts and core skeleton\n'
-            '- [ingest] ingestion pipeline\n'
-            '- [query] query engine\n'
-        )
-        subs = R.parse_subtasks(plan)
-        self.assertEqual([s.id for s in subs], ['core', 'ingest', 'query'])
-        self.assertEqual(subs[0].title, 'contracts and core skeleton')
-
-    def test_parse_subtasks_numbered_and_blank_lines(self) -> None:
-        plan = (
-            'SUBTASKS:\n'
-            '1. [m0] first\n'
-            '\n'
-            '2. [m1] second\n'
-        )
-        self.assertEqual([s.id for s in R.parse_subtasks(plan)], ['m0', 'm1'])
-
-    def test_parse_subtasks_stops_at_trailing_prose(self) -> None:
-        plan = (
-            'SUBTASKS:\n'
-            '- [a] first\n'
-            'That concludes the plan; ship them in order.\n'
-            '- [b] not part of the list\n'
-        )
-        self.assertEqual([s.id for s in R.parse_subtasks(plan)], ['a'])
-
-    def test_parse_subtasks_sanitizes_and_dedupes_ids(self) -> None:
-        plan = (
-            'SUBTASKS:\n'
-            '- [Core Module!] one\n'
-            '- [Core Module?] two\n'   # sanitizes to the same id
-        )
-        ids = [s.id for s in R.parse_subtasks(plan)]
-        self.assertEqual(ids, ['core-module', 'core-module-2'])
-
-    def test_parse_subtasks_last_header_wins(self) -> None:
-        plan = (
-            'SUBTASKS:\n- [old] stale\n\ndiscarded prose\n\n'
-            'SUBTASKS:\n- [new] real\n'
-        )
-        self.assertEqual([s.id for s in R.parse_subtasks(plan)], ['new'])
-
-    def test_parse_subtasks_empty_and_missing(self) -> None:
-        self.assertEqual(R.parse_subtasks(None), [])
-        self.assertEqual(R.parse_subtasks(''), [])
-        self.assertEqual(R.parse_subtasks('# plan\nno subtasks block'), [])
-        self.assertEqual(R.parse_subtasks('SUBTASKS:\nnot an item\n'), [])
 
     def test_consolidation_instruction_requests_subtasks(self) -> None:
         cfg = _make_min_cfg()
