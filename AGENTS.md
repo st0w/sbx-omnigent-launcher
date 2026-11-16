@@ -15,7 +15,8 @@ declarative multi-agent pipelines. `README.md` explains what it does;
 - Files over the limit when it was adopted are listed in
   `code-shape-baseline.toml`. Never grow one. When a change shrinks one,
   lower its entry in the same change, and remove it once the file is
-  within the limit.
+  within the limit. Never raise or add an entry: the
+  `check-baseline-ratchet` hook and CI fail it. Split the code instead.
 - Prefer composition and dependency injection over inheritance and
   mixins.
 

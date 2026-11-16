@@ -36,10 +36,15 @@ repos:
   # No code or test file over 1,000 lines; a note above 350. Files over it
   # when the limit was adopted are listed in code-shape-baseline.toml and
   # may only shrink. Function complexity is ruff's C901 (pyproject.toml).
+  #
+  # The ratchet fails a commit that raises or adds a baseline entry,
+  # compared with HEAD locally and with the target branch in CI
+  # (CODE_SHAPE_BASE_REF in .github/workflows/ci.yml).
   - repo: https://github.com/st0w/code-shape-hooks
-    rev: v0.1.0
+    rev: v0.2.0
     hooks:
       - id: check-file-length
+      - id: check-baseline-ratchet
 
   # `ruff format` is NOT enabled: the tree has never been formatted, so it
   # would rewrite 33 files and mix that churn into every future change.
