@@ -29,3 +29,20 @@ def decisions_ledger_path(config: pipeline.PipelineConfig) -> str:
     return str(
         artifact.with_name(f'{artifact.stem}-decisions{artifact.suffix}')
     )
+
+
+def findings_ledger_path(config: pipeline.PipelineConfig) -> str:
+    """
+    The findings ledger's repo path — ONE per pipeline.
+
+    Deliberately not derived from the chunk's plan path the way the
+    reviews and selection records are. Those are per-chunk on purpose;
+    this must accumulate across every chunk AND every run, because the
+    repo is the only thing that survives a run and each chunk's branch
+    carries the ledger forward on its base.
+
+    :param config: The parsed pipeline.
+    :returns: e.g. ``docs/plans/discover-findings.md``.
+    """
+    p = PurePosixPath(plan_artifact_path(config))
+    return str(p.with_name(f'{p.stem}-findings{p.suffix}'))

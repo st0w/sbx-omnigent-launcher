@@ -42,6 +42,7 @@ from sbx_omnigent.runner.parsing.dispositions import (
     DISPOSITION_ABSENT,
     DISPOSITION_FILED,
     DISPOSITION_RECORDED,
+    Disposition,
 )
 from sbx_omnigent.runner.parsing.plans import (
     _PLAN_RECAP_WINDOW,
@@ -65,7 +66,10 @@ from sbx_omnigent.runner.preflight.sandbox import ensure_pipeline_image
 from sbx_omnigent.runner.prompts.checks import (
     _CHECK_FINISH,
 )
-from sbx_omnigent.runner.records.findings import blocking_finding_id
+from sbx_omnigent.runner.records.findings import (
+    blocking_finding_id,
+    finding_marker,
+)
 from sbx_omnigent.runner.records.judging import retained_bundle_ref
 from sbx_omnigent.runner.render.issues import _issue_title_text
 from sbx_omnigent.runner.resume import (
@@ -4891,23 +4895,6 @@ class TestEachModulesPullRequestListsItsOwnFindings(_Base):
         wt = self._modules()
         self.assertIn(self._url_of(wt, 'm0 leaks a handle'), wt.pr_bodies[0])
 
-    def test_filing_records_start_empty_for_each_module(self) -> None:
-        cfg = self._cfg(_pr_modules())
-        runner = R.PipelineRunner(
-            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
-            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
-            swap_age_s=lambda: 0.0,
-        )
-        runner._filed_findings.append(('https://x/issues/1', 'old'))
-        runner._filing_outcomes['m0/-/sec/r1#1'] = 'Filed: https://x/1'
-        runner._blocking_summary_url = 'https://x/issues/2'
-        runner._start_chunk_records()
-        self.assertEqual(
-            (runner._filed_findings, runner._filing_outcomes,
-             runner._blocking_summary_url),
-            ([], {}, None),
-        )
-
 
 class TestChunkPullRequestsTargetTheBaseBranch(_Base):
     """Every chunk's PR targets `base_branch`, never another chunk.
@@ -5632,11 +5619,11 @@ class TestDispositionsDecideWhatIsFiled(_Base):
         for rec in runner._chunk_reviews():
             for index, _text in rec.filed_findings():
                 runner._triage.dispositions[R.finding_id(rec, index)] = (
-                    R.Disposition(verdict, reason)
+                    Disposition(verdict, reason)
                 )
 
     def _file(self, runner, report_doc='docs/plans/mods-reviews.md'):
-        runner._file_findings_as_issues(
+        runner._filing.file_findings(
             [r for r in runner._chunk_reviews() if r.findings], report_doc
         )
 
@@ -5702,10 +5689,10 @@ class TestDispositionsDecideWhatIsFiled(_Base):
         wt = FakeWT()
         runner = self._runner(wt)
         rec = runner._chunk_reviews()[0]
-        runner._triage.dispositions[R.finding_id(rec, 1)] = R.Disposition(
+        runner._triage.dispositions[R.finding_id(rec, 1)] = Disposition(
             DISPOSITION_ABSENT, 'gone'
         )
-        runner._triage.dispositions[R.finding_id(rec, 2)] = R.Disposition(
+        runner._triage.dispositions[R.finding_id(rec, 2)] = Disposition(
             DISPOSITION_FILED, 'real'
         )
         self._file(runner)
@@ -5948,7 +5935,7 @@ class TestFindingsAreFiledAsIssues(_Base):
             verdict='APPROVED', findings=('impl-a leaks a handle',),
             target='impl-a',
         )
-        wt.issue_bodies = R.finding_marker(R.finding_id(rec, 1))
+        wt.issue_bodies = finding_marker(R.finding_id(rec, 1))
         self._run_gh(wt=wt)
         filed = [i['title'] for i in wt.issues]
         self.assertEqual(len(filed), 1, f'a duplicate was filed: {filed}')
@@ -5964,7 +5951,7 @@ class TestFindingsAreFiledAsIssues(_Base):
             target='impl-b',
         )
         wt.issue_bodies = (
-            'closed long ago\n' + R.finding_marker(R.finding_id(rec, 1))
+            'closed long ago\n' + finding_marker(R.finding_id(rec, 1))
         )
         self._run_gh(wt=wt)
         self.assertNotIn(
@@ -6480,7 +6467,7 @@ class TestTheVerificationGate(_Base):
         pending = runner._triage.pending_findings()
         kept = runner._triage.record_dispositions(
             pending,
-            {1: R.Disposition(DISPOSITION_ABSENT, 'gone in 4622247')},
+            {1: Disposition(DISPOSITION_ABSENT, 'gone in 4622247')},
         )
         self.assertEqual(kept, 1)
         stored = runner._triage.dispositions[
@@ -6702,10 +6689,10 @@ class TestBlockingFindingsReachTheVerifier(_Base):
         kept = runner._triage.record_blocking_dispositions(
             reports,
             {
-                (1, 1): R.Disposition(
+                (1, 1): Disposition(
                     DISPOSITION_FILED, 'repr still prints the key'
                 ),
-                (1, 2): R.Disposition(
+                (1, 2): Disposition(
                     DISPOSITION_ABSENT, 'fixed in round 2'
                 ),
             },
@@ -6766,7 +6753,7 @@ class TestBlockingClaimsAreFiled(_Base):
         rec = runner._triage.pending_blocking_reports()[0][0]
         runner._triage.record_blocking_dispositions(
             [(rec, rec.blocking_report)],
-            {(1, claim): R.Disposition(verdict, reason)},
+            {(1, claim): Disposition(verdict, reason)},
         )
         return rec
 
@@ -6775,7 +6762,7 @@ class TestBlockingClaimsAreFiled(_Base):
         self._conclude(
             runner, DISPOSITION_FILED, 'repr prints the key in impl-b'
         )
-        runner._file_blocking_findings('docs/plans/m0-reviews.md')
+        runner._filing.file_blocking_claims('docs/plans/m0-reviews.md')
         titles = [i['title'] for i in wt.issues]
         self.assertEqual(len(titles), 1, titles)
         self.assertIn('repr prints the key', titles[0])
@@ -6783,7 +6770,7 @@ class TestBlockingClaimsAreFiled(_Base):
     def test_the_issue_says_it_was_raised_as_blocking(self) -> None:
         runner, wt = self._runner()
         self._conclude(runner, DISPOSITION_FILED, 'still there')
-        runner._file_blocking_findings('docs/plans/m0-reviews.md')
+        runner._filing.file_blocking_claims('docs/plans/m0-reviews.md')
         body = wt.issues[0]['body']
         self.assertIn('BLOCKING', body)
         self.assertIn('`bugs`', body)
@@ -6792,17 +6779,17 @@ class TestBlockingClaimsAreFiled(_Base):
     def test_the_body_carries_the_dedup_marker(self) -> None:
         runner, wt = self._runner()
         rec = self._conclude(runner, DISPOSITION_FILED, 'still there')
-        runner._file_blocking_findings('docs/plans/m0-reviews.md')
+        runner._filing.file_blocking_claims('docs/plans/m0-reviews.md')
         self.assertIn(
-            R.finding_marker(blocking_finding_id(rec, 1)),
+            finding_marker(blocking_finding_id(rec, 1)),
             wt.issues[0]['body'],
         )
 
     def test_a_claim_already_filed_is_not_filed_again(self) -> None:
         runner, wt = self._runner()
         rec = self._conclude(runner, DISPOSITION_FILED, 'still there')
-        wt.issue_bodies = R.finding_marker(blocking_finding_id(rec, 1))
-        runner._file_blocking_findings('docs/plans/m0-reviews.md')
+        wt.issue_bodies = finding_marker(blocking_finding_id(rec, 1))
+        runner._filing.file_blocking_claims('docs/plans/m0-reviews.md')
         self.assertEqual(wt.issues, [])
 
     def test_a_claim_that_is_absent_is_withheld_with_its_reason(
@@ -6812,7 +6799,7 @@ class TestBlockingClaimsAreFiled(_Base):
         # file, and the reason must survive.
         runner, wt = self._runner()
         self._conclude(runner, DISPOSITION_ABSENT, 'fixed in round 2')
-        runner._file_blocking_findings('docs/plans/m0-reviews.md')
+        runner._filing.file_blocking_claims('docs/plans/m0-reviews.md')
         titles = [i['title'] for i in wt.issues]
         self.assertEqual(len(titles), 1, titles)
         self.assertIn('withheld', titles[0])
@@ -6822,7 +6809,7 @@ class TestBlockingClaimsAreFiled(_Base):
         self,
     ) -> None:
         runner, wt = self._runner()
-        runner._file_blocking_findings('docs/plans/m0-reviews.md')
+        runner._filing.file_blocking_claims('docs/plans/m0-reviews.md')
         titles = [i['title'] for i in wt.issues]
         self.assertEqual(len(titles), 1, titles)
         self.assertIn('no conclusion', titles[0].lower())
@@ -6832,7 +6819,7 @@ class TestBlockingClaimsAreFiled(_Base):
         runner, wt = self._runner()
         wt.issue_bodies = None
         self._conclude(runner, DISPOSITION_FILED, 'still there')
-        runner._file_blocking_findings('docs/plans/m0-reviews.md')
+        runner._filing.file_blocking_claims('docs/plans/m0-reviews.md')
         self.assertEqual(wt.issues, [])
 
     def test_publish_routes_blocking_claims_too(self) -> None:
@@ -6840,7 +6827,7 @@ class TestBlockingClaimsAreFiled(_Base):
         # early, so its blocking claims never reached the tracker.
         runner, wt = self._runner()
         self._conclude(runner, DISPOSITION_FILED, 'still there')
-        runner._publish_findings('build', 'docs/plans/m0-reviews.md')
+        runner._filing.publish('build', 'docs/plans/m0-reviews.md')
         self.assertTrue(wt.issues)
 
 
@@ -9070,7 +9057,7 @@ class TestScanFindingsAreLabelled(_Base):
 
     def _publish(self, runner):
         with mock.patch('sbx_omnigent.runner.run.click.echo'):
-            runner._publish_findings('build', 'docs/plans/demo-reviews.md')
+            runner._filing.publish('build', 'docs/plans/demo-reviews.md')
 
     def _labels_of(self, wt, needle):
         return [i['labels'] for i in wt.issues if needle in i['body']]
@@ -9131,7 +9118,7 @@ class TestScanFindingsAreLabelled(_Base):
     def _reproduce_blocking(self, runner):
         rec = runner._reviews[1]
         ident = blocking_finding_id(rec, 1)
-        runner._triage.dispositions[ident] = R.Disposition(
+        runner._triage.dispositions[ident] = Disposition(
             'reproduces', 'the query still interpolates name'
         )
         claims = runner._triage.blocking_claims
@@ -9163,7 +9150,7 @@ class TestScanFindingsAreLabelled(_Base):
         wt = FakeWT()
         runner = self._runner(wt, text=_SCANNED_PIPELINE)
         with mock.patch('sbx_omnigent.runner.run.click.echo'):
-            runner._publish_findings('build', 'docs/plans/demo-reviews.md')
+            runner._filing.publish('build', 'docs/plans/demo-reviews.md')
         ledger = '\n'.join(text for _t, _rel, text in wt.tracked_files)
         self.assertIn('Medium problem', ledger)
         self.assertNotIn('Low problem', ledger)
@@ -9209,7 +9196,7 @@ class TestTheSecuritySummary(_Base):
 
     def _summary(self, runner, wt):
         with mock.patch('sbx_omnigent.runner.run.click.echo'):
-            runner._publish_findings('build', 'docs/plans/demo-reviews.md')
+            runner._filing.publish('build', 'docs/plans/demo-reviews.md')
             path = runner._commit_security_summary(
                 'build', 'docs/plans/demo.md'
             )
@@ -9249,7 +9236,7 @@ class TestTheSecuritySummary(_Base):
         wt = FakeWT()
         runner = self._runner(wt)
         final = runner._reviews[-1]
-        runner._triage.dispositions[R.finding_id(final, 1)] = R.Disposition(
+        runner._triage.dispositions[R.finding_id(final, 1)] = Disposition(
             DISPOSITION_RECORDED, 'already tracked as a known limit'
         )
         _path, text = self._summary(runner, wt)
@@ -9263,7 +9250,7 @@ class TestTheSecuritySummary(_Base):
         wt = FakeWT()
         runner = self._runner(wt)
         final = runner._reviews[-1]
-        wt.issue_bodies = R.finding_marker(R.finding_id(final, 1))
+        wt.issue_bodies = finding_marker(R.finding_id(final, 1))
         _path, text = self._summary(runner, wt)
         row = next(line for line in text.splitlines()
                    if 'Medium problem' in line and 'rounds 1 to 2' in line)
@@ -9287,7 +9274,7 @@ class TestTheSecuritySummary(_Base):
         wt = FakeWT()
         runner = self._runner(wt)
         ident = blocking_finding_id(runner._reviews[0], 1)
-        runner._triage.dispositions[ident] = R.Disposition(
+        runner._triage.dispositions[ident] = Disposition(
             DISPOSITION_FILED, 'the query still interpolates name'
         )
         claims = runner._triage.blocking_claims

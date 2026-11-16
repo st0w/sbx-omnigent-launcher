@@ -1,4 +1,4 @@
-"""The ledger of findings and what became of each.
+"""The ledger of findings, and the issues that summarise triage.
 
 Run: python -m unittest tests.test_runner_render_issues
 """
@@ -7,8 +7,18 @@ from __future__ import annotations
 
 import unittest
 
+from sbx_omnigent.runner.parsing.dispositions import (
+    DISPOSITION_ABSENT,
+    DISPOSITION_RECORDED,
+    Disposition,
+)
 from sbx_omnigent.runner.records.findings import finding_id
-from sbx_omnigent.runner.render.issues import render_findings_ledger
+from sbx_omnigent.runner.render.issues import (
+    render_blocking_summary,
+    render_findings_ledger,
+    render_triage_summary,
+    verdict_tally,
+)
 from tests.support.reviews import review_record
 
 
@@ -108,6 +118,59 @@ class TestTheFindingsLedgerIsAppendOnly(unittest.TestCase):
         doc = self._render([review_record(findings=['x'])])
         self.assertIn('only ever APPENDS', doc)
         self.assertIn('TRACKED, not fixed', doc)
+
+
+class TestTheTriageSummary(unittest.TestCase):
+    """One issue naming every finding triage kept out, and why: more
+    provenance than a filed finding gets, not less."""
+
+    def withheld(self):
+        rec = review_record(reviewer='sec', round_no=2, chunk='m0')
+        return [
+            (rec, 'm0/impl-a/sec/r2#1', 'ports are unchecked',
+             Disposition(DISPOSITION_ABSENT, 'checked ports.rs:40')),
+            (rec, 'm0/impl-a/sec/r2#2', 'no retry',
+             Disposition(DISPOSITION_RECORDED, '')),
+        ]
+
+    def test_the_tally_counts_each_verdict(self) -> None:
+        self.assertEqual(
+            verdict_tally(self.withheld()), '1 absent, 1 recorded',
+        )
+
+    def test_the_title_names_the_module_and_count(self) -> None:
+        title, _body = render_triage_summary(
+            self.withheld(), chunk='m0', report_doc=None,
+        )
+        self.assertEqual(
+            title, '[m0] 2 finding(s) verified against the code and withheld',
+        )
+
+    def test_each_finding_carries_its_verdict_reason_and_id(self) -> None:
+        _title, body = render_triage_summary(
+            self.withheld(), chunk='m0', report_doc='docs/plans/r.md',
+        )
+        self.assertIn('### `absent` — ports are unchecked', body)
+        self.assertIn('- Verifier said: checked ports.rs:40', body)
+        self.assertIn('- Verifier said: _no reason given_', body)
+        self.assertIn('- Finding id: `m0/impl-a/sec/r2#1`', body)
+        self.assertIn('`docs/plans/r.md`', body)
+        self.assertIn('the finding is still live', body)
+
+
+class TestTheBlockingSummary(unittest.TestCase):
+    def test_each_unconcluded_vote_is_named_with_its_ids(self) -> None:
+        rec = review_record(reviewer='bugs', chunk='m0', verdict='BLOCKING')
+        title, body = render_blocking_summary(
+            [rec], chunk='m0', report_doc=None,
+        )
+        self.assertEqual(
+            title, '[m0] 1 blocking report(s) reached no conclusion',
+        )
+        self.assertIn(
+            '- `bugs` blocked `impl-a` in round 1 (ids '
+            '`m0/impl-a/bugs/r1#B*`)', body,
+        )
 
 
 if __name__ == '__main__':

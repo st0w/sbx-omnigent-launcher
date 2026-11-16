@@ -69,6 +69,7 @@ from sbx_omnigent.runner.errors import (
     RunInterrupted,
     _Blocked,
 )
+from sbx_omnigent.runner.filing import FindingFiler
 from sbx_omnigent.runner.gate import VerifyGate
 from sbx_omnigent.runner.ledger import DecisionLedger
 from sbx_omnigent.runner.limits import (
@@ -87,7 +88,6 @@ from sbx_omnigent.runner.limits import (
     _WRITER_TURN_ATTEMPTS,
 )
 from sbx_omnigent.runner.parsing.dispositions import (
-    Disposition,
     parse_blocking_dispositions,
     parse_dispositions,
 )
@@ -154,13 +154,7 @@ from sbx_omnigent.runner.prompts.writer import (
     _WRITER_FINISH_ASK,
 )
 from sbx_omnigent.runner.records.findings import (
-    _ALREADY_TRACKED,
-    _FINDING_LABEL,
-    _blocking_id_prefix,
-    _filed,
-    _withheld,
     finding_id,
-    finding_marker,
 )
 from sbx_omnigent.runner.records.judging import (
     JudgePick,
@@ -173,11 +167,6 @@ from sbx_omnigent.runner.records.results import (
 )
 from sbx_omnigent.runner.records.reviews import (
     ReviewRecord,
-)
-from sbx_omnigent.runner.render.issues import (
-    render_blocking_issue,
-    render_finding_issue,
-    render_findings_ledger,
 )
 from sbx_omnigent.runner.render.judging import (
     render_judge_decision,
@@ -195,6 +184,7 @@ from sbx_omnigent.runner.render.sessions import (
     render_turn_capture,
 )
 from sbx_omnigent.runner.stage_kinds import (
+    recorded_by_scan,
     stage_kind,
     writer_is_terminal,
 )
@@ -539,16 +529,6 @@ class PipelineRunner:
         #: always did. Degrading to the slower-but-correct behaviour is
         #: the right failure for a claim about what was checked.
         self._reviewed_ok: set[str] = set()
-        #: (url, title) per finding filed this run, for the PR body.
-        self._filed_findings: list[tuple[str, str]] = []
-        #: Whether the ``security-*`` labels were checked this run.
-        self._security_labels_checked = False
-        #: What filing did with each finding id this chunk, for the
-        #: security summary: filed with its URL, withheld, or tracked.
-        self._filing_outcomes: dict[str, str] = {}
-        #: The issue naming the blocking reports triage reached no
-        #: conclusion on, if one was filed.
-        self._blocking_summary_url: str | None = None
         #: The judge's choices, so the two-writer race can be
         #: evaluated over a series of modules rather than trusted.
         self._picks: list[JudgePick] = []
@@ -650,6 +630,12 @@ class PipelineRunner:
         )
         self._ledger = DecisionLedger(self._ctx)
         self._triage = FindingTriage(chunk_reviews=self._chunk_reviews)
+        self._filing = FindingFiler(
+            self._ctx,
+            publish_repo=self._publish_repo,
+            triage=self._triage,
+            chunk_reviews=self._chunk_reviews,
+        )
         self._gate = VerifyGate(
             self._ctx,
             egress=gate_egress,
@@ -820,7 +806,7 @@ class PipelineRunner:
                 continue
             self._active_subtask = sub
             self._active_is_first = index == 0
-            self._start_chunk_records()
+            self._filing.start_module()
             mark = len(self._sessions)
             staged = self._namespace_stages(
                 sub.id, loop_stages, planner_ids, writer_ids,
@@ -1417,7 +1403,7 @@ class PipelineRunner:
             self._commit_planning_session(winner, plan_path)
         review_doc = self._commit_review_records(winner, plan_path)
         self._commit_security_reports(winner, plan_path)
-        self._publish_findings(winner, review_doc)
+        self._filing.publish(winner, review_doc)
         security_doc = self._commit_security_summary(winner, plan_path)
         pick_doc = self._commit_judge_record(winner, plan_path)
         open_pr = self._config.publish.mode == 'pr'
@@ -1457,20 +1443,6 @@ class PipelineRunner:
         if span is not None:
             self._link_chunk_changes(span, result, body)
         self._save_state()
-
-    def _start_chunk_records(self) -> None:
-        """
-        Forget the previous chunk's filing records as a chunk starts.
-
-        Each chunk publishes its own pull request, which lists the
-        issues filed for that chunk, and its own security summary, which
-        names that chunk's outcomes. Kept for the whole run, they piled
-        up: when two chunks published from one runner (after a resume),
-        the second PR also listed every issue of the first.
-        """
-        self._filed_findings = []
-        self._filing_outcomes = {}
-        self._blocking_summary_url = None
 
     def _chunk_remote_branch(self, chunk_id: str) -> str:
         """:returns: The remote branch a module publishes to."""
@@ -1658,7 +1630,7 @@ class PipelineRunner:
             reviews=self._chunk_votes(),
             picks=self._chunk_picks(),
             pick_doc=pick_doc,
-            findings=list(self._filed_findings),
+            findings=list(self._filing.filed),
             plan_doc=plan_path if has_plan else None,
             session_doc=(
                 self._session_artifact_path(plan_path)
@@ -2096,7 +2068,7 @@ class PipelineRunner:
         """
         by_stage: dict[str, list[ReviewRecord]] = {}
         for rec in self._chunk_reviews():
-            if self._is_scan(rec):
+            if recorded_by_scan(rec, self._stage_by_id):
                 by_stage.setdefault(rec.stage, []).append(rec)
         if not by_stage:
             return None
@@ -2200,15 +2172,15 @@ class PipelineRunner:
             )
         if not claims:
             where = (
-                f' It is named in {self._blocking_summary_url}.'
-                if self._blocking_summary_url else ''
+                f' It is named in {self._filing.blocking_summary_url}.'
+                if self._filing.blocking_summary_url else ''
             )
             return f'triage reached no conclusion on this report.{where}'
         parts = []
         for ident, claim in claims:
             verdict = self._triage.dispositions.get(ident)
             text = f'`{verdict.verdict}`: {claim}' if verdict else claim
-            outcome = self._filing_outcomes.get(ident)
+            outcome = self._filing.outcomes.get(ident)
             parts.append(f'{text} ({outcome})' if outcome else text)
         return '; '.join(parts)
 
@@ -2228,7 +2200,7 @@ class PipelineRunner:
                 if verdict is not None else ''
             )
             return f'Recorded in the findings ledger{triage}'
-        return self._filing_outcomes.get(
+        return self._filing.outcomes.get(
             ident, 'Not filed: the issue tracker could not be read'
         )
 
@@ -2662,483 +2634,6 @@ class PipelineRunner:
             p = PurePosixPath(plan_artifact_path(self._config))
             return str(p.with_name(f'{p.stem}-{sub.id}{p.suffix}'))
         return plan_artifact_path(self._config)
-
-    def _findings_ledger_path(self) -> str:
-        """
-        The findings ledger's repo path — ONE per pipeline.
-
-        Deliberately not derived from the chunk's plan path the way the
-        reviews and selection records are. Those are per-chunk on
-        purpose; this must accumulate across every chunk AND every run,
-        because the repo is the only thing that survives a run and each
-        chunk's branch carries the ledger forward on its base.
-
-        :returns: e.g. ``docs/plans/discover-findings.md``.
-        """
-        p = PurePosixPath(plan_artifact_path(self._config))
-        return str(p.with_name(f'{p.stem}-findings{p.suffix}'))
-
-    def _publish_findings(
-        self, winner: str, report_doc: str | None
-    ) -> None:
-        """
-        Put this chunk's non-blocking findings where a human looks.
-
-        A tracker when the pipeline publishes to GitHub, the
-        committed file otherwise. The file was the original design
-        and the wrong shape: until the campaign thread carried each
-        chunk's records forward, the ledger restarted every chunk, and
-        even now it lives on one run's branches only. An issue tracker
-        is cross-branch and cross-campaign by construction.
-
-        The file survives for ``publish: local`` and ``mode: none``,
-        where there is no tracker to file into.
-
-        :param winner: The node whose branch publishes.
-        :param report_doc: Repo path of the full reviewer reports.
-        """
-        records = self._findings_to_publish()
-        if self._config.publish.mode == 'pr' and self._publish_repo:
-            if records:
-                self._file_findings_as_issues(records, report_doc)
-            # Separately: a record can carry blocking claims and no
-            # non-blocking findings at all, which is exactly the vote
-            # that stopped a branch.
-            self._file_blocking_findings(report_doc)
-        elif records:
-            self._commit_findings_ledger(winner, report_doc)
-
-    def _findings_to_publish(self) -> list[ReviewRecord]:
-        """
-        The chunk's records whose findings are filed or ledgered.
-
-        A scan stage's earlier rounds are left out: they describe code
-        the writer has since changed, and the final round reports again
-        whatever still applies. Their findings stay in the reviews
-        record and their blocking reports still reach triage.
-
-        :returns: Records with findings, superseded scan rounds removed.
-        """
-        records = self._chunk_reviews()
-        latest: dict[str, int] = {}
-        for rec in records:
-            if self._is_scan(rec):
-                latest[rec.stage] = max(latest.get(rec.stage, 0), rec.round_no)
-        return [
-            rec for rec in records
-            if rec.findings
-            and not (self._is_scan(rec) and rec.round_no < latest[rec.stage])
-        ]
-
-    def _is_scan(self, rec: ReviewRecord) -> bool:
-        """Whether *rec* was recorded by a ``scans:`` stage."""
-        stage = self._stage_by_id.get(rec.stage)
-        return stage is not None and stage.scans is not None
-
-    def _issue_labels(
-        self, rec: ReviewRecord, finding: str | None = None
-    ) -> tuple[str, ...]:
-        """
-        The labels for an issue filed from *rec*.
-
-        ``finding`` always; a scan's finding also its
-        ``security-<severity>``, from its tag, or for a blocking claim
-        (*finding* ``None``) from the most severe level in the round.
-
-        :param rec: The vote the finding came from.
-        :param finding: A non-blocking finding's text, or ``None`` for
-            a blocking claim.
-        :returns: The labels.
-        """
-        if not self._is_scan(rec):
-            return (_FINDING_LABEL,)
-        label = (
-            security_scan.blocking_label(rec.blocking_report)
-            if finding is None
-            else security_scan.defect_label(finding)
-        )
-        if label is None:
-            return (_FINDING_LABEL,)
-        self._ensure_security_labels()
-        return (_FINDING_LABEL, label)
-
-    def _ensure_security_labels(self) -> None:
-        """Create any missing ``security-*`` label, once per run."""
-        if self._security_labels_checked or not self._publish_repo:
-            return
-        self._security_labels_checked = True
-        if not self._wt.ensure_labels(
-            self._publish_repo, security_scan.SECURITY_LABELS
-        ):
-            click.echo(
-                '[findings] WARNING: could not create the security-* '
-                'labels on the publish repo. A scan finding is filed '
-                'without labels if GitHub refuses one.'
-            )
-
-    def _file_findings_as_issues(
-        self, records: list[ReviewRecord], report_doc: str | None
-    ) -> None:
-        """
-        File each new finding as an issue, skipping ones already there.
-
-        Dedup is on the positional id, matched against every issue body
-        OPEN AND CLOSED. Closed matters most: an issue a human closed is
-        a finding they have dealt with, and re-filing it next run is the
-        one behaviour that would make the tracker worthless.
-
-        An unreadable tracker files NOTHING. That is deliberate — a
-        listing failure means every id looks absent, and filing on that
-        basis is exactly how a tracker fills with duplicates. The
-        findings are still in the reviewer report on the branch.
-
-        :param records: This chunk's votes that raised findings.
-        :param report_doc: Repo path of the full reviewer reports.
-        """
-        assert self._publish_repo is not None
-        seen = self._wt.issue_bodies_text(self._publish_repo)
-        if seen is None:
-            click.echo(
-                '[findings] could not read the issue tracker; filing '
-                'nothing rather than risking duplicates. The findings '
-                'are in the reviewer report on the branch.'
-            )
-            return
-        raised = failed = 0
-        withheld: list[tuple[ReviewRecord, str, str, Disposition]] = []
-        for rec in records:
-            for index, finding in rec.filed_findings():
-                ident = finding_id(rec, index)
-                if finding_marker(ident) in seen:
-                    self._filing_outcomes[ident] = _ALREADY_TRACKED
-                    continue
-                verdict = self._triage.dispositions.get(ident)
-                if verdict is not None and not verdict.files:
-                    self._filing_outcomes[ident] = _withheld(verdict)
-                    # A verifier read this against the shipping code and
-                    # concluded it needs nobody. It is summarised below
-                    # with its reason rather than filed — and it is NOT
-                    # marked seen, so a later run that verifies
-                    # differently can still raise it.
-                    withheld.append((rec, ident, finding, verdict))
-                    continue
-                raised += 1
-                title, body = render_finding_issue(
-                    rec, finding, index,
-                    run_id=self._run_id, report_doc=report_doc,
-                )
-                url = self._wt.create_issue(
-                    self._publish_repo, title=title, body=body,
-                    labels=self._issue_labels(rec, finding),
-                )
-                self._filing_outcomes[ident] = _filed(url)
-                if url:
-                    self._filed_findings.append((url, title))
-                else:
-                    failed += 1
-        if withheld:
-            self._file_triage_summary(withheld, report_doc)
-        if not raised:
-            return
-        if failed:
-            click.echo(
-                f'[findings] filed {raised - failed} of {raised} '
-                f'finding(s); {failed} could not be filed and remain in '
-                f'the reviewer report on the branch.'
-            )
-        else:
-            click.echo(
-                f'[findings] filed {raised} non-blocking finding(s) as '
-                f'issues — tracked for triage, nothing was changed.'
-            )
-
-    def _file_triage_summary(
-        self,
-        withheld: list[tuple[ReviewRecord, str, str, Disposition]],
-        report_doc: str | None,
-    ) -> None:
-        """
-        One issue naming every finding the gate kept out, and why.
-
-        The gate's whole risk is that it withholds something it should
-        not have, so a withheld finding gets MORE visible provenance
-        than a filed one, not less: the verdict, the verifier's reason,
-        the reviewer who raised it, and the positional id, in one issue
-        a human can read in a minute and reopen from.
-
-        Deliberately one issue and not N. N is the cost this change
-        exists to remove; zero is a silent drop, which is the one
-        outcome worse than N.
-
-        :param withheld: ``(record, id, text, disposition)`` each.
-        :param report_doc: Repo path of the full reviewer reports.
-        """
-        assert self._publish_repo is not None
-        chunk = withheld[0][0].chunk or self._run_id
-        by_verdict: dict[str, int] = {}
-        for _rec, _ident, _text, verdict in withheld:
-            by_verdict[verdict.verdict] = (
-                by_verdict.get(verdict.verdict, 0) + 1
-            )
-        tally = ', '.join(
-            f'{count} {name}' for name, count in sorted(by_verdict.items())
-        )
-        lines = [
-            f'A verification pass read {len(withheld)} reviewer '
-            f'finding(s) against the code that shipped for `{chunk}` and '
-            f'concluded each needed no issue of its own: {tally}.',
-            '',
-            'Nothing here was discarded. Each is reproduced below with '
-            'the verdict and the reason behind it, and each is still in '
-            'the full reviewer report. **If a verdict looks wrong, the '
-            'finding is still live** — reopen it by filing it from here; '
-            'the runner did not mark any of these as seen, so a later '
-            'run that concludes differently will raise it again.',
-            '',
-        ]
-        for rec, ident, text, verdict in withheld:
-            lines += [
-                f'### `{verdict.verdict}` — {text}',
-                '',
-                f'- Raised by `{rec.reviewer}` in round {rec.round_no}'
-                f' against `{rec.target or chunk}`',
-                f'- Verifier said: {verdict.reason or "_no reason given_"}',
-                f'- Finding id: `{ident}`',
-                '',
-            ]
-        if report_doc:
-            lines += [
-                f'Full reviewer reports, including every finding whether '
-                f'filed or not: `{report_doc}`.',
-            ]
-        url = self._wt.create_issue(
-            self._publish_repo,
-            title=(
-                f'[{chunk}] {len(withheld)} finding(s) verified against '
-                f'the code and withheld'
-            ),
-            body='\n'.join(lines),
-            labels=(_FINDING_LABEL,),
-        )
-        if url:
-            self._filed_findings.append((url, f'[{chunk}] triage summary'))
-        click.echo(
-            f'[findings] withheld {len(withheld)} finding(s) — {tally}; '
-            f'summarised in one issue with the reason for each.'
-        )
-
-    def _file_blocking_findings(self, report_doc: str | None) -> None:
-        """
-        File the blocking claims that survive against shipping code.
-
-        A blocking finding is routed nowhere today: the pipeline
-        assumes the loop-back fix turn closed it, which is true of the
-        branch that was blocked and false for its competitor. When the
-        judge selects the competitor, a defect a reviewer reproduced
-        ships and reaches no tracker.
-
-        Three outcomes, and each is visible:
-
-        - ``reproduces`` — filed, with the same dedup marker and
-          positional id every finding carries.
-        - any other verdict — collected into the existing withheld
-          summary, with the verifier's reason.
-        - a report the verifier concluded nothing about — named in one
-          summary issue, because a blocking finding is usually already
-          fixed and filing each one would bury the tracker.
-
-        :param report_doc: Repo path of the full reviewer reports.
-        """
-        if not self._publish_repo:
-            return
-        reports = self._triage.pending_blocking_reports()
-        if not reports:
-            return
-        seen = self._wt.issue_bodies_text(self._publish_repo)
-        if seen is None:
-            click.echo(
-                '[findings] could not read the issue tracker; filing no '
-                'blocking claims rather than risking duplicates. They '
-                'are in the reviewer report on the branch.'
-            )
-            return
-        to_file, withheld, unconcluded = self._sort_blocking_claims(
-            reports, seen
-        )
-        for rec, ident, claim in to_file:
-            title, body = render_blocking_issue(
-                rec, claim, ident,
-                run_id=self._run_id, report_doc=report_doc,
-            )
-            url = self._wt.create_issue(
-                self._publish_repo, title=title, body=body,
-                labels=self._issue_labels(rec),
-            )
-            self._filing_outcomes[ident] = _filed(url)
-            if url:
-                self._filed_findings.append((url, title))
-        for _rec, ident, _claim, verdict in withheld:
-            self._filing_outcomes[ident] = _withheld(verdict)
-        if withheld:
-            self._file_triage_summary(withheld, report_doc)
-        if unconcluded:
-            self._file_blocking_summary(unconcluded, report_doc)
-        if to_file:
-            click.echo(
-                f'[findings] filed {len(to_file)} blocking claim(s) that '
-                f'still reproduce against the code that shipped.'
-            )
-
-    def _sort_blocking_claims(
-        self, reports: list[tuple[ReviewRecord, str]], seen: str
-    ) -> tuple[
-        list[tuple[ReviewRecord, str, str]],
-        list[tuple[ReviewRecord, str, str, Disposition]],
-        list[ReviewRecord],
-    ]:
-        """
-        Sort verified blocking claims by what happens to each.
-
-        :param reports: ``(record, report)`` for each BLOCKING vote.
-        :param seen: Every issue body already in the tracker.
-        :returns: ``(to_file, withheld, unconcluded)`` — claims that
-            still reproduce, claims a verdict kept out with its reason,
-            and the votes whose report got no conclusion at all.
-        """
-        to_file: list[tuple[ReviewRecord, str, str]] = []
-        withheld: list[tuple[ReviewRecord, str, str, Disposition]] = []
-        unconcluded: list[ReviewRecord] = []
-        for rec, _text in reports:
-            claims = self._triage.blocking_claims_for(rec)
-            if not claims:
-                unconcluded.append(rec)
-                continue
-            for ident, claim in claims:
-                verdict = self._triage.dispositions.get(ident)
-                # Already filed, or recorded with no verdict at all:
-                # neither files, and neither is news to anyone.
-                if verdict is None:
-                    continue
-                if finding_marker(ident) in seen:
-                    self._filing_outcomes[ident] = _ALREADY_TRACKED
-                    continue
-                if verdict.files:
-                    to_file.append((rec, ident, claim))
-                else:
-                    withheld.append((rec, ident, claim, verdict))
-        return to_file, withheld, unconcluded
-
-    def _file_blocking_summary(
-        self, unconcluded: list[ReviewRecord], report_doc: str | None
-    ) -> None:
-        """
-        One issue naming every blocking report nobody concluded on.
-
-        The gap this closes is a silent one: without it, a verifier
-        that skipped a report leaves exactly the same trace as one that
-        checked it and found nothing.
-
-        :param unconcluded: The votes whose reports got no conclusion.
-        :param report_doc: Repo path of the full reviewer reports.
-        """
-        assert self._publish_repo is not None
-        chunk = unconcluded[0].chunk or self._run_id
-        lines = [
-            f'{len(unconcluded)} reviewer(s) BLOCKED a candidate in '
-            f'`{chunk}`, and the verification pass reached no '
-            f'conclusion about their reports against the code that '
-            f'shipped.',
-            '',
-            'A blocking finding is relayed to the writer it blocked and '
-            'is usually fixed there, so this is not evidence of a '
-            'defect. It is the one case the pipeline cannot tell apart '
-            'from a fix that never happened — including a fix that '
-            'landed on one candidate while the judge selected the '
-            'other.',
-            '',
-        ]
-        for rec in unconcluded:
-            lines.append(
-                f'- `{rec.reviewer}` blocked `{rec.target or chunk}` in '
-                f'round {rec.round_no} (ids `{_blocking_id_prefix(rec)}*`)'
-            )
-        lines.append('')
-        if report_doc:
-            lines.append(
-                f'The reports themselves are in `{report_doc}`, with '
-                f'every finding whether filed or not.'
-            )
-        url = self._wt.create_issue(
-            self._publish_repo,
-            title=(
-                f'[{chunk}] {len(unconcluded)} blocking report(s) '
-                f'reached no conclusion'
-            ),
-            body='\n'.join(lines),
-            labels=(_FINDING_LABEL,),
-        )
-        self._blocking_summary_url = url
-        if url:
-            self._filed_findings.append(
-                (url, f'[{chunk}] blocking reports summary')
-            )
-        click.echo(
-            f'[findings] {len(unconcluded)} blocking report(s) were not '
-            f'concluded on; summarised in one issue.'
-        )
-
-    def _commit_findings_ledger(
-        self, winner: str, report_doc: str | None
-    ) -> str | None:
-        """
-        Append this chunk's non-blocking findings to the ledger.
-
-        Reads what is already on the branch and adds to it — see
-        :func:`render_findings_ledger` for why nothing is ever
-        rewritten.
-        Best-effort like the other records: worth having, never worth
-        failing a publish over.
-
-        :param winner: The node whose branch publishes.
-        :param report_doc: Repo path of the full reviewer reports.
-        :returns: The committed path, or ``None`` when nothing was new.
-        """
-        records = self._findings_to_publish()
-        if not records:
-            return None
-        path = self._findings_ledger_path()
-        tree = self._wt.node_worktree_path(self._run_id, winner)
-        try:
-            existing = self._wt.read_tracked_file(tree, path)
-        except click.ClickException:
-            return None
-        doc = render_findings_ledger(
-            records,
-            title=f'Findings — {self._config.name}',
-            existing=existing,
-            report_doc=report_doc,
-        )
-        if doc is None:
-            # Every finding is already on the branch — a re-published
-            # chunk, or a resume. Writing nothing is the correct no-op.
-            return None
-        try:
-            self._wt.write_tracked_file(tree, path, doc)
-            committed = self._wt.commit_node(
-                self._run_id, winner,
-                message='docs: record non-blocking reviewer findings',
-                author='reviewer <reviewer@pipeline.local>',
-            )
-        except click.ClickException:
-            return None
-        if not committed:
-            return None
-        added = sum(len(r.findings) for r in records)
-        click.echo(
-            f'[findings] appended up to {added} non-blocking finding(s) '
-            f'to {path} — tracked for triage, nothing was changed.'
-        )
-        return path
 
     def _chunk_preamble(self) -> str:
         """A directive scoping a builder turn to the active chunk."""
@@ -7977,7 +7472,7 @@ class PipelineRunner:
         self._commit_security_reports(
             branch_node, plan_artifact_path(self._config)
         )
-        self._publish_findings(branch_node, review_doc)
+        self._filing.publish(branch_node, review_doc)
         security_doc = self._commit_security_summary(
             branch_node, plan_artifact_path(self._config)
         )

@@ -189,7 +189,7 @@ def parse_blocking_dispositions(
     writer and usually fixed, so filing every unconcluded one would
     bury the tracker in issues that are already closed. The caller
     surfaces the gap instead (see
-    :meth:`PipelineRunner._file_blocking_summary`).
+    :func:`~sbx_omnigent.runner.render.issues.render_blocking_summary`).
 
     :param text: The verifier's reply.
     :returns: ``(report, claim)`` to conclusion; missing keys mean the
