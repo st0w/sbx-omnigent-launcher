@@ -34,8 +34,8 @@ def parse_decisions_doc(text: str | None) -> list[tuple[str, str]]:
     """
     Read a committed decisions ledger back into ``(module, text)``.
 
-    The inverse of :meth:`PipelineRunner._decisions_doc`, and the reason
-    the ledger can survive a run at all: ``_decisions`` is otherwise
+    The inverse of :meth:`DecisionLedger.document`, and the reason the
+    ledger can survive a run at all: its decisions are otherwise
     populated only from run state, so a campaign that builds ONE module
     per run starts empty every time and carries nothing forward.
 
