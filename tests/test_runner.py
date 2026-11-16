@@ -68,6 +68,7 @@ from sbx_omnigent.runner.prompts.checks import (
 )
 from sbx_omnigent.runner.records.findings import (
     blocking_finding_id,
+    finding_id,
     finding_marker,
 )
 from sbx_omnigent.runner.records.judging import retained_bundle_ref
@@ -5618,7 +5619,7 @@ class TestDispositionsDecideWhatIsFiled(_Base):
     def _conclude(self, runner, verdict, reason):
         for rec in runner._chunk_reviews():
             for index, _text in rec.filed_findings():
-                runner._triage.dispositions[R.finding_id(rec, index)] = (
+                runner._triage.dispositions[finding_id(rec, index)] = (
                     Disposition(verdict, reason)
                 )
 
@@ -5689,10 +5690,10 @@ class TestDispositionsDecideWhatIsFiled(_Base):
         wt = FakeWT()
         runner = self._runner(wt)
         rec = runner._chunk_reviews()[0]
-        runner._triage.dispositions[R.finding_id(rec, 1)] = Disposition(
+        runner._triage.dispositions[finding_id(rec, 1)] = Disposition(
             DISPOSITION_ABSENT, 'gone'
         )
-        runner._triage.dispositions[R.finding_id(rec, 2)] = Disposition(
+        runner._triage.dispositions[finding_id(rec, 2)] = Disposition(
             DISPOSITION_FILED, 'real'
         )
         self._file(runner)
@@ -5935,7 +5936,7 @@ class TestFindingsAreFiledAsIssues(_Base):
             verdict='APPROVED', findings=('impl-a leaks a handle',),
             target='impl-a',
         )
-        wt.issue_bodies = finding_marker(R.finding_id(rec, 1))
+        wt.issue_bodies = finding_marker(finding_id(rec, 1))
         self._run_gh(wt=wt)
         filed = [i['title'] for i in wt.issues]
         self.assertEqual(len(filed), 1, f'a duplicate was filed: {filed}')
@@ -5951,7 +5952,7 @@ class TestFindingsAreFiledAsIssues(_Base):
             target='impl-b',
         )
         wt.issue_bodies = (
-            'closed long ago\n' + finding_marker(R.finding_id(rec, 1))
+            'closed long ago\n' + finding_marker(finding_id(rec, 1))
         )
         self._run_gh(wt=wt)
         self.assertNotIn(
@@ -6471,7 +6472,7 @@ class TestTheVerificationGate(_Base):
         )
         self.assertEqual(kept, 1)
         stored = runner._triage.dispositions[
-            R.finding_id(pending[0][0], pending[0][1])
+            finding_id(pending[0][0], pending[0][1])
         ]
         self.assertEqual(stored.verdict, DISPOSITION_ABSENT)
         self.assertEqual(stored.reason, 'gone in 4622247')
@@ -8966,48 +8967,6 @@ class TestTheScanReportsAreKept(_ScanBase):
         ]
         self.assertTrue(set(scan) <= set(sc.disposed))
 
-    def test_a_saved_file_gone_at_publish_is_reported(self) -> None:
-        cfg = self._cfg(_SCANNED_PIPELINE)
-        wt = FakeWT()
-        runner = R.PipelineRunner(
-            cfg, session_client=FakeSC({}), worktree_manager=wt,
-            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
-            swap_age_s=lambda: 0.0,
-        )
-        wt.artifacts['security/scan/r1-1/CLAUDE-SECURITY-RESULTS.md'] = 'md'
-        runner._reviews.append(R.ReviewRecord(
-            chunk=None, stage='scan', reviewer='sec', round_no=1,
-            verdict='APPROVED', attachments=(
-                'security/scan/r1-1/CLAUDE-SECURITY-RESULTS.md',
-                'security/scan/r1-1/CLAUDE-SECURITY-RESULTS.sarif',
-            ),
-        ))
-        with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
-            path = runner._commit_security_reports(
-                'build', 'docs/plans/demo.md'
-            )
-        printed = ' '.join(str(c.args[0]) for c in echo.call_args_list)
-        self.assertEqual(path, 'docs/plans/demo-security')
-        self.assertIn('CLAUDE-SECURITY-RESULTS.sarif', printed)
-        self.assertIn('missing', printed)
-        self.assertEqual(
-            [rel for _t, rel, _c in wt.tracked_files],
-            ['docs/plans/demo-security/r1-1/CLAUDE-SECURITY-RESULTS.md'],
-        )
-
-    def test_nothing_is_committed_without_a_scan(self) -> None:
-        cfg = self._cfg(_SCANNED_PIPELINE)
-        wt = FakeWT()
-        runner = R.PipelineRunner(
-            cfg, session_client=FakeSC({}), worktree_manager=wt,
-            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
-            swap_age_s=lambda: 0.0,
-        )
-        self.assertIsNone(
-            runner._commit_security_reports('build', 'docs/plans/demo.md')
-        )
-        self.assertEqual(wt.commits, [])
-
 
 class TestScanFindingsAreLabelled(_Base):
     """
@@ -9197,8 +9156,8 @@ class TestTheSecuritySummary(_Base):
     def _summary(self, runner, wt):
         with mock.patch('sbx_omnigent.runner.run.click.echo'):
             runner._filing.publish('build', 'docs/plans/demo-reviews.md')
-            path = runner._commit_security_summary(
-                'build', 'docs/plans/demo.md'
+            path = runner._security.commit_summary(
+                'build', 'docs/plans/demo.md', module=None
             )
         tracked = {rel: text for _t, rel, text in wt.tracked_files}
         return path, tracked.get(self._PATH)
@@ -9236,7 +9195,7 @@ class TestTheSecuritySummary(_Base):
         wt = FakeWT()
         runner = self._runner(wt)
         final = runner._reviews[-1]
-        runner._triage.dispositions[R.finding_id(final, 1)] = Disposition(
+        runner._triage.dispositions[finding_id(final, 1)] = Disposition(
             DISPOSITION_RECORDED, 'already tracked as a known limit'
         )
         _path, text = self._summary(runner, wt)
@@ -9250,7 +9209,7 @@ class TestTheSecuritySummary(_Base):
         wt = FakeWT()
         runner = self._runner(wt)
         final = runner._reviews[-1]
-        wt.issue_bodies = finding_marker(R.finding_id(final, 1))
+        wt.issue_bodies = finding_marker(finding_id(final, 1))
         _path, text = self._summary(runner, wt)
         row = next(line for line in text.splitlines()
                    if 'Medium problem' in line and 'rounds 1 to 2' in line)

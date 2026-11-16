@@ -46,3 +46,14 @@ def findings_ledger_path(config: pipeline.PipelineConfig) -> str:
     """
     p = PurePosixPath(plan_artifact_path(config))
     return str(p.with_name(f'{p.stem}-findings{p.suffix}'))
+
+
+def security_folder(plan_path: str) -> str:
+    """
+    The scan reports' folder: ``<plan>-security`` beside the plan.
+
+    :param plan_path: A module's plan artifact path.
+    :returns: e.g. ``docs/plans/discover-m1-security``.
+    """
+    p = PurePosixPath(plan_path)
+    return str(p.with_name(f'{p.stem}-security'))
