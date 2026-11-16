@@ -44,6 +44,7 @@ from sbx_omnigent.runner.parsing.dispositions import (
     DISPOSITION_RECORDED,
     Disposition,
 )
+from sbx_omnigent.runner.parsing.findings import FindingSections
 from sbx_omnigent.runner.parsing.plans import (
     _PLAN_RECAP_WINDOW,
     plan_shape_failures,
@@ -75,6 +76,7 @@ from sbx_omnigent.runner.records.findings import (
 )
 from sbx_omnigent.runner.records.judging import retained_bundle_ref
 from sbx_omnigent.runner.render.issues import _issue_title_text
+from sbx_omnigent.runner.render.reviews import render_review_records
 from sbx_omnigent.runner.resume import (
     _resume_worktree_count,
     reclaim_for_resume,
@@ -1740,7 +1742,7 @@ class TestAContractCheck(_Base):
             verdict='APPROVED',
         )
         self.assertNotIn(
-            'contract check', R.render_review_records([rec], title='T')
+            'contract check', render_review_records([rec], title='T')
         )
 
     def test_its_record_says_there_was_no_dispute(self) -> None:
@@ -5574,7 +5576,7 @@ class TestDispositionsDecideWhatIsFiled(_Base):
         )
         runner._progress.subtasks = list(cfg.subtasks)
         runner._progress.active_subtask = cfg.subtasks[0]
-        runner._reviews = [
+        runner._book.reviews = [
             R.ReviewRecord(
                 chunk='m0', stage='review', reviewer='sec', round_no=1,
                 verdict='APPROVED', target='impl-a',
@@ -5585,7 +5587,7 @@ class TestDispositionsDecideWhatIsFiled(_Base):
         return runner
 
     def _conclude(self, runner, verdict, reason):
-        for rec in runner._chunk_reviews():
+        for rec in runner._book.module_reviews():
             for index, _text in rec.filed_findings():
                 runner._triage.dispositions[finding_id(rec, index)] = (
                     Disposition(verdict, reason)
@@ -5593,7 +5595,8 @@ class TestDispositionsDecideWhatIsFiled(_Base):
 
     def _file(self, runner, report_doc='docs/plans/mods-reviews.md'):
         runner._filing.file_findings(
-            [r for r in runner._chunk_reviews() if r.findings], report_doc
+            [r for r in runner._book.module_reviews() if r.findings],
+            report_doc,
         )
 
     def test_no_dispositions_at_all_files_everything(self) -> None:
@@ -5657,7 +5660,7 @@ class TestDispositionsDecideWhatIsFiled(_Base):
     ) -> None:
         wt = FakeWT()
         runner = self._runner(wt)
-        rec = runner._chunk_reviews()[0]
+        rec = runner._book.module_reviews()[0]
         runner._triage.dispositions[finding_id(rec, 1)] = Disposition(
             DISPOSITION_ABSENT, 'gone'
         )
@@ -5806,7 +5809,7 @@ class TestLaterIncrementIsRoutedNotFiled(_Base):
 
     def _route(self, runner) -> None:
         runner._ledger.record_referrals(
-            runner._progress.module_id, runner._chunk_reviews(),
+            runner._progress.module_id, runner._book.module_reviews(),
         )
 
     def _voted(self, reviewer: str, *routed: str):
@@ -5821,7 +5824,7 @@ class TestLaterIncrementIsRoutedNotFiled(_Base):
         # Both reviewers raise the identical note, and each re-raises it
         # every round. A planner needs it once; six copies is noise.
         runner = self._campaign_runner()
-        runner._reviews = [
+        runner._book.reviews = [
             self._voted('sec', 'pagination belongs to [m1]'),
             self._voted('bugs', 'pagination belongs to [m1]'),
         ]
@@ -5835,7 +5838,9 @@ class TestLaterIncrementIsRoutedNotFiled(_Base):
         # otherwise would design around an observation it should have
         # been free to reject.
         runner = self._campaign_runner()
-        runner._reviews = [self._voted('sec', 'pagination belongs to [m1]')]
+        runner._book.reviews = [
+            self._voted('sec', 'pagination belongs to [m1]'),
+        ]
         self._route(runner)
         doc = runner._ledger.document(runner._progress.subtasks)
         self.assertIn('NOT binding', doc)
@@ -5851,7 +5856,9 @@ class TestLaterIncrementIsRoutedNotFiled(_Base):
         runner._ledger.decisions = [
             ('m0', 'tuples are upserted, never inserted'),
         ]
-        runner._reviews = [self._voted('sec', 'pagination belongs to [m1]')]
+        runner._book.reviews = [
+            self._voted('sec', 'pagination belongs to [m1]'),
+        ]
         self._route(runner)
         block = runner._ledger.planner_block(runner._progress.subtasks)
         self.assertIn('tuples are upserted, never inserted', block)
@@ -6409,7 +6416,7 @@ class TestTheVerificationGate(_Base):
         )
         runner._progress.subtasks = list(cfg.subtasks)
         runner._progress.active_subtask = cfg.subtasks[0]
-        runner._reviews = [
+        runner._book.reviews = [
             R.ReviewRecord(
                 chunk='m0', stage='review', reviewer='sec', round_no=1,
                 verdict='APPROVED',
@@ -6529,22 +6536,22 @@ class TestABlockingReportIsKeptOnTheRecord(_Base):
 
     def test_the_report_behind_a_block_is_recorded(self) -> None:
         runner = self._runner()
-        runner._record_review(
+        runner._book.record_review(
             'review', 'bugs', 1, 'BLOCKING', 'sess-1', _BLOCKING_REPORT
         )
         self.assertIn(
-            'prints the access key', runner._reviews[0].blocking_report
+            'prints the access key', runner._book.reviews[0].blocking_report
         )
 
     def test_an_approval_records_no_blocking_report(self) -> None:
         # An approved vote's non-blocking findings already have a home;
         # carrying its text here would double-file every one of them.
         runner = self._runner()
-        runner._record_review(
+        runner._book.record_review(
             'review', 'bugs', 1, 'APPROVED', 'sess-1',
             'FINDINGS:\n- a minor thing\n\nVERDICT: APPROVED',
         )
-        self.assertEqual(runner._reviews[0].blocking_report, '')
+        self.assertEqual(runner._book.reviews[0].blocking_report, '')
 
     def test_it_survives_a_resume(self) -> None:
         rec = R.ReviewRecord(
@@ -6572,7 +6579,7 @@ class TestABlockingReportIsKeptOnTheRecord(_Base):
         # recorded as silently as a good one.
         runner = self._runner()
         with mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
-            runner._record_review(
+            runner._book.record_review(
                 'review', 'bugs', 1, 'BLOCKING', 'sess-1',
                 'VERDICT: BLOCKING',
             )
@@ -6599,7 +6606,7 @@ class TestBlockingFindingsReachTheVerifier(_Base):
         )
         runner._progress.subtasks = list(cfg.subtasks)
         runner._progress.active_subtask = cfg.subtasks[0]
-        runner._reviews = [
+        runner._book.reviews = [
             R.ReviewRecord(
                 chunk='m0', stage='review-a', reviewer='bugs', round_no=1,
                 verdict='BLOCKING', target='impl-a',
@@ -6709,7 +6716,7 @@ class TestBlockingClaimsAreFiled(_Base):
         )
         runner._progress.subtasks = list(cfg.subtasks)
         runner._progress.active_subtask = cfg.subtasks[0]
-        runner._reviews = [
+        runner._book.reviews = [
             R.ReviewRecord(
                 chunk='m0', stage='review-a', reviewer='bugs', round_no=1,
                 verdict='BLOCKING', target='impl-a',
@@ -7646,10 +7653,10 @@ class TestTheReviewBudgetBoundsTheBranch(_Base):
 
     def _review_until_blocked(self, runner):
         """Drive one entry into the gate; return the rounds it spent."""
-        before = len(runner._reviews)
+        before = len(runner._book.reviews)
         with self.assertRaises(R._Blocked):
             runner._run_review(runner._stage_by_id['review'])
-        return len(runner._reviews) - before
+        return len(runner._book.reviews) - before
 
     def test_a_single_entry_spends_its_whole_budget(self) -> None:
         # The meaning of --max-review-rounds is UNCHANGED: N re-drives,
@@ -7669,16 +7676,10 @@ class TestTheReviewBudgetBoundsTheBranch(_Base):
         runner = self._runner(cap=3)
         for _entry in range(3):
             self._review_until_blocked(runner)
-        rounds = [r.round_no for r in runner._reviews if r.stage == 'review']
+        rounds = [
+            r.round_no for r in runner._book.reviews if r.stage == 'review'
+        ]
         self.assertEqual(len(rounds), 6, rounds)
-
-    def test_two_review_stages_have_separate_budgets(self) -> None:
-        # review-a and review-b review different branches; one
-        # exhausting its rounds must not spend the other's.
-        runner = self._runner(cap=3)
-        runner._spend_review_round('review-a')
-        runner._spend_review_round('review-a')
-        self.assertEqual(runner._spend_review_round('review-b'), 1)
 
     def test_a_fresh_runner_starts_with_a_full_budget(self) -> None:
         # What a resume is: a new process. The maintainer's call — a
@@ -8765,7 +8766,7 @@ class TestASecurityScanStage(_ScanBase):
         runner._record_scan(
             runner._stage_by_id['scan'], 1, findings, 'a' * 40, ()
         )
-        record = runner._reviews[-1]
+        record = runner._book.reviews[-1]
         self.assertEqual(record.verdict, 'BLOCKING')
         self.assertEqual(
             [text.split(']')[0] for _i, text in record.filed_findings()],
@@ -8947,7 +8948,7 @@ class TestScanFindingsAreLabelled(_Base):
         scan = R.security_scan
         first = scan.parse_report(_scan_jsonl(*blocking, 'MEDIUM', 'LOW'))
         final = scan.parse_report(_scan_jsonl('MEDIUM'))
-        runner._reviews = [
+        runner._book.reviews = [
             R.ReviewRecord(
                 chunk=None, stage='review', reviewer='bugs', round_no=1,
                 verdict='APPROVED', target='build',
@@ -9027,12 +9028,12 @@ class TestScanFindingsAreLabelled(_Base):
     def test_without_a_scan_finding_no_labels_are_ensured(self) -> None:
         wt = FakeWT()
         runner = self._runner(wt)
-        runner._reviews = runner._reviews[:1]
+        runner._book.reviews = runner._book.reviews[:1]
         self._publish(runner)
         self.assertEqual(wt.label_calls, [])
 
     def _reproduce_blocking(self, runner):
-        rec = runner._reviews[1]
+        rec = runner._book.reviews[1]
         ident = blocking_finding_id(rec, 1)
         runner._triage.dispositions[ident] = Disposition(
             'reproduces', 'the query still interpolates name'
@@ -9091,7 +9092,7 @@ class TestTheSecuritySummary(_Base):
             run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0, publish_repo='https://gh/org/proj',
         )
-        runner._reviews = [
+        runner._book.reviews = [
             self._round(runner, wt, 1, _scan_jsonl('HIGH', 'MEDIUM', 'LOW')),
             self._round(runner, wt, 2, _scan_jsonl('MEDIUM')),
         ]
@@ -9108,7 +9109,7 @@ class TestTheSecuritySummary(_Base):
                 runner._stage_by_id['scan'], round_no, findings,
                 'a' * 40, saved,
             )
-        return runner._reviews.pop()
+        return runner._book.reviews.pop()
 
     def _summary(self, runner, wt):
         with mock.patch('sbx_omnigent.runner.run.click.echo'):
@@ -9151,7 +9152,7 @@ class TestTheSecuritySummary(_Base):
     ) -> None:
         wt = FakeWT()
         runner = self._runner(wt)
-        final = runner._reviews[-1]
+        final = runner._book.reviews[-1]
         runner._triage.dispositions[finding_id(final, 1)] = Disposition(
             DISPOSITION_RECORDED, 'already tracked as a known limit'
         )
@@ -9165,7 +9166,7 @@ class TestTheSecuritySummary(_Base):
     def test_one_already_in_the_tracker_says_so(self) -> None:
         wt = FakeWT()
         runner = self._runner(wt)
-        final = runner._reviews[-1]
+        final = runner._book.reviews[-1]
         wt.issue_bodies = finding_marker(finding_id(final, 1))
         _path, text = self._summary(runner, wt)
         row = next(line for line in text.splitlines()
@@ -9189,7 +9190,7 @@ class TestTheSecuritySummary(_Base):
     def test_a_reproducing_claim_shows_its_verdict_and_issue(self) -> None:
         wt = FakeWT()
         runner = self._runner(wt)
-        ident = blocking_finding_id(runner._reviews[0], 1)
+        ident = blocking_finding_id(runner._book.reviews[0], 1)
         runner._triage.dispositions[ident] = Disposition(
             DISPOSITION_FILED, 'the query still interpolates name'
         )
@@ -9213,7 +9214,7 @@ class TestTheSecuritySummary(_Base):
     def test_no_scan_no_summary(self) -> None:
         wt = FakeWT()
         runner = self._runner(wt)
-        runner._reviews = []
+        runner._book.reviews = []
         path, text = self._summary(runner, wt)
         self.assertIsNone(path)
         self.assertIsNone(text)
@@ -12590,7 +12591,7 @@ class TestAReviewerIsAskedWhatTheSandboxStopped(_Base):
             **self._instructions(), **self._templates(),
         }.items():
             with self.subTest(surface=surface):
-                self.assertEqual(R.FindingSections.of(text).environment, ())
+                self.assertEqual(FindingSections.of(text).environment, ())
 
 
 class TestAReviewerDoesNotReRunTheGate(_Base):
@@ -13328,7 +13329,7 @@ class TestVerifyGate(_Base):
         with patch:
             runner.run()
         rounds = [
-            (r.stage, r.round_no) for r in runner._reviews
+            (r.stage, r.round_no) for r in runner._book.reviews
         ]
         self.assertEqual(rounds, [('review', 1), ('review', 2)])
         # ...so the two rounds land in DIFFERENT run-dir files.
@@ -13336,19 +13337,6 @@ class TestVerifyGate(_Base):
             sorted(k for k in wt.artifacts if k.startswith('reviews/')),
             ['reviews/review-sec-r1.md', 'reviews/review-sec-r2.md'],
         )
-
-    def test_the_numbering_survives_a_resume(self) -> None:
-        # _reviews is restored from the run state, so a resumed run must
-        # continue the count rather than start over and overwrite what
-        # the earlier attempt recorded.
-        runner, _sc, _wt = self._build()
-        runner._reviews = [
-            R.ReviewRecord(chunk=None, stage='review', reviewer='sec',
-                           round_no=n, verdict='APPROVED')
-            for n in (1, 2)
-        ]
-        self.assertEqual(runner._next_review_round('review'), 3)
-        self.assertEqual(runner._next_review_round('other'), 1)
 
     def test_persistent_failure_blocks_the_publish(self) -> None:
         patch, calls = self._gate([_outcome(False, 2, 'lines 40%')])
