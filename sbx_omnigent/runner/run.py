@@ -57,7 +57,6 @@ from sbx_omnigent import (
     pipeline,
     readback,
     security_scan,
-    verify,
 )
 from sbx_omnigent.launch_args import launch_args_for
 from sbx_omnigent.runner import state
@@ -119,9 +118,7 @@ from sbx_omnigent.runner.parsing.verdicts import (
 )
 from sbx_omnigent.runner.paths import (
     chunk_plan_path,
-    plan_artifact_path,
     security_folder,
-    session_record_path,
 )
 from sbx_omnigent.runner.prompts.checks import (
     _APPROVED_AS_IS,
@@ -157,12 +154,11 @@ from sbx_omnigent.runner.prompts.writer import (
     _WRITER_FINISH,
     _WRITER_FINISH_ASK,
 )
+from sbx_omnigent.runner.publish import Publisher
 from sbx_omnigent.runner.records.judging import (
     JudgePick,
 )
 from sbx_omnigent.runner.records.results import (
-    _COMMIT_RE,
-    ChunkSpan,
     NodeResult,
     RunResult,
 )
@@ -174,8 +170,6 @@ from sbx_omnigent.runner.render.judging import (
 )
 from sbx_omnigent.runner.render.pr_body import (
     environment_by_stage,
-    render_pr_body,
-    short_title,
 )
 from sbx_omnigent.runner.render.reviews import (
     render_review_records,
@@ -204,8 +198,6 @@ from sbx_omnigent.swarm_session import (
 )
 from sbx_omnigent.worktrees import (
     WorktreeManager,
-    github_slug,
-    pr_number,
 )
 
 #: Ways to tell a coverage tool not to count a line. Each ecosystem
@@ -464,7 +456,6 @@ class PipelineRunner:
         self._run_id = run_id
         self._agent_ids = agent_ids
         self._publish_repo = publish_repo or config.repo
-        self._preflight_publish()
         self._max_rounds = max_review_rounds
         self._turn_timeout = turn_timeout
         self._keep = keep
@@ -481,10 +472,6 @@ class PipelineRunner:
         self._completed: set[str] = set()
         #: Chunk ids already built AND published.
         self._completed_chunks: set[str] = set()
-        #: Per published chunk: the commit the NEXT chunk is built on
-        #: (``seed``) and its PR URL (``pr``). Lets the next chunk's PR
-        #: link its own changes only.
-        self._chunk_publishes: dict[str, dict[str, str]] = {}
         #: Nodes withdrawn because their review never reached consensus
         #: — the blocked review stage and the writer it was vetting. A
         #: forfeited candidate is excluded from judging: comparing a
@@ -512,11 +499,6 @@ class PipelineRunner:
         #: from its state on resume. For DISPOSAL ONLY — never driven,
         #: never treated as live (see :meth:`_dispose_stale_sessions`).
         self._stale_sessions: list[str] = []
-        #: winner node -> the verification result that let it publish.
-        #: Kept because that captured output IS the pull request's
-        #: evidence; discarding it would leave the PR asserting the
-        #: tests passed instead of showing it.
-        self._evidence: dict[str, verify.VerifyOutcome] = {}
         #: Every reviewer vote cast this run, with the report behind it.
         #: Buffered rather than written to a branch as it happens: a
         #: competition is still live during review, so nothing may
@@ -614,8 +596,6 @@ class PipelineRunner:
         #: each running two reviewers is four guests — and a per-call
         #: cap would bound each level while their product ran away.
         self._node_slots = threading.Semaphore(_MAX_PARALLEL_NODES)
-        #: Publish results accumulated across passes/chunks.
-        self._published: list[str] = []
         self._stage_by_id: dict[str, pipeline.PipelineStage] = {}
         for stage in pipeline._iter_stages(config.stages):
             if stage.run or stage.parallel:
@@ -651,6 +631,18 @@ class PipelineRunner:
             filing=self._filing,
             chunk_reviews=self._chunk_reviews,
         )
+        self._publisher = Publisher(
+            self._ctx,
+            publish_repo=self._publish_repo,
+            records=self._records,
+            ledger=self._ledger,
+            security=self._security,
+            filing=self._filing,
+            chunk_reviews=self._chunk_reviews,
+            chunk_picks=self._chunk_picks,
+            save_state=self._save_state,
+        )
+        self._publisher.preflight()
         self._gate = VerifyGate(
             self._ctx,
             egress=gate_egress,
@@ -658,33 +650,6 @@ class PipelineRunner:
             rerun_stage=self._rerun_stage,
         )
 
-    def _preflight_publish(self) -> None:
-        """
-        Refuse at startup if ``mode: pr`` cannot open a PR.
-
-        The publish target defaults to the pipeline's ``repo:``, which
-        is commonly a LOCAL PATH — and a local path has no
-        ``owner/repo`` for ``gh -R``. That used to survive provisioning
-        the whole build, then die inside ``publish_node`` at the END of
-        the first chunk, throwing away a finished module. Parsing the
-        slug here turns a run-ending surprise into a two-second error
-        with the fix in it.
-
-        :raises PipelineRunError: If PR mode has a non-GitHub target.
-        """
-        if self._config.publish.mode != 'pr':
-            return
-        try:
-            github_slug(self._publish_repo)
-        except click.ClickException as exc:
-            raise PipelineRunError(
-                f"publish mode 'pr' opens a GitHub PR, but the publish "
-                f'target is {self._publish_repo!r}, which has no '
-                f'owner/repo. Either pass --publish-repo with the '
-                f'GitHub URL (keeping repo: local for a fast clone), or '
-                f"set publish.mode to 'local' to push the branch "
-                f'without opening a PR.'
-            ) from exc
 
     # ── public entry ──────────────────────────────────────────────
 
@@ -751,7 +716,7 @@ class PipelineRunner:
         return RunResult(
             run_id=self._run_id,
             status='blocked' if blocked else 'completed',
-            published='; '.join(self._published) or None,
+            published='; '.join(self._publisher.published) or None,
             final_node=self._last_branch_node,
             blocked_stage=blocked,
             nodes=dict(self._nodes),
@@ -886,7 +851,7 @@ class PipelineRunner:
         )
         self._completed = restored.completed
         self._completed_chunks = restored.completed_chunks
-        self._chunk_publishes = restored.chunk_publishes
+        self._publisher.chunk_publishes = restored.chunk_publishes
         self._reviewed_ok = restored.reviewed_ok
         self._stale_sessions = restored.sessions
         self._ledger.decisions = restored.decisions
@@ -898,7 +863,7 @@ class PipelineRunner:
         self._reader_turns = restored.reader_turns
         self._picks = restored.picks
         self._plan_of_record = restored.plan_of_record
-        self._published = restored.published
+        self._publisher.published = restored.published
         self._last_branch_node = restored.last_branch_node
         self._subtasks = restored.subtasks
         self._nodes.update(restored.nodes)
@@ -986,13 +951,13 @@ class PipelineRunner:
                 blocking_claims=self._triage.blocking_claims,
                 harness_versions=self._harness_versions,
                 completed_chunks=self._completed_chunks,
-                chunk_publishes=self._chunk_publishes,
+                chunk_publishes=self._publisher.chunk_publishes,
                 reviewed_ok=self._reviewed_ok,
                 reviews=self._reviews,
                 reader_turns=self._reader_turns,
                 picks=self._picks,
                 last_branch_node=self._last_branch_node,
-                published=self._published,
+                published=self._publisher.published,
                 nodes=self._nodes,
             )
         )
@@ -1028,7 +993,7 @@ class PipelineRunner:
         """
         outcome = self._gate.check(winner, stages)
         if outcome is not None:
-            self._evidence[winner] = outcome
+            self._publisher.evidence[winner] = outcome
 
     def _rerun_stage(self, stage: pipeline.PipelineStage) -> None:
         """
@@ -1393,78 +1358,16 @@ class PipelineRunner:
     def _publish_chunk(
         self, sub: pipeline.Subtask, winner: str, *, first: bool
     ) -> None:
-        """Publish one chunk's winner to ``pipeline/<run>-<chunk>``."""
-        if self._config.publish.mode == 'none':
-            return
+        """Publish one module's winner; see :class:`Publisher`."""
         plan, plan_path = self._chunk_plan_of_record(sub, first=first)
-        if plan:
-            self._records.commit_plan(winner, plan_path, plan)
-        self._ledger.record_referrals(
-            self._active_subtask.id if self._active_subtask else None,
-            self._chunk_reviews(),
+        self._publisher.publish_module(
+            sub, winner,
+            first=first,
+            plan=plan,
+            plan_path=plan_path,
+            prior=self._prior_chunk(),
+            subtasks=self._subtasks,
         )
-        self._ledger.commit(winner, self._subtasks)
-        # Flat mode has ONE planner for the whole campaign, so its
-        # session record is the same conversation every time, committed
-        # once and carried to later chunks by the campaign thread.
-        # Per-module mode has a planner per module, and a per-module
-        # path, so it records every chunk.
-        if self._config.subtasks or first:
-            self._records.commit_planning_session(
-                winner, plan_path, module=self._active_subtask
-            )
-        review_doc = self._records.commit_reviews(
-            winner, plan_path, module=self._active_subtask
-        )
-        self._security.commit_reports(winner, plan_path)
-        self._filing.publish(winner, review_doc)
-        security_doc = self._security.commit_summary(
-            winner, plan_path, module=self._active_subtask
-        )
-        pick_doc = self._records.commit_selection(
-            winner, plan_path, module=self._active_subtask
-        )
-        open_pr = self._config.publish.mode == 'pr'
-        span = self._chunk_span(winner) if open_pr else None
-        body = self._pr_body(
-            winner, plan_path,
-            summary=f'**[{sub.id}]** {sub.title}',
-            review_doc=review_doc,
-            pick_doc=pick_doc,
-            series_note=self._series_note(span, None) if span else None,
-            security_doc=security_doc,
-        )
-        # The winner with every record above committed: the campaign
-        # branch moves here once this returns, so it is the commit the
-        # next chunk is built on, and where the next PR's own changes
-        # start.
-        seed = self._wt.hub_branch_tip(self._run_id, winner) or ''
-        result = self._wt.publish_node(
-            self._run_id, winner, self._publish_repo,
-            title=(
-                f'[pipeline] {self._config.name} — {sub.id}: '
-                f'{short_title(sub.title)}'
-            ),
-            body=body,
-            # Always the configured base. Stacking on the previous
-            # chunk's branch closed this PR when that one merged with
-            # its branch deleted.
-            base_branch=self._config.base_branch,
-            remote_branch=self._chunk_remote_branch(sub.id),
-            open_pr=open_pr,
-        )
-        self._chunk_publishes[sub.id] = {
-            'seed': seed if _COMMIT_RE.fullmatch(seed) else '',
-            'pr': result.strip() if open_pr else '',
-        }
-        self._published.append(result)
-        if span is not None:
-            self._link_chunk_changes(span, result, body)
-        self._save_state()
-
-    def _chunk_remote_branch(self, chunk_id: str) -> str:
-        """:returns: The remote branch a module publishes to."""
-        return f'pipeline/{self._run_id}-{chunk_id}'
 
     def _prior_chunk(self) -> str | None:
         """
@@ -1487,179 +1390,6 @@ class PipelineRunner:
             if sub.id in self._completed_chunks:
                 prior = sub.id
         return prior
-
-    def _chunk_span(self, winner: str) -> ChunkSpan | None:
-        """
-        What the active chunk's PR adds on top of the previous chunk.
-
-        :param winner: The node whose branch this chunk publishes.
-        :returns: The span, or ``None`` for the first chunk, and when
-            the base branch already holds the commit this chunk was
-            built on: the PR then shows only its own changes, and a
-            note telling the reviewer to merge the earlier PR first
-            would be false. Its commits are ``''`` when either end is
-            unknown or not a git object id, and the PR then goes
-            without the link.
-        """
-        prior = self._prior_chunk()
-        active = self._active_subtask
-        if prior is None or active is None:
-            return None
-        record = self._chunk_publishes.get(prior, {})
-        start = record.get('seed', '')
-        end = self._wt.hub_branch_tip(self._run_id, winner) or ''
-        linkable = bool(
-            _COMMIT_RE.fullmatch(start) and _COMMIT_RE.fullmatch(end)
-        )
-        base = self._config.base_branch or 'main'
-        if linkable and self._publish_repo and self._wt.base_contains(
-            self._publish_repo, branch=base, commit=start
-        ):
-            # Live: [k2] was merged before [k3] started, and [k3]'s PR
-            # still said to merge [k2]'s first. Unknown keeps the note.
-            click.echo(
-                f'[publish] {active.id}: everything it was built on is '
-                f'already in {base}, so its PR shows only its own '
-                f'changes; no series note.'
-            )
-            return None
-        return ChunkSpan(
-            chunk=active.id,
-            prior=prior,
-            prior_pr=record.get('pr', ''),
-            start=start if linkable else '',
-            end=end if linkable else '',
-            slug=github_slug(self._publish_repo),
-            base=base,
-        )
-
-    @staticmethod
-    def _series_note(span: ChunkSpan, number: int | None) -> str:
-        """
-        The top of a chained chunk's PR description.
-
-        :param span: What this chunk adds on the previous one.
-        :param number: This PR's number once it exists. Before then the
-            link is GitHub's read-only comparison; after, the view of
-            this PR's own commits, which can be reviewed and commented
-            on like the PR itself.
-        :returns: A markdown block quote.
-        """
-        prior_number = pr_number(span.prior_pr, span.slug)
-        prior_ref = (
-            f'#{prior_number}' if prior_number
-            else f"[{span.prior}]'s pull request"
-        )
-        lines = [
-            f'> **Part of a series.** This PR targets `{span.base}` and '
-            f'is built on **[{span.prior}]** ({prior_ref}), so until that '
-            f"merges it also shows [{span.prior}]'s changes.",
-        ]
-        if span.start and span.end:
-            url = (
-                f'https://github.com/{span.slug}/pull/{number}/files/'
-                f'{span.start}..{span.end}'
-                if number
-                else f'https://github.com/{span.slug}/compare/'
-                f'{span.start}...{span.end}'
-            )
-            lines += [
-                '>',
-                f"> **[Review [{span.chunk}]'s changes only]({url})**: "
-                f"its own commits, without [{span.prior}]'s.",
-            ]
-        lines += [
-            '>',
-            f'> Merge {prior_ref} first. Once it has merged, this PR '
-            f'shows only its own changes. If it was squashed or rebased, '
-            f'press **Update branch** on this PR first.',
-        ]
-        return '\n'.join(lines)
-
-    def _link_chunk_changes(
-        self, span: ChunkSpan, pr_url: str, body: str
-    ) -> None:
-        """
-        Point the note at this PR's own view of its commits.
-
-        Best-effort: the PR already exists and links the comparison
-        view, so a failed edit is reported and the run carries on.
-
-        :param span: What this chunk adds on the previous one.
-        :param pr_url: The URL ``gh pr create`` printed.
-        :param body: The description the PR was opened with.
-        """
-        if not (span.start and span.end):
-            return
-        number = pr_number(pr_url, span.slug)
-        edited = (
-            body.replace(
-                self._series_note(span, None),
-                self._series_note(span, number),
-            )
-            if number
-            else body
-        )
-        try:
-            if number is None:
-                raise click.ClickException(
-                    f'{pr_url.strip()!r} is not a pull request URL'
-                )
-            self._wt.edit_pr_body(self._publish_repo, pr_url, edited)
-        except click.ClickException as exc:
-            click.echo(
-                f'[publish] {span.chunk}: opened {pr_url.strip()} but '
-                f'could not add the link to its own changes '
-                f'({exc.message}). Its description links the comparison '
-                f'view instead.'
-            )
-
-    def _pr_body(
-        self,
-        winner: str,
-        plan_path: str,
-        *,
-        summary: str,
-        task: str | None = None,
-        review_doc: str | None = None,
-        pick_doc: str | None = None,
-        series_note: str | None = None,
-        security_doc: str | None = None,
-    ) -> str:
-        """
-        The pull-request body for a branch about to publish.
-
-        :param winner: The node whose branch publishes (its verification
-            evidence, if any, is embedded).
-        :param plan_path: Repo path of this branch's plan of record.
-        :param summary: One-line description of what shipped.
-        :param task: The original ask, when it adds to the summary.
-        :param review_doc: Repo path of the committed reviewer reports.
-        :param series_note: What a chained chunk's PR says first.
-        :param security_doc: Repo path of the security scan summary.
-        :returns: The markdown body.
-        """
-        has_plan = any(
-            is_planner(stage, self._config) for stage in self._config.stages
-        )
-        return render_pr_body(
-            summary=summary,
-            series_note=series_note,
-            task=task,
-            review_doc=review_doc,
-            reviews=self._chunk_votes(),
-            picks=self._chunk_picks(),
-            pick_doc=pick_doc,
-            findings=list(self._filing.filed),
-            plan_doc=plan_path if has_plan else None,
-            session_doc=(
-                session_record_path(plan_path)
-                if has_plan
-                else None
-            ),
-            outcome=self._evidence.get(winner),
-            security_doc=security_doc,
-        )
 
     def _next_review_round(self, stage_id: str) -> int:
         """
@@ -1946,24 +1676,6 @@ class PipelineRunner:
         """:returns: The votes belonging to the publishing chunk."""
         chunk = self._active_subtask.id if self._active_subtask else None
         return [r for r in self._reviews if r.chunk == chunk]
-
-    def _chunk_votes(self) -> list[ReviewRecord]:
-        """
-        The publishing chunk's records that voted on its branch.
-
-        A contract check is recorded beside the reviewers so its
-        findings are kept, but it read the contract, not the branch, so
-        the pull request's roster of approvals leaves it out.
-
-        :returns: The chunk's review records, contract checks excluded.
-        """
-        return [
-            r for r in self._chunk_reviews()
-            if not (
-                (stage := self._stage_by_id.get(r.stage)) is not None
-                and stage.checks
-            )
-        ]
 
     def _security_folder_name(self) -> str:
         """The scan reports' folder name, for the record to cite."""
@@ -6975,60 +6687,11 @@ class PipelineRunner:
         branch_node = node.selected if node.kind == 'judge' else node_id
         if branch_node is None:
             return None
-        # Commit the plan of record onto the branch about to ship, so
-        # the approved design travels with the code in the PR.
-        if self._plan_of_record:
-            self._records.commit_plan(
-                branch_node,
-                plan_artifact_path(self._config),
-                self._plan_of_record,
-            )
-            self._records.commit_planning_session(
-                branch_node,
-                plan_artifact_path(self._config),
-                module=self._active_subtask,
-            )
-        # NOT gated on a plan existing: a pipeline with no planner still
-        # has reviewers, and their reports are just as much the record.
-        review_doc = self._records.commit_reviews(
+        return self._publisher.publish_run(
             branch_node,
-            plan_artifact_path(self._config),
+            plan=self._plan_of_record,
             module=self._active_subtask,
         )
-        self._security.commit_reports(
-            branch_node, plan_artifact_path(self._config)
-        )
-        self._filing.publish(branch_node, review_doc)
-        security_doc = self._security.commit_summary(
-            branch_node,
-            plan_artifact_path(self._config),
-            module=self._active_subtask,
-        )
-        pick_doc = self._records.commit_selection(
-            branch_node,
-            plan_artifact_path(self._config),
-            module=self._active_subtask,
-        )
-        result = self._wt.publish_node(
-            self._run_id,
-            branch_node,
-            self._publish_repo,
-            title=f'[pipeline] {self._config.name}',
-            body=self._pr_body(
-                branch_node,
-                plan_artifact_path(self._config),
-                summary=f'Pipeline `{self._config.name}`',
-                task=self._config.task,
-                review_doc=review_doc,
-                pick_doc=pick_doc,
-                security_doc=security_doc,
-            ),
-            base_branch=self._config.base_branch,
-            open_pr=self._config.publish.mode == 'pr',
-        )
-        self._published.append(result)
-        self._save_state()
-        return result
 
     def _teardown(self, *, preserve_run: bool = False) -> None:
         """

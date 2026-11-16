@@ -28,7 +28,7 @@ from unittest import mock
 import click
 from click.testing import CliRunner, Result
 
-from sbx_omnigent import egress, pipeline, sbx_cli
+from sbx_omnigent import egress, pipeline, sbx_cli, verify
 from sbx_omnigent import image as sbx_image
 from sbx_omnigent.defaults import DEFAULT_EGRESS_ALLOW, DEFAULT_HOST_IMAGE
 from sbx_omnigent.runner import cli
@@ -4838,7 +4838,7 @@ class TestALaterModuleIsBuiltOnTheEarlierRecords(_Base):
         )
         wt = _CampaignTipWT()
         with mock.patch.object(
-            R.verify, 'run_verification',
+            verify, 'run_verification',
             return_value=_outcome(False, 2, 'short'),
         ), self.assertRaises(R.PipelineRunError):
             self._run(
@@ -9320,7 +9320,7 @@ class TestTheSecuritySummary(_Base):
 
     def test_the_pull_request_links_it(self) -> None:
         runner = self._runner(FakeWT())
-        body = runner._pr_body(
+        body = runner._publisher.pr_body(
             'build', 'docs/plans/demo.md', summary='s',
             security_doc=self._PATH,
         )
@@ -12894,7 +12894,7 @@ _VERIFY = _LINEAR.replace(
 
 
 def _outcome(ok, code=0, output='', timed_out=False):
-    return R.verify.VerifyOutcome(
+    return verify.VerifyOutcome(
         ok=ok, exit_code=code, output=output, timed_out=timed_out
     )
 
@@ -12990,7 +12990,7 @@ class TestAGateFixIsCheckedAgainInOrder(_Base):
         with mock.patch.object(
             R.security_scan, 'collect_report', side_effect=scan
         ), mock.patch.object(
-            R.verify, 'run_verification', side_effect=gate
+            verify, 'run_verification', side_effect=gate
         ) as gate_calls, mock.patch('sbx_omnigent.runner.run.click.echo'):
             result = self._run(text, {}, sc=sc, wt=wt)[0]
         return result, sc, wt, gate_calls
@@ -13216,7 +13216,7 @@ class TestVerifyGate(_Base):
             return item
 
         return mock.patch.object(
-            R.verify, 'run_verification', side_effect=fake
+            verify, 'run_verification', side_effect=fake
         ), calls
 
     # ── whose setup reaches the shell ─────────────────────────────
@@ -13422,7 +13422,7 @@ class TestVerifyGate(_Base):
 
     def test_infrastructure_failure_never_loops_back_a_writer(self) -> None:
         # A sandbox that would not start says NOTHING about the branch.
-        patch, _calls = self._gate([R.verify.VerifyError('no daemon')])
+        patch, _calls = self._gate([verify.VerifyError('no daemon')])
         runner, sc, wt = self._build()
         with patch, self.assertRaises(R.PipelineRunError) as ctx:
             runner.run()
@@ -13487,7 +13487,7 @@ class TestVerifyGate(_Base):
             return _outcome(True)
 
         with mock.patch.object(
-            R.verify, 'run_verification', side_effect=fake
+            verify, 'run_verification', side_effect=fake
         ):
             runner.run()
         # m0's gate ran with the campaign thread not yet advanced.
@@ -13963,17 +13963,17 @@ class TestPrEvidenceReachesTheRequest(_Base):
     def _publish(self, **kw):
         cfg = self._cfg(self._V)
         wt, sc = FakeWT(), FakeSC(dict(_LINEAR_REPLIES))
-        outcome = R.verify.VerifyOutcome(
+        outcome = verify.VerifyOutcome(
             ok=True, exit_code=0, output='ok',
             steps=(
-                R.verify.StepOutcome('tests', 'make check', 0, '42 passed'),
-                R.verify.StepOutcome(
+                verify.StepOutcome('tests', 'make check', 0, '42 passed'),
+                verify.StepOutcome(
                     'demo', './scripts/demo.sh', 0, 'connected over TLS1.3'
                 ),
             ),
         )
         with mock.patch.object(
-            R.verify, 'run_verification', return_value=outcome
+            verify, 'run_verification', return_value=outcome
         ) as ran:
             R.PipelineRunner(
                 cfg, session_client=sc, worktree_manager=wt, run_id='r1',
@@ -14986,7 +14986,7 @@ class TestTheGateHonoursTheOperatorsAllowlist(_Base):
             swap_age_s=lambda: 0.0, **kw,
         )
         with mock.patch.object(
-            R.verify, 'run_verification', side_effect=fake
+            verify, 'run_verification', side_effect=fake
         ):
             runner.run()
         return calls[0]['egress']
