@@ -51,13 +51,16 @@ class _FakeWorktrees:
 
     def __init__(self) -> None:
         self.files: dict[str, str] = {}
+        self.refuse = False
         self.written: list[tuple[str, str, str]] = []
         self.commits: list[tuple[str, str, str, str]] = []
 
-    def read_tracked_file(self, worktree: str, path: str) -> str:
-        if path not in self.files:
-            raise click.ClickException(f'{path}: not tracked')
-        return self.files[path]
+    def read_tracked_file(self, worktree: str, path: str) -> str | None:
+        # The real contract: None for a file that does not exist, and
+        # an exception only for a path that is not allowed.
+        if self.refuse:
+            raise click.ClickException(f'{path}: escapes the worktree')
+        return self.files.get(path)
 
     def node_worktree_path(self, run_id: str, node_id: str) -> str:
         return f'/w/{run_id}/{node_id}'
@@ -218,6 +221,12 @@ class TestTheLedgerSurvivesAcrossRuns(_LedgerTest):
     def test_no_ledger_yet_seeds_nothing(self) -> None:
         # The first module of a campaign, which is the normal case.
         ledger = self.ledger()
+        ledger.seed_from('/w/plan')
+        self.assertEqual(ledger.decisions, [])
+
+    def test_an_unreadable_ledger_seeds_nothing(self) -> None:
+        ledger = self.ledger()
+        self.wt.refuse = True
         ledger.seed_from('/w/plan')
         self.assertEqual(ledger.decisions, [])
 

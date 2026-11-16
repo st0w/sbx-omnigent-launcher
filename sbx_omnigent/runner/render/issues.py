@@ -1,8 +1,13 @@
-"""Tracker issues for findings, and the ledger of what was filed."""
+"""Issues for findings, their summaries, and the findings ledger."""
 
 from __future__ import annotations
 
-from sbx_omnigent.runner.records.findings import finding_id, finding_marker
+from sbx_omnigent.runner.parsing.dispositions import Disposition
+from sbx_omnigent.runner.records.findings import (
+    _blocking_id_prefix,
+    finding_id,
+    finding_marker,
+)
 from sbx_omnigent.runner.records.reviews import ReviewRecord
 
 
@@ -218,3 +223,126 @@ def render_findings_ledger(
         'them is a judgement call, and it is yours.',
     ]
     return '\n'.join(header + fresh) + '\n'
+
+
+def verdict_tally(
+    withheld: list[tuple[ReviewRecord, str, str, Disposition]],
+) -> str:
+    """
+    How many withheld findings got each verdict.
+
+    :param withheld: ``(record, id, text, disposition)`` each.
+    :returns: e.g. ``"1 absent, 2 recorded"``, by verdict name.
+    """
+    by_verdict: dict[str, int] = {}
+    for _rec, _ident, _text, verdict in withheld:
+        by_verdict[verdict.verdict] = by_verdict.get(verdict.verdict, 0) + 1
+    return ', '.join(
+        f'{count} {name}' for name, count in sorted(by_verdict.items())
+    )
+
+
+def render_triage_summary(
+    withheld: list[tuple[ReviewRecord, str, str, Disposition]],
+    *,
+    chunk: str,
+    report_doc: str | None,
+) -> tuple[str, str]:
+    """
+    One issue naming every finding triage kept out, and why.
+
+    The gate's whole risk is that it withholds something it should not
+    have, so a withheld finding gets MORE visible provenance than a
+    filed one, not less: the verdict, the verifier's reason, the
+    reviewer who raised it, and the positional id, in one issue a human
+    can read in a minute and reopen from.
+
+    :param withheld: ``(record, id, text, disposition)`` each.
+    :param chunk: The module, or the run id outside a campaign.
+    :param report_doc: Repo path of the full reviewer reports.
+    :returns: ``(title, body)``.
+    """
+    lines = [
+        f'A verification pass read {len(withheld)} reviewer '
+        f'finding(s) against the code that shipped for `{chunk}` and '
+        f'concluded each needed no issue of its own: '
+        f'{verdict_tally(withheld)}.',
+        '',
+        'Nothing here was discarded. Each is reproduced below with '
+        'the verdict and the reason behind it, and each is still in '
+        'the full reviewer report. **If a verdict looks wrong, the '
+        'finding is still live** — reopen it by filing it from here; '
+        'the runner did not mark any of these as seen, so a later '
+        'run that concludes differently will raise it again.',
+        '',
+    ]
+    for rec, ident, text, verdict in withheld:
+        lines += [
+            f'### `{verdict.verdict}` — {text}',
+            '',
+            f'- Raised by `{rec.reviewer}` in round {rec.round_no}'
+            f' against `{rec.target or chunk}`',
+            f'- Verifier said: {verdict.reason or "_no reason given_"}',
+            f'- Finding id: `{ident}`',
+            '',
+        ]
+    if report_doc:
+        lines += [
+            f'Full reviewer reports, including every finding whether '
+            f'filed or not: `{report_doc}`.',
+        ]
+    title = (
+        f'[{chunk}] {len(withheld)} finding(s) verified against '
+        f'the code and withheld'
+    )
+    return title, '\n'.join(lines)
+
+
+def render_blocking_summary(
+    unconcluded: list[ReviewRecord],
+    *,
+    chunk: str,
+    report_doc: str | None,
+) -> tuple[str, str]:
+    """
+    One issue naming every blocking report nobody concluded on.
+
+    The gap this closes is a silent one: without it, a verifier that
+    skipped a report leaves exactly the same trace as one that checked
+    it and found nothing.
+
+    :param unconcluded: The votes whose reports got no conclusion.
+    :param chunk: The module, or the run id outside a campaign.
+    :param report_doc: Repo path of the full reviewer reports.
+    :returns: ``(title, body)``.
+    """
+    lines = [
+        f'{len(unconcluded)} reviewer(s) BLOCKED a candidate in '
+        f'`{chunk}`, and the verification pass reached no '
+        f'conclusion about their reports against the code that '
+        f'shipped.',
+        '',
+        'A blocking finding is relayed to the writer it blocked and '
+        'is usually fixed there, so this is not evidence of a '
+        'defect. It is the one case the pipeline cannot tell apart '
+        'from a fix that never happened — including a fix that '
+        'landed on one candidate while the judge selected the '
+        'other.',
+        '',
+    ]
+    for rec in unconcluded:
+        lines.append(
+            f'- `{rec.reviewer}` blocked `{rec.target or chunk}` in '
+            f'round {rec.round_no} (ids `{_blocking_id_prefix(rec)}*`)'
+        )
+    lines.append('')
+    if report_doc:
+        lines.append(
+            f'The reports themselves are in `{report_doc}`, with '
+            f'every finding whether filed or not.'
+        )
+    title = (
+        f'[{chunk}] {len(unconcluded)} blocking report(s) '
+        f'reached no conclusion'
+    )
+    return title, '\n'.join(lines)

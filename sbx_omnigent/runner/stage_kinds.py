@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from sbx_omnigent import pipeline
+from sbx_omnigent.runner.records.reviews import ReviewRecord
 
 
 def stage_kind(stage: pipeline.PipelineStage) -> str:
@@ -66,3 +67,17 @@ def writer_is_terminal(
     if target is None or stage_kind(target) != 'writer':
         return False
     return stage_id != want
+
+
+def recorded_by_scan(
+    rec: ReviewRecord, stage_by_id: dict[str, pipeline.PipelineStage]
+) -> bool:
+    """
+    Whether *rec* was recorded by a ``scans:`` stage.
+
+    :param rec: A review record.
+    :param stage_by_id: The run's stages, by id.
+    :returns: ``True`` for a scan's record.
+    """
+    stage = stage_by_id.get(rec.stage)
+    return stage is not None and stage.scans is not None
