@@ -28,7 +28,9 @@ from unittest import mock
 import click
 from click.testing import CliRunner, Result
 
-from sbx_omnigent import egress, pipeline
+from sbx_omnigent import egress, pipeline, sbx_cli
+from sbx_omnigent import image as sbx_image
+from sbx_omnigent.runner import cli
 from sbx_omnigent.runner import run as R
 from sbx_omnigent.runner.limits import (
     _VM_DISK_BYTES,
@@ -43,11 +45,31 @@ from sbx_omnigent.runner.parsing.plans import (
     _PLAN_RECAP_WINDOW,
     plan_shape_failures,
 )
+from sbx_omnigent.runner.preflight.disk import (
+    max_concurrent_vms,
+    preflight_disk,
+    writer_worktrees,
+)
+from sbx_omnigent.runner.preflight.egress import (
+    preflight_egress,
+    read_operator_egress,
+)
+from sbx_omnigent.runner.preflight.harnesses import (
+    ensure_agy_harvester,
+    preflight_agy,
+    preflight_codex_login,
+)
+from sbx_omnigent.runner.preflight.sandbox import ensure_pipeline_image
 from sbx_omnigent.runner.prompts.checks import (
     _CHECK_FINISH,
 )
 from sbx_omnigent.runner.records.judging import retained_bundle_ref
 from sbx_omnigent.runner.render.issues import _issue_title_text
+from sbx_omnigent.runner.resume import (
+    _resume_worktree_count,
+    reclaim_for_resume,
+)
+from sbx_omnigent.runner.stage_kinds import stage_kind, writer_is_terminal
 from sbx_omnigent.swarm_session import (
     PlanDecision,
     SwarmRunnerUnavailable,
@@ -1798,8 +1820,8 @@ class TestAContractCheck(_Base):
             '',
         ).replace('needs: [plan, check]', 'needs: [plan]')
         self.assertEqual(
-            R.max_concurrent_vms(self._cfg(_CHECKS_TESTS)),
-            R.max_concurrent_vms(self._cfg(without)),
+            max_concurrent_vms(self._cfg(_CHECKS_TESTS)),
+            max_concurrent_vms(self._cfg(without)),
         )
 
     def test_provision_only_binds_it_read_only(self) -> None:
@@ -4494,12 +4516,12 @@ class TestWriterIsTerminal(_Base):
         cfg = self._cfg(_TDD_JUDGE)        # publish.branch: refactor
         for gated in ('impl-a', 'impl-b'):
             with self.subTest(gated=gated):
-                self.assertFalse(R.writer_is_terminal(cfg, gated))
+                self.assertFalse(writer_is_terminal(cfg, gated))
 
     def test_the_publish_target_is_never_terminal(self) -> None:
         # The verification gate loops back to it.
         cfg = self._cfg(_TDD_JUDGE)
-        self.assertFalse(R.writer_is_terminal(cfg, 'refactor'))
+        self.assertFalse(writer_is_terminal(cfg, 'refactor'))
 
     def test_an_ungated_candidate_is_terminal(self) -> None:
         # _JUDGE_REFACTOR puts no review on its two coders. The judge
@@ -4507,24 +4529,24 @@ class TestWriterIsTerminal(_Base):
         # and the gate loops back to `refactor` — so nothing drives
         # them again and holding them would be waste.
         cfg = self._cfg(_JUDGE_REFACTOR)
-        self.assertTrue(R.writer_is_terminal(cfg, 'impl-a'))
+        self.assertTrue(writer_is_terminal(cfg, 'impl-a'))
 
     def test_an_untargetable_writer_is_terminal(self) -> None:
         # THE case: a tdd writer with no gate that nothing publishes.
         cfg = self._cfg(_TDD_JUDGE)
-        self.assertTrue(R.writer_is_terminal(cfg, 'tests'))
+        self.assertTrue(writer_is_terminal(cfg, 'tests'))
 
     def test_publishing_the_last_writer_releases_nothing(self) -> None:
         # `publish.branch` unset means the gate's target is not known
         # until the run ends, so no writer may be assumed safe.
         cfg = self._cfg(_TDD_JUDGE.replace('  branch: refactor\n', ''))
-        self.assertFalse(R.writer_is_terminal(cfg, 'tests'))
+        self.assertFalse(writer_is_terminal(cfg, 'tests'))
 
     def test_publishing_a_judge_pick_releases_nothing(self) -> None:
         # The winner is one of the judge's candidates, resolved only
         # once it has run — so no writer can be named safe statically.
         cfg = self._cfg(_TDD_JUDGE.replace('branch: refactor', 'branch: pick'))
-        self.assertFalse(R.writer_is_terminal(cfg, 'tests'))
+        self.assertFalse(writer_is_terminal(cfg, 'tests'))
 
     def test_it_is_freed_at_stage_completion(self) -> None:
         _r, sc, _wt = self._run(
@@ -4588,9 +4610,9 @@ class TestWriterIsTerminal(_Base):
         # Freed: writers impl-a/impl-b/refactor (all re-drivable) plus
         # the largest single review stage. `tests` is terminal and the
         # judge is a reader-shaped node, so neither is part of a peak.
-        self.assertEqual(R.max_concurrent_vms(cfg), 4)
+        self.assertEqual(max_concurrent_vms(cfg), 4)
         # --keep frees nothing: 4 writers + judge + 3 reviewers.
-        self.assertEqual(R.max_concurrent_vms(cfg, reclaim=False), 8)
+        self.assertEqual(max_concurrent_vms(cfg, reclaim=False), 8)
 
 
 class TestReviewRecords(_Base):
@@ -6471,7 +6493,7 @@ class TestAVerifiesStageParsesFromYaml(_Base):
         cfg = self._cfg(self._with_gate())
         stage = next(s for s in cfg.stages if s.id == 'triage')
         self.assertEqual(stage.verifies, 'findings')
-        self.assertEqual(R.PipelineRunner._stage_kind(stage), 'verify')
+        self.assertEqual(stage_kind(stage), 'verify')
 
     def test_a_pipeline_without_one_is_unchanged(self) -> None:
         # The gate is opt-in: every existing pipeline keeps filing
@@ -6566,7 +6588,7 @@ class TestTheVerificationGate(_Base):
         stage = pipeline.PipelineStage(
             id='triage', run=('sec',), verifies='findings'
         )
-        self.assertEqual(R.PipelineRunner._stage_kind(stage), 'verify')
+        self.assertEqual(stage_kind(stage), 'verify')
 
     def test_its_microVM_is_freed_like_a_reader_s(self) -> None:
         # Nothing loops back to a verifier, so holding its guest through
@@ -8759,22 +8781,22 @@ class TestCtrlCStopsTheRunNow(_Base):
         cfg_path = self.root / 'pipeline.yaml'
         cfg_path.write_text(_LINEAR, encoding='utf-8')
         order: list[str] = []
-        with mock.patch.object(R, 'preflight_sbx'), \
-                mock.patch.object(R, 'preflight_disk'), \
-                mock.patch.object(R, 'preflight_codex_auth'), \
-                mock.patch.object(R, 'preflight_codex_login'), \
+        with mock.patch.object(cli, 'preflight_sbx'), \
+                mock.patch.object(cli, 'preflight_disk'), \
+                mock.patch.object(cli, 'preflight_codex_auth'), \
+                mock.patch.object(cli, 'preflight_codex_login'), \
                 mock.patch.object(
-                    R, '_drive', side_effect=KeyboardInterrupt
+                    cli, '_drive', side_effect=KeyboardInterrupt
                 ), \
                 mock.patch.object(
                     R.agy, 'stop_harvester',
                     side_effect=lambda _h: order.append('harvester'),
                 ), \
                 mock.patch.object(
-                    R, '_exit_now',
+                    cli, '_exit_now',
                     side_effect=lambda code: order.append(f'exit {code}'),
                 ):
-            CliRunner().invoke(R.main, [
+            CliRunner().invoke(cli.main, [
                 '-c', str(cfg_path),
                 '--canonical-root', str(self.root / 'c'),
                 '--worktree-root', str(self.root / 'w'),
@@ -9685,7 +9707,7 @@ class TestAgyPreflight(_Base):
     def test_missing_stamp_refuses_with_actionable_message(self) -> None:
         cfg = self._cfg(_LINEAR)  # its planner is antigravity-native
         with self.assertRaises(click.ClickException) as ctx:
-            R.preflight_agy(cfg, stamp_path=self._stamp(None), now=1000.0)
+            preflight_agy(cfg, stamp_path=self._stamp(None), now=1000.0)
         msg = str(ctx.exception)
         self.assertIn('plan', msg)  # names the offending agent
         self.assertIn('omni-sbx-agy harvest', msg)  # the actual fix
@@ -9695,24 +9717,24 @@ class TestAgyPreflight(_Base):
         cfg = self._cfg(_LINEAR)
         stale = R.agy.MAX_SWAP_AGE_S + 60
         with self.assertRaises(click.ClickException):
-            R.preflight_agy(cfg, stamp_path=self._stamp(stale), now=1000.0)
+            preflight_agy(cfg, stamp_path=self._stamp(stale), now=1000.0)
 
     def test_fresh_stamp_passes(self) -> None:
         cfg = self._cfg(_LINEAR)
-        R.preflight_agy(cfg, stamp_path=self._stamp(60.0), now=1000.0)
+        preflight_agy(cfg, stamp_path=self._stamp(60.0), now=1000.0)
 
     def test_boundary_age_passes(self) -> None:
         # Exactly at the bound is still fresh — a healthy harvester
         # refreshing on cadence must never trip the guard.
         cfg = self._cfg(_LINEAR)
         at = R.agy.MAX_SWAP_AGE_S
-        R.preflight_agy(cfg, stamp_path=self._stamp(at), now=1000.0)
+        preflight_agy(cfg, stamp_path=self._stamp(at), now=1000.0)
 
     def test_no_agy_agents_is_a_noop(self) -> None:
         # An all-Claude pipeline must never be blocked by agy auth,
         # even with no stamp anywhere.
         cfg = self._cfg(_TDD)
-        R.preflight_agy(cfg, stamp_path=self._stamp(None), now=1000.0)
+        preflight_agy(cfg, stamp_path=self._stamp(None), now=1000.0)
 
     def test_cli_refuses_before_touching_the_server(self) -> None:
         # Wiring: the CLI must run the guard BEFORE it builds a client
@@ -9723,11 +9745,11 @@ class TestAgyPreflight(_Base):
         cfg_path.write_text(_LINEAR, encoding='utf-8')
         missing = self.root / 'no-such-stamp.json'
         with mock.patch.object(R.agy, 'HARVEST_STAMP', missing), \
-                mock.patch.object(R, 'preflight_sbx'), \
-                mock.patch.object(R, 'preflight_disk'), \
-                mock.patch.object(R, 'SwarmSessionClient') as client:
+                mock.patch.object(cli, 'preflight_sbx'), \
+                mock.patch.object(cli, 'preflight_disk'), \
+                mock.patch.object(cli, 'SwarmSessionClient') as client:
             res = CliRunner().invoke(
-                R.main,
+                cli.main,
                 [
                     '-c', str(cfg_path),
                     '--canonical-root', str(self.root / 'c'),
@@ -9744,11 +9766,11 @@ class TestAgyPreflight(_Base):
         cfg_path.write_text(_LINEAR, encoding='utf-8')
         missing = self.root / 'no-such-stamp.json'
         with mock.patch.object(R.agy, 'HARVEST_STAMP', missing), \
-                mock.patch.object(R, 'preflight_sbx'), \
-                mock.patch.object(R, 'preflight_disk'), \
-                mock.patch.object(R, 'SwarmSessionClient') as client:
+                mock.patch.object(cli, 'preflight_sbx'), \
+                mock.patch.object(cli, 'preflight_disk'), \
+                mock.patch.object(cli, 'SwarmSessionClient') as client:
             CliRunner().invoke(
-                R.main,
+                cli.main,
                 [
                     '-c', str(cfg_path),
                     '--canonical-root', str(self.root / 'c'),
@@ -10306,7 +10328,7 @@ class TestAgyAutoHarvest(_Base):
         return path
 
     def _ensure(self, cfg_text: str, age_s, *, fresh=True, **kw):
-        return R.ensure_agy_harvester(
+        return ensure_agy_harvester(
             self._cfg(cfg_text),
             stamp_path=self._stamp(age_s),
             lock_path=self.lock,
@@ -10342,7 +10364,7 @@ class TestAgyAutoHarvest(_Base):
         # Already usable: drive immediately instead of burning the
         # first-refresh deadline.
         waited = []
-        R.ensure_agy_harvester(
+        ensure_agy_harvester(
             self._cfg(_LINEAR),
             stamp_path=self._stamp(60.0),
             lock_path=self.lock,
@@ -10390,12 +10412,12 @@ class TestAgyAutoHarvest(_Base):
         cfg_path.write_text(_LINEAR, encoding='utf-8')
         proc = FakeHarvester()
         with mock.patch.object(
-            R, 'ensure_agy_harvester', return_value=proc
-        ), mock.patch.object(R, 'preflight_sbx'), \
-                mock.patch.object(R, 'preflight_disk'), \
-                mock.patch.object(R, '_drive') as drive:
+            cli, 'ensure_agy_harvester', return_value=proc
+        ), mock.patch.object(cli, 'preflight_sbx'), \
+                mock.patch.object(cli, 'preflight_disk'), \
+                mock.patch.object(cli, '_drive') as drive:
             res = CliRunner().invoke(
-                R.main,
+                cli.main,
                 [
                     '-c', str(cfg_path),
                     '--canonical-root', str(self.root / 'c'),
@@ -10411,14 +10433,14 @@ class TestAgyAutoHarvest(_Base):
         cfg_path.write_text(_LINEAR, encoding='utf-8')
         proc = FakeHarvester()
         with mock.patch.object(
-            R, 'ensure_agy_harvester', return_value=proc
-        ), mock.patch.object(R, 'preflight_sbx'), \
-                mock.patch.object(R, 'preflight_disk'), \
+            cli, 'ensure_agy_harvester', return_value=proc
+        ), mock.patch.object(cli, 'preflight_sbx'), \
+                mock.patch.object(cli, 'preflight_disk'), \
                 mock.patch.object(
-            R, '_drive', side_effect=RuntimeError('boom')
+            cli, '_drive', side_effect=RuntimeError('boom')
         ):
             CliRunner().invoke(
-                R.main,
+                cli.main,
                 [
                     '-c', str(cfg_path),
                     '--canonical-root', str(self.root / 'c'),
@@ -11490,7 +11512,7 @@ class TestResumeReclaimsBeforeMeasuring(_Base):
         wt = wt if wt is not None else self._WT(state)
         sc = sc if sc is not None else self._SC()
         said: list[str] = []
-        freed = R.reclaim_for_resume(
+        freed = reclaim_for_resume(
             run_id='r1', canonical_root='/c', worktree_root='/wt',
             server='http://x', keep=keep, default_branch='main',
             client=sc, manager=wt, echo=said.append,
@@ -11593,7 +11615,7 @@ class TestAResumeReclaimsFinishedWriters(_Base):
     def _reclaim(self, text, state, off_hub=(), keep=False, config=True):
         wt = self._WT(state, off_hub)
         said: list[str] = []
-        R.reclaim_for_resume(
+        reclaim_for_resume(
             run_id='r1', canonical_root='/c', worktree_root='/wt',
             server='http://x', keep=keep, default_branch='main',
             client=TestResumeReclaimsBeforeMeasuring._SC(), manager=wt,
@@ -11709,7 +11731,7 @@ class TestAResumeCountsOnlyBuildTrees(_Base):
         nodes = self.root / 'wt' / 'r1' / 'nodes'
         for name in dirs:
             (nodes / name).mkdir(parents=True)
-        return R._resume_worktree_count(str(self.root / 'wt'), 'r1', state)
+        return _resume_worktree_count(str(self.root / 'wt'), 'r1', state)
 
     def test_writers_and_gate_clones_count(self) -> None:
         state = {'nodes': {'impl': {'kind': 'writer'},
@@ -11727,7 +11749,7 @@ class TestAResumeCountsOnlyBuildTrees(_Base):
 
     def test_no_run_directory_counts_nothing(self) -> None:
         self.assertEqual(
-            R._resume_worktree_count(str(self.root / 'none'), 'r1', None), 0
+            _resume_worktree_count(str(self.root / 'none'), 'r1', None), 0
         )
 
     def test_main_counts_after_it_reclaims(self) -> None:
@@ -11743,18 +11765,18 @@ class TestAResumeCountsOnlyBuildTrees(_Base):
             order.append('count')
             return 3
 
-        with mock.patch.object(R, 'preflight_sbx'), \
+        with mock.patch.object(cli, 'preflight_sbx'), \
                 mock.patch.object(
-                    R, 'reclaim_for_resume', side_effect=reclaimed
+                    cli, 'reclaim_for_resume', side_effect=reclaimed
                 ) as reclaim, \
                 mock.patch.object(
-                    R, '_resume_worktree_count', side_effect=counted
+                    cli, '_resume_worktree_count', side_effect=counted
                 ), \
-                mock.patch.object(R, 'preflight_disk') as disk, \
-                mock.patch.object(R, 'preflight_codex_auth'), \
-                mock.patch.object(R, 'preflight_codex_login'), \
-                mock.patch.object(R, '_drive'):
-            res = CliRunner().invoke(R.main, [
+                mock.patch.object(cli, 'preflight_disk') as disk, \
+                mock.patch.object(cli, 'preflight_codex_auth'), \
+                mock.patch.object(cli, 'preflight_codex_login'), \
+                mock.patch.object(cli, '_drive'):
+            res = CliRunner().invoke(cli.main, [
                 '-c', str(cfg_path),
                 '--canonical-root', str(self.root / 'c'),
                 '--worktree-root', str(self.root / 'w'),
@@ -11791,7 +11813,7 @@ class TestAResumeDisposesEachVmOnce(_Base):
             'sessions': ['s1', 's2'],
         })
         sc = _DisposeRecorder()
-        R.reclaim_for_resume(
+        reclaim_for_resume(
             run_id='r1', canonical_root=str(self.root / 'c'),
             worktree_root=str(self.root / 'w'), server='http://x',
             keep=False, default_branch='main', client=sc, manager=wm,
@@ -11814,7 +11836,7 @@ class TestADiskRefusalNamesLeakedDisks(_Base):
         # message and every test stayed green.
         self.orphan_advice.return_value = '3 leaked guest disk(s)'
         with self.assertRaises(click.ClickException) as caught:
-            R.preflight_disk(
+            preflight_disk(
                 self._cfg(_LINEAR), usage=lambda _p: _Usage(0)
             )
         self.assertIn(
@@ -11834,12 +11856,12 @@ class TestPreflightIsResumeAware(_Base):
         # Sized so the run fits ONLY once the tree is subtracted.
         free[0] = 5_000_000_000 + 2 * 3_500_000_000
         with self.assertRaises(click.ClickException):
-            R.preflight_disk(cfg, usage=usage)
-        R.preflight_disk(cfg, usage=usage, worktrees_on_disk=1)
+            preflight_disk(cfg, usage=usage)
+        preflight_disk(cfg, usage=usage, worktrees_on_disk=1)
 
     def test_it_never_demands_less_than_nothing(self) -> None:
         cfg = self._cfg(_LINEAR)
-        R.preflight_disk(
+        preflight_disk(
             cfg,
             usage=lambda _p: _Usage(10 ** 12),
             worktrees_on_disk=999,
@@ -11853,12 +11875,12 @@ class TestDiskPreflight(_Base):
         # _LINEAR is plan(reader) + build(writer) + review(sec). The
         # reader is freed the moment its stage completes and is never
         # driven again, so it is not part of any peak: build + sec = 2.
-        self.assertEqual(R.max_concurrent_vms(self._cfg(_LINEAR)), 2)
+        self.assertEqual(max_concurrent_vms(self._cfg(_LINEAR)), 2)
 
     def test_keep_counts_the_reader_too(self) -> None:
         # --keep frees nothing, so everything accumulates.
         self.assertEqual(
-            R.max_concurrent_vms(self._cfg(_LINEAR), reclaim=False), 3
+            max_concurrent_vms(self._cfg(_LINEAR), reclaim=False), 3
         )
 
     def test_a_finished_judge_is_not_part_of_the_peak(self) -> None:
@@ -11866,8 +11888,8 @@ class TestDiskPreflight(_Base):
         # to publish is what put 6 GB out of reach of a refactor build
         # on a live 17 GB host.
         cfg = self._cfg(_COMPETE)          # impl-a + impl-b + pick
-        self.assertEqual(R.max_concurrent_vms(cfg), 2)
-        self.assertEqual(R.max_concurrent_vms(cfg, reclaim=False), 3)
+        self.assertEqual(max_concurrent_vms(cfg), 2)
+        self.assertEqual(max_concurrent_vms(cfg, reclaim=False), 3)
 
     def test_counts_each_reviewer_in_a_consensus_gate(self) -> None:
         # A review stage runs one session PER reviewer agent, so a
@@ -11887,7 +11909,7 @@ class TestDiskPreflight(_Base):
             '    gate: consensus\n'
             '    on_block: build\n'
         )
-        self.assertEqual(R.max_concurrent_vms(cfg), 3)
+        self.assertEqual(max_concurrent_vms(cfg), 3)
 
     def _three_gates(self) -> str:
         # The shape the live cadre uses: two isolated writers,
@@ -11920,11 +11942,11 @@ class TestDiskPreflight(_Base):
         # reviewers, not 3 + 6. Summing them demanded 14 GB of disk
         # that no longer gets used, which refused runs that fit.
         cfg = self._cfg(self._three_gates())
-        self.assertEqual(R.max_concurrent_vms(cfg), 5)
+        self.assertEqual(max_concurrent_vms(cfg), 5)
 
     def test_keep_sums_every_gate_because_nothing_is_freed(self) -> None:
         cfg = self._cfg(self._three_gates())
-        self.assertEqual(R.max_concurrent_vms(cfg, reclaim=False), 9)
+        self.assertEqual(max_concurrent_vms(cfg, reclaim=False), 9)
 
     def test_a_parallel_group_of_gates_is_still_sequential(self) -> None:
         # `parallel:` means isolated BRANCHES, not concurrent
@@ -11947,19 +11969,19 @@ class TestDiskPreflight(_Base):
             '        needs: [a]\n        gate: consensus\n'
             '        on_block: a\n'
         )
-        self.assertEqual(R.max_concurrent_vms(cfg), 3)  # a + 2, not a + 4
+        self.assertEqual(max_concurrent_vms(cfg), 3)  # a + 2, not a + 4
 
     def test_counts_both_writers_in_a_parallel_group(self) -> None:
         # A parallel group is counted by its CHILDREN, never twice —
         # here impl-a + impl-b (the judge is freed when it finishes).
-        self.assertEqual(R.max_concurrent_vms(self._cfg(_COMPETE)), 2)
+        self.assertEqual(max_concurrent_vms(self._cfg(_COMPETE)), 2)
 
     def test_ample_disk_passes(self) -> None:
-        R.preflight_disk(self._cfg(_LINEAR), usage=_Usage(500_000_000_000))
+        preflight_disk(self._cfg(_LINEAR), usage=_Usage(500_000_000_000))
 
     def test_tight_disk_refuses_naming_the_numbers(self) -> None:
         with self.assertRaises(click.ClickException) as ctx:
-            R.preflight_disk(self._cfg(_LINEAR), usage=_Usage(1_000_000))
+            preflight_disk(self._cfg(_LINEAR), usage=_Usage(1_000_000))
         msg = str(ctx.exception)
         self.assertIn('free', msg)
         self.assertIn('needed', msg)
@@ -11978,37 +12000,37 @@ class TestDiskPreflight(_Base):
             + 2 * _VM_DISK_BYTES
             + 1 * _WORKTREE_DISK_BYTES
         )
-        R.preflight_disk(self._cfg(_LINEAR), usage=_Usage(need))
+        preflight_disk(self._cfg(_LINEAR), usage=_Usage(need))
         with self.assertRaises(click.ClickException):
-            R.preflight_disk(self._cfg(_LINEAR), usage=_Usage(need - 1))
+            preflight_disk(self._cfg(_LINEAR), usage=_Usage(need - 1))
 
     def test_worktrees_alone_can_refuse_a_run(self) -> None:
         # THE gap this closes: room for every microVM, but not for
         # the build trees they mount. The VM-only estimate said yes here
         # and the host filled two modules later.
         vms_only = 5_000_000_000 + 2 * _VM_DISK_BYTES
-        R.preflight_disk(
+        preflight_disk(
             self._cfg(_LINEAR), usage=_Usage(vms_only), per_worktree_bytes=0
         )
         with self.assertRaises(click.ClickException):
-            R.preflight_disk(self._cfg(_LINEAR), usage=_Usage(vms_only))
+            preflight_disk(self._cfg(_LINEAR), usage=_Usage(vms_only))
 
     def test_counts_a_build_worktree_per_writer(self) -> None:
-        self.assertEqual(R.writer_worktrees(self._cfg(_LINEAR)), 1)
-        self.assertEqual(R.writer_worktrees(self._cfg(_TDD)), 2)
+        self.assertEqual(writer_worktrees(self._cfg(_LINEAR)), 1)
+        self.assertEqual(writer_worktrees(self._cfg(_TDD)), 2)
 
     def test_readers_judges_and_reviewers_cost_no_worktree(self) -> None:
         # _COMPETE is 2 writers + a judge; _LINEAR a reader + a writer +
         # a reviewer. A node clone is LOCAL (hardlinked objects),
         # so only the tree an agent BUILDS in is worth budgeting.
-        self.assertEqual(R.writer_worktrees(self._cfg(_COMPETE)), 2)
-        self.assertEqual(R.writer_worktrees(self._cfg(_LINEAR)), 1)
+        self.assertEqual(writer_worktrees(self._cfg(_COMPETE)), 2)
+        self.assertEqual(writer_worktrees(self._cfg(_LINEAR)), 1)
 
     def test_the_verify_gate_adds_a_build_worktree(self) -> None:
         # Its throwaway clone builds and tests from clean.
         self.assertEqual(
-            R.writer_worktrees(self._cfg(_VERIFY)),
-            R.writer_worktrees(self._cfg(_LINEAR)) + 1,
+            writer_worktrees(self._cfg(_VERIFY)),
+            writer_worktrees(self._cfg(_LINEAR)) + 1,
         )
 
     def test_keep_multiplies_by_the_module_count(self) -> None:
@@ -12020,9 +12042,9 @@ class TestDiskPreflight(_Base):
             + 3 * _VM_DISK_BYTES
             + 2 * _WORKTREE_DISK_BYTES
         )
-        R.preflight_disk(cfg, usage=_Usage(one_module))
+        preflight_disk(cfg, usage=_Usage(one_module))
         with self.assertRaises(click.ClickException) as ctx:
-            R.preflight_disk(cfg, keep=True, usage=_Usage(one_module))
+            preflight_disk(cfg, keep=True, usage=_Usage(one_module))
         msg = str(ctx.exception)
         self.assertIn('2 modules held at once', msg)
         self.assertIn('--keep', msg)
@@ -12035,7 +12057,7 @@ class TestDiskPreflight(_Base):
             + 3 * _VM_DISK_BYTES
             + 1 * _WORKTREE_DISK_BYTES
         )
-        R.preflight_disk(cfg, keep=True, usage=_Usage(need))
+        preflight_disk(cfg, keep=True, usage=_Usage(need))
 
     def test_the_pipeline_can_tune_the_per_unit_estimates(self) -> None:
         # The runner cannot know what a project builds; a Python repo
@@ -12050,19 +12072,19 @@ class TestDiskPreflight(_Base):
         )
         self.assertEqual(light.disk.per_worktree_gb, 0.1)
         # 1 + 3*0.5 + 1*0.1 = 2.6 GB, far under the compiled default.
-        R.preflight_disk(light, usage=_Usage(2_600_000_000))
+        preflight_disk(light, usage=_Usage(2_600_000_000))
         with self.assertRaises(click.ClickException):
-            R.preflight_disk(self._cfg(_LINEAR), usage=_Usage(2_600_000_000))
+            preflight_disk(self._cfg(_LINEAR), usage=_Usage(2_600_000_000))
 
     def test_cli_passes_keep_to_the_disk_guard(self) -> None:
         cfg_path = self.root / 'pipeline.yaml'
         cfg_path.write_text(_LINEAR, encoding='utf-8')
-        with mock.patch.object(R, 'preflight_sbx'), \
-                mock.patch.object(R, 'preflight_disk') as guard, \
-                mock.patch.object(R, 'ensure_agy_harvester'), \
-                mock.patch.object(R, '_drive'):
+        with mock.patch.object(cli, 'preflight_sbx'), \
+                mock.patch.object(cli, 'preflight_disk') as guard, \
+                mock.patch.object(cli, 'ensure_agy_harvester'), \
+                mock.patch.object(cli, '_drive'):
             CliRunner().invoke(
-                R.main,
+                cli.main,
                 [
                     '-c', str(cfg_path),
                     '--canonical-root', str(self.root / 'c'),
@@ -12076,12 +12098,12 @@ class TestDiskPreflight(_Base):
         cfg_path = self.root / 'pipeline.yaml'
         cfg_path.write_text(_LINEAR, encoding='utf-8')
         with mock.patch.object(
-            R, 'preflight_disk', side_effect=AssertionError('ran')
-        ) as guard, mock.patch.object(R, 'ensure_agy_harvester'), \
-                mock.patch.object(R, 'preflight_sbx'), \
-                mock.patch.object(R, '_drive'):
+            cli, 'preflight_disk', side_effect=AssertionError('ran')
+        ) as guard, mock.patch.object(cli, 'ensure_agy_harvester'), \
+                mock.patch.object(cli, 'preflight_sbx'), \
+                mock.patch.object(cli, '_drive'):
             res = CliRunner().invoke(
-                R.main,
+                cli.main,
                 [
                     '-c', str(cfg_path),
                     '--canonical-root', str(self.root / 'c'),
@@ -13698,8 +13720,8 @@ class TestVerifyGate(_Base):
     # ── the disk budget ───────────────────────────────────────────
 
     def test_the_gate_vm_counts_toward_the_disk_preflight(self) -> None:
-        plain = R.max_concurrent_vms(self._cfg(_LINEAR))
-        gated = R.max_concurrent_vms(self._cfg(_VERIFY))
+        plain = max_concurrent_vms(self._cfg(_LINEAR))
+        gated = max_concurrent_vms(self._cfg(_VERIFY))
         self.assertEqual(gated, plain + 1)
 
 
@@ -14481,12 +14503,12 @@ class TestPublishTokenIsValidatedEarlyAndReadLate(unittest.TestCase):
         shutil.rmtree(self.root, ignore_errors=True)
 
     def _invoke(self, *extra: str):
-        with mock.patch.object(R, 'preflight_sbx'), \
-                mock.patch.object(R, 'preflight_disk'), \
-                mock.patch.object(R, 'preflight_codex_auth'), \
-                mock.patch.object(R, '_drive') as drive:
+        with mock.patch.object(cli, 'preflight_sbx'), \
+                mock.patch.object(cli, 'preflight_disk'), \
+                mock.patch.object(cli, 'preflight_codex_auth'), \
+                mock.patch.object(cli, '_drive') as drive:
             res = CliRunner().invoke(
-                R.main,
+                cli.main,
                 [
                     '-c', str(self.cfg),
                     '--canonical-root', str(self.root / 'c'),
@@ -14526,61 +14548,6 @@ class TestPublishTokenIsValidatedEarlyAndReadLate(unittest.TestCase):
         res, drive = self._invoke()
         self.assertEqual(res.exit_code, 0, res.output)
         self.assertIsNone(drive.call_args.kwargs['publish_token']())
-
-
-class TestResolvePublishToken(unittest.TestCase):
-    """Token comes from a file or a command — never the command line."""
-
-    def setUp(self) -> None:
-        self.root = Path(tempfile.mkdtemp(prefix='tok-'))
-
-    def tearDown(self) -> None:
-        shutil.rmtree(self.root, ignore_errors=True)
-
-    def _file(self, text: str) -> str:
-        p = self.root / 'tok'
-        p.write_text(text, encoding='utf-8')
-        return str(p)
-
-    def test_neither_option_means_host_credentials(self) -> None:
-        self.assertIsNone(R.resolve_publish_token(None, None))
-
-    def test_from_file(self) -> None:
-        tok = R.resolve_publish_token(self._file('secret\n'), None)
-        self.assertEqual(tok, 'secret')  # trailing newline stripped
-
-    def test_missing_file_errors(self) -> None:
-        with self.assertRaises(R.PipelineRunError):
-            R.resolve_publish_token(str(self.root / 'nope'), None)
-
-    def test_empty_file_errors(self) -> None:
-        with self.assertRaises(R.PipelineRunError):
-            R.resolve_publish_token(self._file('  \n'), None)
-
-    def test_from_command(self) -> None:
-        tok = R.resolve_publish_token(None, 'echo secret')
-        self.assertEqual(tok, 'secret')
-
-    def test_command_is_argv_not_a_shell(self) -> None:
-        # A shell would pipe; argv passes the bar through literally.
-        tok = R.resolve_publish_token(None, 'echo a|b')
-        self.assertEqual(tok, 'a|b')
-
-    def test_failing_command_errors(self) -> None:
-        with self.assertRaises(R.PipelineRunError):
-            R.resolve_publish_token(None, 'false')
-
-    def test_unknown_command_errors(self) -> None:
-        with self.assertRaises(R.PipelineRunError):
-            R.resolve_publish_token(None, 'sbx-no-such-binary-xyz')
-
-    def test_command_with_empty_output_errors(self) -> None:
-        with self.assertRaises(R.PipelineRunError):
-            R.resolve_publish_token(None, 'echo')
-
-    def test_both_options_error(self) -> None:
-        with self.assertRaises(R.PipelineRunError):
-            R.resolve_publish_token(self._file('s'), 'echo s')
 
 
 class BlockedReviewForfeitsOneCandidate(unittest.TestCase):
@@ -14681,7 +14648,7 @@ class TestSbxPreflight(_Base):
         cfg_path = self.root / 'pipeline.yaml'
         cfg_path.write_text(_LINEAR, encoding='utf-8')
         return CliRunner().invoke(
-            R.main,
+            cli.main,
             [
                 '-c', str(cfg_path),
                 '--canonical-root', str(self.root / 'c'),
@@ -14697,11 +14664,11 @@ class TestSbxPreflight(_Base):
         """Patch the process runner so `sbx ls` hangs or answers."""
         if hung:
             return mock.patch.object(
-                R.sbx_cli.subprocess, 'run',
+                sbx_cli.subprocess, 'run',
                 side_effect=subprocess.TimeoutExpired(['sbx', 'ls'], 20.0),
             )
         return mock.patch.object(
-            R.sbx_cli.subprocess, 'run',
+            sbx_cli.subprocess, 'run',
             return_value=subprocess.CompletedProcess(
                 ['sbx', 'ls'], 0, 'SANDBOX\n', ''
             ),
@@ -14709,9 +14676,9 @@ class TestSbxPreflight(_Base):
 
     def test_a_stuck_daemon_refuses_before_the_other_gates(self) -> None:
         with self._sbx_ls(hung=True), \
-                mock.patch.object(R, 'preflight_disk') as disk, \
-                mock.patch.object(R, 'ensure_agy_harvester') as harvester, \
-                mock.patch.object(R, '_drive') as drive:
+                mock.patch.object(cli, 'preflight_disk') as disk, \
+                mock.patch.object(cli, 'ensure_agy_harvester') as harvester, \
+                mock.patch.object(cli, '_drive') as drive:
             res = self._invoke()
         self.assertEqual(res.exit_code, 1)
         self.assertIn('sbx daemon is not responding', res.output)
@@ -14721,7 +14688,7 @@ class TestSbxPreflight(_Base):
 
     def test_the_refusal_names_the_remedy(self) -> None:
         with self._sbx_ls(hung=True), \
-                mock.patch.object(R, '_drive'):
+                mock.patch.object(cli, '_drive'):
             res = self._invoke()
         self.assertIn('sbx daemon stop && sbx daemon start', res.output)
 
@@ -14729,19 +14696,19 @@ class TestSbxPreflight(_Base):
         # The reclaim disposes VMs through the server, which is itself
         # an sbx call that would hang.
         with self._sbx_ls(hung=True), \
-                mock.patch.object(R, 'reclaim_for_resume') as reclaim, \
-                mock.patch.object(R, '_resume_worktree_count',
+                mock.patch.object(cli, 'reclaim_for_resume') as reclaim, \
+                mock.patch.object(cli, '_resume_worktree_count',
                                   return_value=0), \
-                mock.patch.object(R, '_drive'):
+                mock.patch.object(cli, '_drive'):
             res = self._invoke('--resume')
         self.assertEqual(res.exit_code, 1)
         reclaim.assert_not_called()
 
     def test_a_healthy_daemon_lets_the_run_proceed(self) -> None:
         with self._sbx_ls(hung=False), \
-                mock.patch.object(R, 'preflight_disk'), \
-                mock.patch.object(R, 'ensure_agy_harvester'), \
-                mock.patch.object(R, '_drive') as drive:
+                mock.patch.object(cli, 'preflight_disk'), \
+                mock.patch.object(cli, 'ensure_agy_harvester'), \
+                mock.patch.object(cli, '_drive') as drive:
             res = self._invoke()
         self.assertEqual(res.exit_code, 0, res.output)
         drive.assert_called_once()
@@ -14767,7 +14734,7 @@ class TestTheCodexLoginIsCheckedAgainstTheServer(_Base):
 
     def _check(self, text: str, *, skip: bool = False) -> list[str]:
         said: list[str] = []
-        R.preflight_codex_login(
+        preflight_codex_login(
             self._cfg(text), skip=skip, echo=said.append
         )
         return said
@@ -14803,13 +14770,13 @@ class TestTheCodexLoginIsCheckedAgainstTheServer(_Base):
     def _main(self, *extra: str) -> tuple[Result, mock.MagicMock]:
         cfg_path = self.root / 'pipeline.yaml'
         cfg_path.write_text(_CODEX_ONLY, encoding='utf-8')
-        with mock.patch.object(R, 'preflight_sbx'), \
-                mock.patch.object(R, 'preflight_disk'), \
-                mock.patch.object(R, 'preflight_codex_auth'), \
-                mock.patch.object(R, 'preflight_codex_login') as login, \
-                mock.patch.object(R, '_drive'):
+        with mock.patch.object(cli, 'preflight_sbx'), \
+                mock.patch.object(cli, 'preflight_disk'), \
+                mock.patch.object(cli, 'preflight_codex_auth'), \
+                mock.patch.object(cli, 'preflight_codex_login') as login, \
+                mock.patch.object(cli, '_drive'):
             res = CliRunner().invoke(
-                R.main,
+                cli.main,
                 [
                     '-c', str(cfg_path),
                     '--canonical-root', str(self.root / 'c'),
@@ -14836,12 +14803,12 @@ class TestTheCodexLoginIsCheckedAgainstTheServer(_Base):
         cfg_path = self.root / 'pipeline.yaml'
         cfg_path.write_text(_CODEX_ONLY, encoding='utf-8')
         expired = R.codex.CodexAuthError('the token expired')
-        with mock.patch.object(R, 'preflight_sbx'), \
-                mock.patch.object(R, 'preflight_disk'), \
+        with mock.patch.object(cli, 'preflight_sbx'), \
+                mock.patch.object(cli, 'preflight_disk'), \
                 mock.patch.object(R.codex, 'preflight', side_effect=expired), \
-                mock.patch.object(R, '_drive') as drive:
+                mock.patch.object(cli, '_drive') as drive:
             res = CliRunner().invoke(
-                R.main,
+                cli.main,
                 [
                     '-c', str(cfg_path),
                     '--canonical-root', str(self.root / 'c'),
@@ -14858,12 +14825,12 @@ class TestTheCodexLoginIsCheckedAgainstTheServer(_Base):
         cfg_path = self.root / 'pipeline.yaml'
         cfg_path.write_text(_CODEX_ONLY, encoding='utf-8')
         self.probe_login.side_effect = R.codex.CodexLoginRejected('nope')
-        with mock.patch.object(R, 'preflight_sbx'), \
-                mock.patch.object(R, 'preflight_disk'), \
-                mock.patch.object(R, 'preflight_codex_auth'), \
-                mock.patch.object(R, '_drive') as drive:
+        with mock.patch.object(cli, 'preflight_sbx'), \
+                mock.patch.object(cli, 'preflight_disk'), \
+                mock.patch.object(cli, 'preflight_codex_auth'), \
+                mock.patch.object(cli, '_drive') as drive:
             res = CliRunner().invoke(
-                R.main,
+                cli.main,
                 [
                     '-c', str(cfg_path),
                     '--canonical-root', str(self.root / 'c'),
@@ -15346,34 +15313,34 @@ class TestTheGatesAllowlistIsReadBeforeTheRun(_Base):
 
     def test_a_pipeline_without_a_gate_reads_nothing(self) -> None:
         self.assertIsNone(
-            R.read_operator_egress(self._cfg(_LINEAR), str(self.root / 'none'))
+            read_operator_egress(self._cfg(_LINEAR), str(self.root / 'none'))
         )
 
     def test_it_returns_the_operators_list(self) -> None:
         root = self._publish(['pypi.org', '**.crates.io'])
         self.assertEqual(
-            R.read_operator_egress(self._cfg(_VERIFY), root),
+            read_operator_egress(self._cfg(_VERIFY), root),
             ('pypi.org', '**.crates.io'),
         )
 
     def test_a_lockdown_is_returned_as_empty(self) -> None:
         root = self._publish([])
-        self.assertEqual(R.read_operator_egress(self._cfg(_VERIFY), root), ())
+        self.assertEqual(read_operator_egress(self._cfg(_VERIFY), root), ())
 
     def test_a_missing_list_refuses_the_run(self) -> None:
         with self.assertRaises(click.ClickException) as caught:
-            R.read_operator_egress(self._cfg(_VERIFY), str(self.root / 'none'))
+            read_operator_egress(self._cfg(_VERIFY), str(self.root / 'none'))
         self.assertIn('Restart the server', caught.exception.format_message())
 
     def _main(self, text: str, root: str):
         cfg_path = self.root / 'pipeline.yaml'
         cfg_path.write_text(text, encoding='utf-8')
-        with mock.patch.object(R, 'preflight_sbx') as sbx, \
-                mock.patch.object(R, 'preflight_disk'), \
-                mock.patch.object(R, 'preflight_codex_auth'), \
-                mock.patch.object(R, 'preflight_codex_login'), \
-                mock.patch.object(R, '_drive') as drive:
-            res = CliRunner().invoke(R.main, [
+        with mock.patch.object(cli, 'preflight_sbx') as sbx, \
+                mock.patch.object(cli, 'preflight_disk'), \
+                mock.patch.object(cli, 'preflight_codex_auth'), \
+                mock.patch.object(cli, 'preflight_codex_login'), \
+                mock.patch.object(cli, '_drive') as drive:
+            res = CliRunner().invoke(cli.main, [
                 '-c', str(cfg_path),
                 '--canonical-root', str(self.root / 'c'),
                 '--worktree-root', root,
@@ -15433,19 +15400,19 @@ class TestDeclaredEgressIsCheckedBeforeTheRun(_Base):
         root = str(self.root / 'w')
         egress.publish_policy(root, ('pypi.org',))
         self.assertEqual(
-            R.read_operator_egress(self._cfg(_DECLARES), root), ('pypi.org',)
+            read_operator_egress(self._cfg(_DECLARES), root), ('pypi.org',)
         )
 
     def test_nothing_declared_checks_nothing(self) -> None:
         with self._verdicts() as check:
-            R.preflight_egress(
+            preflight_egress(
                 self._cfg(_VERIFY), ('pypi.org',), run_id='r1'
             )
         check.assert_not_called()
 
     def test_the_check_gets_the_hosts_list_and_run(self) -> None:
         with self._verdicts(), contextlib.redirect_stdout(io.StringIO()):
-            R.preflight_egress(
+            preflight_egress(
                 self._cfg(_DECLARES), ('pypi.org',), run_id='r1'
             )
         self.assertEqual(self.seen['hosts'], ('sh.rustup.rs', 'crates.io'))
@@ -15455,7 +15422,7 @@ class TestDeclaredEgressIsCheckedBeforeTheRun(_Base):
 
     def test_a_lockdown_is_checked_as_a_lockdown(self) -> None:
         with self._verdicts(), contextlib.redirect_stdout(io.StringIO()):
-            R.preflight_egress(self._cfg(_DECLARES), (), run_id='r1')
+            preflight_egress(self._cfg(_DECLARES), (), run_id='r1')
         self.assertEqual(self.seen['allowlist'], ())
 
     def test_the_gates_image_is_used_when_set(self) -> None:
@@ -15465,20 +15432,20 @@ class TestDeclaredEgressIsCheckedBeforeTheRun(_Base):
             '  image: example.invalid/gate:1',
         )
         with self._verdicts(), contextlib.redirect_stdout(io.StringIO()):
-            R.preflight_egress(self._cfg(text), (), run_id='r1')
+            preflight_egress(self._cfg(text), (), run_id='r1')
         self.assertEqual(self.seen['image'], 'example.invalid/gate:1')
 
     def test_all_allowed_says_so(self) -> None:
         out = io.StringIO()
         with self._verdicts(), contextlib.redirect_stdout(out):
-            R.preflight_egress(self._cfg(_DECLARES), (), run_id='r1')
+            preflight_egress(self._cfg(_DECLARES), (), run_id='r1')
         self.assertIn('2 declared host(s)', out.getvalue())
 
     def test_a_denied_host_refuses_naming_it_and_the_fix(self) -> None:
         quiet = contextlib.redirect_stdout(io.StringIO())
         with self._verdicts('crates.io'), quiet:
             with self.assertRaises(click.ClickException) as caught:
-                R.preflight_egress(self._cfg(_DECLARES), (), run_id='r1')
+                preflight_egress(self._cfg(_DECLARES), (), run_id='r1')
         msg = caught.exception.format_message()
         self.assertIn('crates.io: No matching allow rule', msg)
         self.assertNotIn('sh.rustup.rs', msg)
@@ -15490,18 +15457,18 @@ class TestDeclaredEgressIsCheckedBeforeTheRun(_Base):
             side_effect=egress.EgressCheckError('sbx gave no verdict'),
         ), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(click.ClickException) as caught:
-                R.preflight_egress(self._cfg(_DECLARES), (), run_id='r1')
+                preflight_egress(self._cfg(_DECLARES), (), run_id='r1')
         self.assertIn('sbx gave no verdict', caught.exception.format_message())
 
     def _main(self, text: str, root: str):
         cfg_path = self.root / 'pipeline.yaml'
         cfg_path.write_text(text, encoding='utf-8')
-        with mock.patch.object(R, 'preflight_sbx'), \
-                mock.patch.object(R, 'preflight_disk'), \
-                mock.patch.object(R, 'preflight_codex_auth'), \
-                mock.patch.object(R, 'preflight_codex_login'), \
-                mock.patch.object(R, '_drive') as drive:
-            res = CliRunner().invoke(R.main, [
+        with mock.patch.object(cli, 'preflight_sbx'), \
+                mock.patch.object(cli, 'preflight_disk'), \
+                mock.patch.object(cli, 'preflight_codex_auth'), \
+                mock.patch.object(cli, 'preflight_codex_login'), \
+                mock.patch.object(cli, '_drive') as drive:
+            res = CliRunner().invoke(cli.main, [
                 '-c', str(cfg_path),
                 '--canonical-root', str(self.root / 'c'),
                 '--worktree-root', root,
@@ -15556,17 +15523,17 @@ class TestThePipelineImageIsReadyBeforeTheRun(_Base):
         cfg = self._cfg(text)
         out = io.StringIO()
         with mock.patch.object(
-            R.image, 'image_built', return_value=built
+            sbx_image, 'image_built', return_value=built
         ) as is_built, mock.patch.object(
-            R.image, 'build_image', side_effect=build_error
+            sbx_image, 'build_image', side_effect=build_error
         ) as build, contextlib.redirect_stdout(out):
-            R.ensure_pipeline_image(cfg, self.wt, egress_allow)
+            ensure_pipeline_image(cfg, self.wt, egress_allow)
         return cfg, is_built, build, out.getvalue()
 
     def _serve(self, cfg_text: str = _WITH_IMAGE) -> str:
         tag = pipeline.image_tag(self._cfg(cfg_text))
         assert tag is not None
-        R.image.publish_agent_image(self.wt, tag)
+        sbx_image.publish_agent_image(self.wt, tag)
         return tag
 
     def test_a_pipeline_without_one_does_nothing(self) -> None:
@@ -15596,12 +15563,14 @@ class TestThePipelineImageIsReadyBeforeTheRun(_Base):
         with self.assertRaises(click.ClickException) as caught:
             self._ensure(
                 built=False,
-                build_error=R.image.ImageError('image.setup failed (exit 2)'),
+                build_error=sbx_image.ImageError(
+                    'image.setup failed (exit 2)'
+                ),
             )
         self.assertIn('image.setup failed', caught.exception.format_message())
 
     def test_a_server_with_another_image_is_refused(self) -> None:
-        R.image.publish_agent_image(self.wt, 'ghcr.io/x/host:v1')
+        sbx_image.publish_agent_image(self.wt, 'ghcr.io/x/host:v1')
         with self.assertRaises(click.ClickException) as caught:
             self._ensure()
         message = caught.exception.format_message()
@@ -15614,11 +15583,11 @@ class TestThePipelineImageIsReadyBeforeTheRun(_Base):
         self.assertIn('Restart the server', caught.exception.format_message())
 
     def test_the_refusal_comes_before_any_build(self) -> None:
-        R.image.publish_agent_image(self.wt, 'ghcr.io/x/host:v1')
-        with mock.patch.object(R.image, 'build_image') as build, \
-                mock.patch.object(R.image, 'image_built') as is_built:
+        sbx_image.publish_agent_image(self.wt, 'ghcr.io/x/host:v1')
+        with mock.patch.object(sbx_image, 'build_image') as build, \
+                mock.patch.object(sbx_image, 'image_built') as is_built:
             with self.assertRaises(click.ClickException):
-                R.ensure_pipeline_image(
+                ensure_pipeline_image(
                     self._cfg(_WITH_IMAGE), self.wt, ()
                 )
         is_built.assert_not_called()
@@ -15626,28 +15595,28 @@ class TestThePipelineImageIsReadyBeforeTheRun(_Base):
 
     def test_a_build_in_progress_is_waited_for_not_repeated(self) -> None:
         self._serve()
-        held = R.image.try_build_lock(self.wt)
+        held = sbx_image.try_build_lock(self.wt)
         assert held is not None
         state = {'built': False}
 
         def finish() -> None:
             state['built'] = True
-            R.image.release_build_lock(held)
+            sbx_image.release_build_lock(held)
 
         timer = threading.Timer(0.3, finish)
         with mock.patch.object(
-            R.image, 'image_built', side_effect=lambda _t: state['built']
-        ), mock.patch.object(R.image, 'build_image') as build, \
+            sbx_image, 'image_built', side_effect=lambda _t: state['built']
+        ), mock.patch.object(sbx_image, 'build_image') as build, \
                 contextlib.redirect_stdout(io.StringIO()):
             timer.start()
-            R.ensure_pipeline_image(self._cfg(_WITH_IMAGE), self.wt, ())
+            ensure_pipeline_image(self._cfg(_WITH_IMAGE), self.wt, ())
         timer.join()
         build.assert_not_called()
 
     def test_an_image_alone_reads_the_operators_list(self) -> None:
         egress.publish_policy(self.wt, ('pypi.org',))
         self.assertEqual(
-            R.read_operator_egress(self._cfg(_WITH_IMAGE), self.wt),
+            read_operator_egress(self._cfg(_WITH_IMAGE), self.wt),
             ('pypi.org',),
         )
 
@@ -15656,18 +15625,18 @@ class TestThePipelineImageIsReadyBeforeTheRun(_Base):
         self._serve()
         cfg_path = self.root / 'pipeline.yaml'
         cfg_path.write_text(_WITH_IMAGE, encoding='utf-8')
-        with mock.patch.object(R, 'preflight_sbx'), \
-                mock.patch.object(R, 'preflight_disk'), \
-                mock.patch.object(R, 'preflight_codex_auth'), \
-                mock.patch.object(R, 'preflight_codex_login'), \
+        with mock.patch.object(cli, 'preflight_sbx'), \
+                mock.patch.object(cli, 'preflight_disk'), \
+                mock.patch.object(cli, 'preflight_codex_auth'), \
+                mock.patch.object(cli, 'preflight_codex_login'), \
                 mock.patch.object(
-                    R.image, 'image_built', return_value=built
+                    sbx_image, 'image_built', return_value=built
                 ), \
                 mock.patch.object(
-                    R.image, 'build_image', side_effect=build_error
+                    sbx_image, 'build_image', side_effect=build_error
                 ) as build, \
-                mock.patch.object(R, '_drive') as drive:
-            res = CliRunner().invoke(R.main, [
+                mock.patch.object(cli, '_drive') as drive:
+            res = CliRunner().invoke(cli.main, [
                 '-c', str(cfg_path),
                 '--canonical-root', str(self.root / 'c'),
                 '--worktree-root', self.wt,
@@ -15683,7 +15652,7 @@ class TestThePipelineImageIsReadyBeforeTheRun(_Base):
 
     def test_main_stops_when_the_build_fails(self) -> None:
         res, _build, drive = self._main(
-            built=False, build_error=R.image.ImageError('setup failed')
+            built=False, build_error=sbx_image.ImageError('setup failed')
         )
         self.assertEqual(res.exit_code, 1)
         self.assertIn('setup failed', res.output)
@@ -15725,7 +15694,7 @@ class TestTheGateBootsThePipelineImage(_Base):
         with mock.patch.object(
             egress, 'check_declared_hosts', side_effect=check
         ), contextlib.redirect_stdout(io.StringIO()):
-            R.preflight_egress(self._cfg(text), (), run_id='r1')
+            preflight_egress(self._cfg(text), (), run_id='r1')
         self.assertEqual(
             seen['image'], 'ghcr.io/omnigent-ai/omnigent-host:v0.20.0'
         )

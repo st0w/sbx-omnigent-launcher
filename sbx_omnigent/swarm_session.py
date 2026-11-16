@@ -1796,7 +1796,7 @@ class SwarmSessionClient:
 
         Lets a caller judge a reply against the rest of the
         conversation rather than trusting the last one blind — see
-        :func:`sbx_omnigent.runner.run.select_plan_of_record`.
+        :func:`sbx_omnigent.runner.parsing.plans.select_plan_of_record`.
 
         :param session_id: The session to read.
         :param tail: How many trailing items to scan.

@@ -1169,7 +1169,10 @@ sbx-omnigent-launcher/
     ├── launcher.py           # SbxLauncher: sbx transport + worktree mounting
     ├── entrypoint.py         # provider wrap + agent auto-register + `omni-sbx`
     ├── pipeline.py           # pipeline.yaml parser, templates, agent materialization
-    ├── runner/               # PipelineRunner: the DAG executor + `omni-sbx-pipeline`
+    ├── runner/               # the pipeline runner and `omni-sbx-pipeline`:
+    │                         #   run.py (PipelineRunner, the DAG executor),
+    │                         #   cli.py, preflight/, resume.py, and the
+    │                         #   prompts, parsing, records and render it uses
     ├── worktrees.py          # host-side git: canonical mirror, worktrees, publish
     ├── swarm_session.py      # create/drive managed sessions over HTTP+SSE
     ├── swarm.py              # SwarmOrchestrator + `omni-sbx-swarm` CLI (coordinator)
