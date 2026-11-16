@@ -91,9 +91,7 @@ from sbx_omnigent.runner.parsing.dispositions import (
     parse_dispositions,
 )
 from sbx_omnigent.runner.parsing.findings import (
-    FindingSections,
     parse_findings,
-    report_names_nothing,
 )
 from sbx_omnigent.runner.parsing.plans import (
     _PLAN_REPLY_TAIL,
@@ -157,9 +155,6 @@ from sbx_omnigent.runner.prompts.writer import (
     _WRITER_FINISH_ASK,
 )
 from sbx_omnigent.runner.publish import Publisher
-from sbx_omnigent.runner.records.judging import (
-    JudgePick,
-)
 from sbx_omnigent.runner.records.results import (
     NodeResult,
     RunResult,
@@ -167,19 +162,14 @@ from sbx_omnigent.runner.records.results import (
 from sbx_omnigent.runner.records.reviews import (
     ReviewRecord,
 )
-from sbx_omnigent.runner.render.judging import (
-    render_judge_decision,
-)
 from sbx_omnigent.runner.render.pr_body import (
     environment_by_stage,
-)
-from sbx_omnigent.runner.render.reviews import (
-    render_review_records,
 )
 from sbx_omnigent.runner.render.sessions import (
     render_turn_capture,
 )
 from sbx_omnigent.runner.repo_records import RepoRecords
+from sbx_omnigent.runner.review_book import ReviewBook
 from sbx_omnigent.runner.security_records import SecurityRecords
 from sbx_omnigent.runner.stage_kinds import (
     is_planner,
@@ -412,23 +402,10 @@ class PipelineRunner:
         #: CLIs already reported as off the known-good set, THIS
         #: PROCESS: once per CLI, not once per session.
         self._known_good_reported: set[str] = set()
-        #: Review rounds spent per stage, THIS PROCESS.
-        #:
-        #: Deliberately not in the run state. The cap bounds the
-        #: branch, and a resume is a deliberate human act that buys
-        #: another budget — persisting this would reverse that. See
-        #: :meth:`_spend_review_round`.
-        self._review_rounds: dict[str, int] = {}
         #: Sessions a PREVIOUS attempt of this run left behind, read
         #: from its state on resume. For DISPOSAL ONLY — never driven,
         #: never treated as live (see :meth:`_dispose_stale_sessions`).
         self._stale_sessions: list[str] = []
-        #: Every reviewer vote cast this run, with the report behind it.
-        #: Buffered rather than written to a branch as it happens: a
-        #: competition is still live during review, so nothing may
-        #: commit to a candidate's branch mid-flight. Written to the run
-        #: dir immediately and committed to the winner at publish.
-        self._reviews: list[ReviewRecord] = []
         #: Writer nodes whose review stage reached APPROVED consensus.
         #: Read by :meth:`_all_reviewed` so a judge can be told its
         #: candidates are already verified and need not be re-built.
@@ -437,9 +414,6 @@ class PipelineRunner:
         #: always did. Degrading to the slower-but-correct behaviour is
         #: the right failure for a claim about what was checked.
         self._reviewed_ok: set[str] = set()
-        #: The judge's choices, so the two-writer race can be
-        #: evaluated over a series of modules rather than trusted.
-        self._picks: list[JudgePick] = []
         #: Age of the agy swap secret, guarding every agy turn.
         self._swap_age_s = swap_age_s or agy.harvest_age_s
         #: The operator's allowlist for the verify gate, as the server
@@ -520,21 +494,24 @@ class PipelineRunner:
             lock=self._lock,
             max_rounds=max_review_rounds,
         )
+        self._book = ReviewBook(
+            self._ctx, progress=self._progress, save_state=self._save_state
+        )
         self._ledger = DecisionLedger(self._ctx)
         self._policy = WriterPolicy(
             self._ctx, redrive_writer=self._redrive_writer
         )
-        self._triage = FindingTriage(chunk_reviews=self._chunk_reviews)
+        self._triage = FindingTriage(chunk_reviews=self._book.module_reviews)
         self._filing = FindingFiler(
             self._ctx,
             publish_repo=self._publish_repo,
             triage=self._triage,
-            chunk_reviews=self._chunk_reviews,
+            chunk_reviews=self._book.module_reviews,
         )
         self._records = RepoRecords(
             self._ctx,
-            chunk_reviews=self._chunk_reviews,
-            chunk_picks=self._chunk_picks,
+            chunk_reviews=self._book.module_reviews,
+            chunk_picks=self._book.module_picks,
             reader_turns=lambda: self._reader_turns,
         )
         self._security = SecurityRecords(
@@ -542,7 +519,7 @@ class PipelineRunner:
             publish_repo=self._publish_repo,
             triage=self._triage,
             filing=self._filing,
-            chunk_reviews=self._chunk_reviews,
+            chunk_reviews=self._book.module_reviews,
         )
         self._publisher = Publisher(
             self._ctx,
@@ -551,8 +528,8 @@ class PipelineRunner:
             ledger=self._ledger,
             security=self._security,
             filing=self._filing,
-            chunk_reviews=self._chunk_reviews,
-            chunk_picks=self._chunk_picks,
+            chunk_reviews=self._book.module_reviews,
+            chunk_picks=self._book.module_picks,
             save_state=self._save_state,
         )
         self._publisher.preflight()
@@ -678,9 +655,9 @@ class PipelineRunner:
         self._triage.dispositions = restored.dispositions
         self._triage.blocking_claims = restored.blocking_claims
         self._harness_versions = restored.harness_versions
-        self._reviews = restored.reviews
+        self._book.reviews = restored.reviews
         self._reader_turns = restored.reader_turns
-        self._picks = restored.picks
+        self._book.picks = restored.picks
         self._progress.plan_of_record = restored.plan_of_record
         self._publisher.published = restored.published
         self._progress.last_branch_node = restored.last_branch_node
@@ -777,9 +754,9 @@ class PipelineRunner:
                 completed_chunks=self._progress.completed_chunks,
                 chunk_publishes=self._publisher.chunk_publishes,
                 reviewed_ok=self._reviewed_ok,
-                reviews=self._reviews,
+                reviews=self._book.reviews,
                 reader_turns=self._reader_turns,
-                picks=self._picks,
+                picks=self._book.picks,
                 last_branch_node=self._progress.last_branch_node,
                 published=self._publisher.published,
                 nodes=self._nodes,
@@ -1036,49 +1013,6 @@ class PipelineRunner:
             )
         self._save_state()
 
-    def _next_review_round(self, stage_id: str) -> int:
-        """
-        The next round number for a review stage, across re-entries.
-
-        Derived from the records themselves rather than a counter, so it
-        survives a resume for free: ``_reviews`` is restored from the
-        run state, and a resumed run continues the numbering instead of
-        starting over and overwriting what the earlier attempt wrote.
-
-        :param stage_id: The review stage's id (already namespaced per
-            module, so modules cannot collide).
-        :returns: One past the highest round recorded for that stage.
-        """
-        with self._lock:
-            prior = [
-                r.round_no for r in self._reviews
-                if r.stage == stage_id
-            ]
-        return max(prior, default=0) + 1
-
-    def _spend_review_round(self, stage_id: str) -> int:
-        """
-        Charge one round to a review stage's budget, and report it.
-
-        Separate from :meth:`_next_review_round`, which derives the
-        RECORDED number from the records themselves and therefore
-        survives a resume. This one must not: the budget bounds the
-        branch within a run, and a resume starts fresh.
-
-        It is also not a local, which is the defect. Held in a local,
-        the budget was reset by anything that re-entered
-        ``_run_review`` — a parallel sibling failing, a gate retry —
-        while the recorded number kept climbing. One branch reached
-        six recorded rounds against a cap of three.
-
-        :param stage_id: The review stage being charged.
-        :returns: How many rounds that stage has now spent.
-        """
-        with self._lock:
-            spent = self._review_rounds.get(stage_id, 0) + 1
-            self._review_rounds[stage_id] = spent
-        return spent
-
     def _sandbox_for_session(self, session: str) -> str | None:
         """
         The microVM name backing *session*, or ``None``.
@@ -1237,91 +1171,6 @@ class PipelineRunner:
             )
         return pane_path
 
-    def _record_review(
-        self,
-        stage_id: str,
-        reviewer: str,
-        round_no: int,
-        verdict: str | None,
-        session: str,
-        fallback: str,
-    ) -> None:
-        """
-        Capture a reviewer's report before its session is disposed.
-
-        Written to the run dir straight away, so a run that blocks or
-        crashes still explains itself; buffered in memory (and in the
-        run state, so a resume keeps it) for the copy committed to the
-        publishing branch. Best-effort throughout — a lost record must
-        never fail a review that otherwise decided cleanly.
-
-        :param stage_id: The review stage's id.
-        :param reviewer: The agent name that voted.
-        :param round_no: Which review round this was (1-based).
-        :param verdict: The parsed verdict, or ``None``.
-        :param session: The reviewer's session, still alive.
-        :param fallback: The reply text already captured, used when the
-            transcript cannot be read at all.
-        """
-        try:
-            turns = self._sc.read_transcript(session)
-        except SwarmSessionError:
-            turns = []
-        if not turns and fallback.strip():
-            turns = [('assistant', fallback.strip())]
-        # Best-effort: a review whose stage cannot be resolved still
-        # records its vote, just without naming the candidate.
-        stage = self._stage_by_id.get(stage_id)
-        try:
-            target = review_target(stage, self._nodes) if stage else None
-        except PipelineRunError:
-            target = None
-        sections = FindingSections.of(fallback)
-        # A blocking report is kept WHOLE. Its findings are prose under
-        # whatever heading the reviewer chose, so there is no list to
-        # lift — and the three sections above are explicitly the
-        # non-blocking ones, which left the record of a block empty.
-        blocking_report = fallback.strip() if verdict == 'BLOCKING' else ''
-        if blocking_report and report_names_nothing(blocking_report):
-            click.echo(
-                f'[review] {stage_id}-{reviewer}: BLOCKING, but the '
-                f'report named nothing — no finding, file or line for '
-                f'the writer to address or a verifier to check. Its '
-                f'reply is in the run directory.'
-            )
-        record = ReviewRecord(
-            chunk=self._progress.module_id,
-            stage=stage_id,
-            reviewer=reviewer,
-            round_no=round_no,
-            verdict=verdict,
-            turns=tuple(turns),
-            findings=sections.all,
-            defects=sections.defects,
-            later_increment=sections.later_increment,
-            premises=sections.premises,
-            environment=sections.environment,
-            target=target,
-            blocking_report=blocking_report,
-        )
-        # Reviewers of a stage vote concurrently, and the round
-        # number below is derived by WALKING this list.
-        with self._lock:
-            self._reviews.append(record)
-        self._wt.write_run_artifact(
-            self._run_id,
-            f'reviews/{record.slug}.md',
-            render_review_records(
-                [record], title=f'Review — {record.label}'
-            ),
-        )
-        self._save_state()
-
-    def _chunk_reviews(self) -> list[ReviewRecord]:
-        """:returns: The votes belonging to the publishing chunk."""
-        chunk = self._progress.module_id
-        return [r for r in self._reviews if r.chunk == chunk]
-
     def _security_folder_name(self) -> str:
         """The scan reports' folder name, for the record to cite."""
         return PurePosixPath(
@@ -1430,79 +1279,6 @@ class PipelineRunner:
                 f'[disk] {event}: recorded {len(records)} measurement(s) '
                 f'to {self._wt.metrics_path(self._run_id)}.'
             )
-
-    def _record_pick(
-        self,
-        stage_id: str,
-        candidates: list[str],
-        selected: str,
-        stated: str | None,
-        reasoning: str,
-        retained: tuple[tuple[str, str], ...] = (),
-        *,
-        forfeited: tuple[tuple[str, str, int], ...] = (),
-        uncontested: bool = False,
-    ) -> None:
-        """
-        Record a judge's choice before its session is disposed.
-
-        Written to the run dir straight away so a run that fails after
-        the judge still explains what it picked, and buffered (and
-        persisted, so a resume keeps it) for the copy committed to the
-        publishing branch — the same treatment reviewer reports get.
-
-        :param stage_id: The judge stage's id.
-        :param candidates: The competing node ids it compared.
-        :param selected: The node id that will publish.
-        :param stated: What the judge's own SELECT line named, or
-            ``None``. Recorded separately so the runner's fail-safe
-            substitution cannot be mistaken for a real preference.
-        :param reasoning: The judge's reply. Passed in rather than read
-            back off the node, because this runs BEFORE the node exists
-            — recording has to happen before the branch alias so a run
-            that fails in between still explains itself.
-        :param retained: ``(node, bundle-path)`` for each preserved
-            loser, so the record says where the losing code lives.
-        :param forfeited: ``(candidate, review, rounds)`` for each
-            candidate withdrawn before judging.
-        :param uncontested: Only one candidate was left; no judge ran.
-        """
-        pick = JudgePick(
-            chunk=self._progress.module_id,
-            stage=stage_id,
-            candidates=tuple(candidates),
-            selected=selected,
-            stated=stated,
-            reasoning=reasoning,
-            retained=retained,
-            forfeited=forfeited,
-            uncontested=uncontested,
-        )
-        self._picks.append(pick)
-        self._wt.write_run_artifact(
-            self._run_id,
-            f'judging/{stage_id}.md',
-            render_judge_decision([pick], title=f'Judging — {stage_id}'),
-        )
-        if pick.uncontested:
-            # _select_uncontested has already said why.
-            return
-        if pick.honored:
-            click.echo(
-                f'[judge] {stage_id}: selected {selected} from '
-                f'{", ".join(candidates)}.'
-            )
-        else:
-            click.echo(
-                f'[judge] {stage_id}: no usable SELECT line (said '
-                f'{stated!r}) — falling back to {selected}. This is '
-                f'recorded as an ABSENT decision, not a preference.'
-            )
-
-    def _chunk_picks(self) -> list[JudgePick]:
-        """This chunk's judge picks (all of them outside a campaign)."""
-        chunk = self._progress.module_id
-        return [p for p in self._picks if p.chunk == chunk]
 
     def _chunk_preamble(self) -> str:
         """A directive scoping a builder turn to the active chunk."""
@@ -1905,7 +1681,7 @@ class PipelineRunner:
                 # blocked sibling from the recorded verdicts rather
                 # than that one exception.
                 blocked = [exc] + [
-                    _Blocked(sub.id, self._review_rounds.get(sub.id, 0))
+                    _Blocked(sub.id, self._book.rounds_spent(sub.id))
                     for sub in stage.parallel
                     if sub.id != exc.stage_id
                     and (node := self._nodes.get(sub.id)) is not None
@@ -2274,7 +2050,7 @@ class PipelineRunner:
         """
         assert stage.scans is not None and stage.scan_effort is not None
         while True:
-            round_no = self._next_review_round(stage.id)
+            round_no = self._book.next_round(stage.id)
             findings = self._scan_round(stage, round_no)
             blocking = [f for f in findings if f.blocks]
             if not blocking:
@@ -2282,7 +2058,7 @@ class PipelineRunner:
                     stage.id, 'scan', verdict='APPROVED'
                 )
                 return
-            rounds = self._spend_review_round(stage.id)
+            rounds = self._book.spend_round(stage.id)
             if rounds > self._max_rounds or not stage.on_block:
                 self._nodes[stage.id] = NodeResult(
                     stage.id, 'scan', verdict='BLOCKING'
@@ -2452,16 +2228,7 @@ class PipelineRunner:
             ),
             attachments=saved,
         )
-        with self._lock:
-            self._reviews.append(record)
-        self._wt.write_run_artifact(
-            self._run_id,
-            f'reviews/{record.slug}.md',
-            render_review_records(
-                [record], title=f'Review — {record.label}'
-            ),
-        )
-        self._save_state()
+        self._book.add(record)
 
     def _module_start(self) -> str:
         """
@@ -2538,8 +2305,8 @@ class PipelineRunner:
         )
         self._halt_on_reader_dispute(stage)
         self._halt_on_unfinished_check(stage, session, out)
-        self._record_review(
-            stage.id, stage.run[0], self._next_review_round(stage.id),
+        self._book.record_review(
+            stage.id, stage.run[0], self._book.next_round(stage.id),
             _CHECK_VERDICT, session, out,
         )
         findings = parse_findings(out)
@@ -2841,8 +2608,8 @@ class PipelineRunner:
         self._nodes[check.id] = NodeResult(
             check.id, 'check', worktree=wt, session=session, output=out
         )
-        self._record_review(
-            check.id, check.run[0], self._next_review_round(check.id),
+        self._book.record_review(
+            check.id, check.run[0], self._book.next_round(check.id),
             _CHECK_DISPUTED if claims else _CHECK_VERDICT, session, out,
         )
         self._release_completed_session(check, 'check')
@@ -3566,7 +3333,7 @@ class PipelineRunner:
         # BEFORE the disposal below: disposing a session deletes its
         # transcript, so this is the last moment the report exists
         # anywhere.
-        self._record_review(
+        self._book.record_review(
             stage.id, reviewer, round_no, verdict, session, text
         )
         # As soon as it votes, not once the stage ends. A reviewer that
@@ -3589,16 +3356,17 @@ class PipelineRunner:
         # started over while the recorded number kept climbing.
         #
         # The RECORDED number still comes from the records instead
-        # (`_next_review_round`). Deriving it from the budget labelled
-        # every re-review "round 1" — six of them on one branch, which
-        # reads as six independent first rounds rather than one block
-        # and the re-reviews that followed — and collided the run-dir
-        # filenames, so each re-review overwrote the last.
+        # (`ReviewBook.next_round`). Deriving it from the budget
+        # labelled every re-review "round 1" — six of them on one
+        # branch, which reads as six independent first rounds rather
+        # than one block and the re-reviews that followed — and
+        # collided the run-dir filenames, so each re-review overwrote
+        # the last.
         inconclusive_rounds = 0
         while True:
             outputs: dict[str, str] = {}
             verdicts: dict[str, str | None] = {}
-            round_no = self._next_review_round(stage.id)
+            round_no = self._book.next_round(stage.id)
             created: list[str] = []
             # Both per ROUND, not once per stage. A blocked round
             # re-drives the writer, so round two must read what that
@@ -3724,10 +3492,10 @@ class PipelineRunner:
                     stage.id, 'review', verdict='BLOCKING'
                 )
                 raise _Blocked(
-                    stage.id, self._review_rounds.get(stage.id, 0) + 1
+                    stage.id, self._book.rounds_spent(stage.id) + 1
                 )
             self._halt_on_dispute(stage, outputs, blocking)
-            rounds = self._spend_review_round(stage.id)
+            rounds = self._book.spend_round(stage.id)
             if rounds > self._max_rounds or not stage.on_block:
                 self._nodes[stage.id] = NodeResult(
                     stage.id, 'review', verdict='BLOCKING'
@@ -3752,7 +3520,7 @@ class PipelineRunner:
         :param round_no: That round.
         """
         with self._lock:
-            records = [r for r in self._reviews if r.stage == stage_id]
+            records = [r for r in self._book.reviews if r.stage == stage_id]
         earlier = {
             text
             for rec in records
@@ -4313,7 +4081,7 @@ class PipelineRunner:
         # branches live only there, and the run directory holds the only
         # copy — teardown deletes it.
         retained = self._retain_losers(candidates, sel)
-        self._record_pick(
+        self._book.record_pick(
             stage.id, candidates, sel, stated, out, retained,
             forfeited=forfeited,
         )
@@ -4359,7 +4127,7 @@ class PipelineRunner:
             f'after {withdrawn} withdrew, so no judge turn runs. '
             f'Recorded as UNCONTESTED, not as a judgment.'
         )
-        self._record_pick(
+        self._book.record_pick(
             stage.id, [selected], selected, None, '',
             forfeited=forfeited, uncontested=True,
         )
