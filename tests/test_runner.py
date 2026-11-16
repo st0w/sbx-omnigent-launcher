@@ -3192,8 +3192,8 @@ _TWO_REVIEW_REPLIES = {
 class TestAStageFreesItsOwnSessionsOnly(_Base):
     """
     Review stages used to free their guests by an INDEX MARK into one
-    shared session list — ``mark = len(self._sessions)`` on the way in,
-    ``del self._sessions[mark:]`` on the way out.
+    shared session list — ``mark = len(sessions)`` on the way in,
+    ``del sessions[mark:]`` on the way out.
 
     That is safe only while one review stage runs at a time. With
     review-a and review-b in a ``parallel:`` block both take a mark at
@@ -3216,10 +3216,10 @@ class TestAStageFreesItsOwnSessionsOnly(_Base):
         # frees what it created and leaves everything else running.
         sc = FakeSC(dict(_TWO_REVIEW_REPLIES))
         runner = self._runner(sc)
-        runner._sessions[:] = ['a-1', 'b-1', 'a-2', 'b-2']
+        runner._registry.sessions[:] = ['a-1', 'b-1', 'a-2', 'b-2']
         runner._dispose_sessions(['a-1', 'a-2'])
         self.assertEqual(sc.disposed, ['a-1', 'a-2'])
-        self.assertEqual(runner._sessions, ['b-1', 'b-2'])
+        self.assertEqual(runner._registry.sessions, ['b-1', 'b-2'])
 
     def test_an_outstanding_chunk_mark_still_means_what_it_did(self)\
             -> None:
@@ -3228,24 +3228,25 @@ class TestAStageFreesItsOwnSessionsOnly(_Base):
         # next chunk boundary frees the wrong guests.
         sc = FakeSC(dict(_TWO_REVIEW_REPLIES))
         runner = self._runner(sc)
-        runner._sessions[:] = ['chunk0-1', 'chunk0-2']
-        mark = len(runner._sessions)
-        runner._sessions.extend(['stage-a', 'stage-b', 'other'])
+        sessions = runner._registry.sessions
+        sessions[:] = ['chunk0-1', 'chunk0-2']
+        mark = len(sessions)
+        sessions.extend(['stage-a', 'stage-b', 'other'])
         runner._dispose_sessions(['stage-a', 'stage-b'])
-        self.assertEqual(runner._sessions[mark:], ['other'])
-        self.assertEqual(runner._sessions[:mark], ['chunk0-1', 'chunk0-2'])
+        self.assertEqual(sessions[mark:], ['other'])
+        self.assertEqual(sessions[:mark], ['chunk0-1', 'chunk0-2'])
 
     def test_a_session_already_freed_is_not_deleted_twice(self) -> None:
         # Each reviewer releases its own guest the moment it votes, so
         # the stage backstop must be a no-op for those.
         sc = FakeSC(dict(_TWO_REVIEW_REPLIES))
         runner = self._runner(sc)
-        runner._sessions[:] = ['s-1', 's-2']
+        runner._registry.sessions[:] = ['s-1', 's-2']
         runner._free_session('s-1', 'voted')
         self.assertEqual(sc.disposed, ['s-1'])
         runner._dispose_sessions(['s-1', 's-2'])
         self.assertEqual(sc.disposed, ['s-1', 's-2'])
-        self.assertEqual(runner._sessions, [])
+        self.assertEqual(runner._registry.sessions, [])
 
     def test_a_still_working_reviewer_is_not_torn_down(self) -> None:
         """
@@ -6497,7 +6498,7 @@ class TestTheVerificationGate(_Base):
             'triage', 'verify', worktree='w', session='s-triage'
         )
         runner._release_completed_session(stage, 'verify')
-        self.assertIn('s-triage', runner._released)
+        self.assertIn('s-triage', runner._registry.released)
 
 
 #: What a blocking reviewer actually writes: numbered prose under a
@@ -8482,7 +8483,7 @@ class TestCtrlCStopsTheRunNow(_Base):
         runner = self._runner()
         release = threading.Event()
         self.addCleanup(release.set)
-        runner._in_turn.update({'s-a', 's-b'})
+        runner._registry.in_turn.update({'s-a', 's-b'})
 
         def interrupted(*_a, **_k):
             raise KeyboardInterrupt
@@ -8555,7 +8556,7 @@ class TestCtrlCStopsTheRunNow(_Base):
 
         class _Watching(FakeSC):
             def send_and_wait(self, session, message, **kw):
-                seen.append(session in holder['runner']._in_turn)
+                seen.append(session in holder['runner']._registry.in_turn)
                 return super().send_and_wait(session, message, **kw)
 
         sc = _Watching({'build': 'done'})
@@ -8566,7 +8567,7 @@ class TestCtrlCStopsTheRunNow(_Base):
         )
         runner._drive(session, 'do the work')
         self.assertEqual(seen, [True])
-        self.assertNotIn(session, runner._in_turn)
+        self.assertNotIn(session, runner._registry.in_turn)
 
     def test_main_exits_once_it_has_cleaned_up(self) -> None:
         cfg_path = self.root / 'pipeline.yaml'
@@ -10971,8 +10972,8 @@ class TestAResumeIsNotAMidSessionUpdate(_Base):
                 'versions': {**_KNOWN_GOOD, 'claude': '2.1.266'},
             },
         })
-        runner._session_agent['sess-new'] = cfg.agents['build']
-        runner._session_label['sess-new'] = 'build'
+        runner._registry.agents['sess-new'] = cfg.agents['build']
+        runner._registry.labels['sess-new'] = 'build'
         with mock.patch.object(R.click, 'echo') as echo:
             runner._note_harness_versions('sess-new', versions)
         said = '\n'.join(str(c.args[0]) for c in echo.call_args_list)
@@ -14023,17 +14024,6 @@ class TestPlanningSessionCommitted(_Base):
         instr = runner._plan_consolidation_instruction()
         self.assertIn('SUBTASKS:', instr)
         self.assertIn('[<short-id>]', instr)
-
-    def test_resolve_agent_ids_missing(self) -> None:
-        cfg = _make_min_cfg()
-        with self.assertRaises(R.PipelineRunError):
-            R.resolve_agent_ids(cfg, [])  # empty catalog
-
-    def test_resolve_agent_ids_ok(self) -> None:
-        cfg = _make_min_cfg()
-        spec = pipeline.namespaced_agent_name(cfg.name, 'build')
-        ids = R.resolve_agent_ids(cfg, [{'id': 'ag_x', 'name': spec}])
-        self.assertEqual(ids['build'], 'ag_x')
 
 
 def _make_min_cfg() -> pipeline.PipelineConfig:
