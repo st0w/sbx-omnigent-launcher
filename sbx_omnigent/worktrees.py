@@ -1416,7 +1416,7 @@ class WorktreeManager:
         Write ``name`` into a node worktree and git-ignore it there.
 
         Used to hand an agent a large turn as a file it reads instead
-        of an over-long paste (see runner ``_agy_deliverable``). The
+        of an over-long paste (see ``SessionDriver.drive``). The
         file is added to the clone's ``.git/info/exclude`` so it is
         (a) never staged by :meth:`commit_node`'s ``git add -A`` and
         (b) never shown by the settle-wait's ``git status --porcelain``
