@@ -46,6 +46,8 @@ from sbx_omnigent.runner.parsing.plans import (
 from sbx_omnigent.runner.prompts.checks import (
     _CHECK_FINISH,
 )
+from sbx_omnigent.runner.records.judging import retained_bundle_ref
+from sbx_omnigent.runner.render.issues import _issue_title_text
 from sbx_omnigent.swarm_session import (
     PlanDecision,
     SwarmRunnerUnavailable,
@@ -56,6 +58,7 @@ from sbx_omnigent.swarm_session import (
 )
 from sbx_omnigent.worktrees import WorktreeManager
 from tests.support.plans import plan_text, plan_with_decisions
+from tests.support.reviews import AUDIT_LIMIT, SCAN_LIMIT
 
 
 def _assert_plan_committed(case, wt, worktree, path, marker):
@@ -5170,45 +5173,6 @@ class TestReviewRecordsPerModule(_Base):
         self.assertIn('docs/plans/mods-m1-reviews.md', paths)
 
 
-class TestRenderReviewRecords(unittest.TestCase):
-    def _rec(self, **kw):
-        base = {
-            'chunk': None, 'stage': 'review', 'reviewer': 'sec',
-            'round_no': 1, 'verdict': 'APPROVED',
-            'turns': (('assistant', 'It builds.'),),
-        }
-        return R.ReviewRecord(**{**base, **kw})
-
-    def test_no_records_renders_nothing(self) -> None:
-        self.assertEqual(R.render_review_records([], title='T'), '')
-
-    def test_the_roster_lists_every_vote(self) -> None:
-        doc = R.render_review_records(
-            [self._rec(), self._rec(reviewer='bugs', verdict='BLOCKING')],
-            title='T',
-        )
-        self.assertIn('| `review-sec` | 1 | APPROVED |', doc)
-        self.assertIn('| `review-bugs` | 1 | BLOCKING |', doc)
-
-    def test_a_silent_reviewer_is_recorded_as_such(self) -> None:
-        # Not blank: "none stated" is itself the finding.
-        doc = R.render_review_records([self._rec(verdict=None)], title='T')
-        self.assertIn('none stated', doc)
-        self.assertIn('no verdict stated', doc)
-
-    def test_an_unreadable_session_says_so(self) -> None:
-        doc = R.render_review_records([self._rec(turns=())], title='T')
-        self.assertIn('could not be read', doc)
-
-    def test_the_slug_keeps_rounds_apart(self) -> None:
-        # The stage id already carries the module in a campaign, so the
-        # record must not prefix it again ("m1-m1-review-sec").
-        self.assertEqual(
-            self._rec(chunk='m1', stage='m1-review', round_no=2).slug,
-            'm1-review-sec-r2',
-        )
-
-
 _COMPETE_REVIEWED = """\
 name: race
 repo: https://github.com/org/proj.git
@@ -5242,15 +5206,6 @@ _REVIEWED_REPLIES = {
     'review-b-sec': 'VERDICT: APPROVED',
     'pick': 'SELECT: impl-a',
 }
-
-
-def _rec(reviewer='bugs', target='impl-a', round_no=1, findings=(),
-         chunk='topology', verdict='APPROVED'):
-    return R.ReviewRecord(
-        chunk=chunk, stage=f'{chunk}-review-a', reviewer=reviewer,
-        round_no=round_no, verdict=verdict, findings=tuple(findings),
-        target=target,
-    )
 
 
 #: Three candidates reviewed as ordinary TOP-LEVEL stages, as the
@@ -5489,135 +5444,6 @@ stages:
         self.assertFalse([ln for ln in said if ln.startswith('[forfeit]')])
 
 
-class TestJudgePickRecordsTheField(unittest.TestCase):
-    def _pick(self, **kw):
-        base = {
-            'chunk': None, 'stage': 'pick', 'candidates': ('impl-b',),
-            'selected': 'impl-b', 'stated': None,
-        }
-        return R.JudgePick(**{**base, **kw})
-
-    def test_forfeits_and_uncontested_survive_a_round_trip(self) -> None:
-        pick = self._pick(
-            forfeited=(('impl-a', 'review-a', 3),), uncontested=True
-        )
-        self.assertEqual(R.JudgePick.from_dict(pick.as_dict()), pick)
-
-    def test_a_pick_from_older_state_is_contested_with_no_forfeits(
-        self,
-    ) -> None:
-        raw = self._pick(stated='impl-b').as_dict()
-        del raw['forfeited'], raw['uncontested']
-        pick = R.JudgePick.from_dict(raw)
-        self.assertEqual(pick.forfeited, ())
-        self.assertFalse(pick.uncontested)
-
-    def test_a_malformed_forfeit_is_dropped(self) -> None:
-        raw = self._pick().as_dict()
-        raw['forfeited'] = [['impl-a', 'review-a', 'three'], 'junk',
-                            ['impl-c', 'review-c', 2]]
-        pick = R.JudgePick.from_dict(raw)
-        self.assertEqual(pick.forfeited, (('impl-c', 'review-c', 2),))
-
-
-class TestTheFindingsLedgerIsAppendOnly(unittest.TestCase):
-    """
-    The ledger is a HUMAN-EDITED artifact: a person annotates status and
-    reasoning on it, across modules and across runs. So the runner reads
-    what is on the branch and adds to it. A renderer that rebuilt the
-    document each run would clobber exactly what it exists to hold.
-    """
-
-    def _render(self, records, existing=None):
-        return R.render_findings_ledger(
-            records, title='Findings — demo', existing=existing,
-            report_doc='docs/plans/demo-reviews.md',
-        )
-
-    def test_a_first_run_creates_the_document(self) -> None:
-        doc = self._render([_rec(findings=['pagination is missing'])])
-        self.assertIn('# Findings — demo', doc)
-        self.assertIn('pagination is missing', doc)
-        self.assertIn('**Status:** open', doc)
-
-    def test_the_entry_says_which_candidate_and_which_reviewer(
-        self,
-    ) -> None:
-        # A finding without the candidate it was raised against is
-        # meaningless: two are reviewed per chunk.
-        doc = self._render([_rec(target='impl-b', findings=['x'])])
-        self.assertIn('`impl-b`', doc)
-        self.assertIn('`bugs`', doc)
-        self.assertIn('round 1', doc)
-
-    def test_existing_content_is_carried_through_byte_for_byte(
-        self,
-    ) -> None:
-        # THE critical property. Not "looks similar" — a prefix match on
-        # the actual bytes.
-        human = (
-            '# Findings — demo\n\nMy own notes here.\n\n---\n\n'
-            '## `[topology/impl-a/bugs/r1#1]`\n\n'
-            '**Status:** accepted — fixing in [identities]\n\n'
-            'pagination is missing\n'
-        )
-        doc = self._render(
-            [_rec(findings=['pagination is missing']),
-             _rec(reviewer='sec', findings=['a second, new one'])],
-            existing=human,
-        )
-        self.assertTrue(
-            doc.startswith(human.rstrip('\n')),
-            "the human's existing bytes were not preserved",
-        )
-        self.assertIn('accepted — fixing in [identities]', doc)
-        self.assertIn('a second, new one', doc)
-
-    def test_a_finding_already_present_is_not_added_again(self) -> None:
-        rec = _rec(findings=['pagination is missing'])
-        first = self._render([rec])
-        again = self._render([rec], existing=first)
-        self.assertIsNone(again, 'a re-publish duplicated an entry')
-
-    def test_an_id_the_human_moved_still_counts_as_present(self) -> None:
-        # Substring match on the id, so reorganising the file — which is
-        # the point of it being editable — never resurrects an entry.
-        rec = _rec(findings=['pagination is missing'])
-        ident = R.finding_id(rec, 1)
-        scrambled = f'notes\n\n## Later\n\nsee `[{ident}]` — handled\n'
-        self.assertIsNone(self._render([rec], existing=scrambled))
-
-    def test_the_same_issue_from_two_reviewers_is_kept_twice(self) -> None:
-        # Duplicates are provenance. Merging them is a judgement
-        # call and it is the human's, not the runner's.
-        doc = self._render([
-            _rec(reviewer='bugs', findings=['pagination is missing']),
-            _rec(reviewer='sec', findings=['pagination is missing']),
-        ])
-        self.assertEqual(doc.count('pagination is missing'), 2)
-
-    def test_a_re_raise_in_a_later_round_is_a_separate_entry(self) -> None:
-        # A finding raised again after a round of work is a different
-        # event, not a duplicate to swallow.
-        doc = self._render([
-            _rec(round_no=1, findings=['still unpaginated']),
-            _rec(round_no=2, findings=['still unpaginated']),
-        ])
-        self.assertIn('r1#1', doc)
-        self.assertIn('r2#1', doc)
-
-    def test_nothing_to_add_writes_nothing(self) -> None:
-        self.assertIsNone(self._render([]))
-        self.assertIsNone(self._render([_rec(findings=[])]))
-
-    def test_the_header_says_the_runner_will_not_clobber_it(self) -> None:
-        # The invitation to edit is the feature; without it a human has
-        # no reason to trust their annotations will survive.
-        doc = self._render([_rec(findings=['x'])])
-        self.assertIn('only ever APPENDS', doc)
-        self.assertIn('TRACKED, not fixed', doc)
-
-
 #: The same pipeline publishing LOCALLY, where there is no tracker to
 #: file into and the committed ledger is still the right answer.
 _COMPETE_REVIEWED_LOCAL = _COMPETE_REVIEWED.replace(
@@ -5647,10 +5473,6 @@ _ROUTED_REPLIES = {
                     '\n\nVERDICT: APPROVED',
     'pick': 'SELECT: impl-a',
 }
-
-
-_AUDIT = 'cargo audit: api.osv.dev was refused by the sandbox'
-_SCAN = 'trivy: its database download from ghcr.io was refused'
 
 
 def _limited(*items: str, verdict: str = 'APPROVED') -> str:
@@ -5687,30 +5509,31 @@ class TestEnvironmentLimitsAreSurfacedOncePerStage(_Base):
         # report the same blocked audit.
         notes, _wt = self._run_env(self._replies(**{
             'review-a-sec': [
-                _limited(_AUDIT, verdict='BLOCKING'), _limited(_AUDIT),
+                _limited(AUDIT_LIMIT, verdict='BLOCKING'),
+                _limited(AUDIT_LIMIT),
             ],
         }))
         review_a = [n for n in notes if 'review-a' in n]
         self.assertEqual(len(review_a), 1, notes)
-        self.assertIn(_AUDIT, review_a[0])
+        self.assertIn(AUDIT_LIMIT, review_a[0])
         self.assertIn('not run', review_a[0])
 
     def test_a_later_round_says_only_what_is_new(self) -> None:
         notes, _wt = self._run_env(self._replies(**{
             'review-a-sec': [
-                _limited(_AUDIT, verdict='BLOCKING'),
-                _limited(_AUDIT, _SCAN),
+                _limited(AUDIT_LIMIT, verdict='BLOCKING'),
+                _limited(AUDIT_LIMIT, SCAN_LIMIT),
             ],
         }))
         review_a = [n for n in notes if 'review-a' in n]
         self.assertEqual(len(review_a), 2, notes)
-        self.assertIn(_SCAN, review_a[1])
-        self.assertNotIn(_AUDIT, review_a[1])
+        self.assertIn(SCAN_LIMIT, review_a[1])
+        self.assertNotIn(AUDIT_LIMIT, review_a[1])
 
     def test_each_stage_says_its_own(self) -> None:
         notes, _wt = self._run_env(self._replies(**{
-            'review-a-sec': _limited(_AUDIT),
-            'review-b-sec': _limited(_AUDIT),
+            'review-a-sec': _limited(AUDIT_LIMIT),
+            'review-b-sec': _limited(AUDIT_LIMIT),
         }))
         self.assertEqual(
             sorted(n.split(':')[0] for n in notes),
@@ -5719,19 +5542,20 @@ class TestEnvironmentLimitsAreSurfacedOncePerStage(_Base):
 
     def test_it_is_never_filed_as_a_finding(self) -> None:
         _notes, wt = self._run_env(self._replies(**{
-            'review-a-sec': _limited(_AUDIT),
+            'review-a-sec': _limited(AUDIT_LIMIT),
         }))
         self.assertEqual(wt.issues, [])
 
     def test_the_pull_request_lists_it_once_per_stage(self) -> None:
         _notes, wt = self._run_env(self._replies(**{
             'review-a-sec': [
-                _limited(_AUDIT, verdict='BLOCKING'), _limited(_AUDIT),
+                _limited(AUDIT_LIMIT, verdict='BLOCKING'),
+                _limited(AUDIT_LIMIT),
             ],
         }))
         body = wt.pr_bodies[-1]
         self.assertIn('## Checks the sandbox could not run', body)
-        self.assertEqual(body.count(_AUDIT), 1, body)
+        self.assertEqual(body.count(AUDIT_LIMIT), 1, body)
         self.assertIn('`review-a`', body)
         self.assertIn('sandbox.sbx.egress_allow', body)
 
@@ -5742,7 +5566,7 @@ class TestEnvironmentLimitsAreSurfacedOncePerStage(_Base):
 
     def test_a_local_run_still_says_it_and_ledgers_nothing(self) -> None:
         notes, wt = self._run_env(
-            {**_LINEAR_REPLIES, 'review-sec': _limited(_AUDIT)},
+            {**_LINEAR_REPLIES, 'review-sec': _limited(AUDIT_LIMIT)},
             source=_LINEAR,
         )
         self.assertEqual(len(notes), 1, notes)
@@ -5756,36 +5580,6 @@ class TestEnvironmentLimitsAreSurfacedOncePerStage(_Base):
         }))
         self.assertIn('audit[2J blocked', notes[0])
         self.assertNotIn('\x1b', notes[0])
-
-
-class TestThePullRequestGroupsEnvironmentLimits(unittest.TestCase):
-    def _rec(self, reviewer, stage='review-a', round_no=1, env=()):
-        return R.ReviewRecord(
-            chunk=None, stage=stage, reviewer=reviewer, round_no=round_no,
-            verdict='APPROVED', environment=tuple(env),
-        )
-
-    def test_one_line_per_check_naming_everyone_who_raised_it(self) -> None:
-        body = R.render_pr_body(summary='s', reviews=[
-            self._rec('sec', env=[_AUDIT]),
-            self._rec('bugs', env=[_AUDIT, _SCAN]),
-            self._rec('sec', round_no=2, env=[_AUDIT]),
-        ])
-        self.assertEqual(body.count(_AUDIT), 1, body)
-        self.assertIn(f'- {_AUDIT} (raised by `sec`, `bugs`)', body)
-        self.assertIn(f'- {_SCAN} (raised by `bugs`)', body)
-
-    def test_stages_are_kept_apart(self) -> None:
-        body = R.render_pr_body(summary='s', reviews=[
-            self._rec('sec', env=[_AUDIT]),
-            self._rec('sec', stage='review-b', env=[_AUDIT]),
-        ])
-        self.assertEqual(body.count(_AUDIT), 2, body)
-        self.assertLess(body.index('`review-a`'), body.index('`review-b`'))
-
-    def test_no_limits_no_section(self) -> None:
-        body = R.render_pr_body(summary='s', reviews=[self._rec('sec')])
-        self.assertNotIn('Checks the sandbox could not run', body)
 
 
 class TestDispositionsDecideWhatIsFiled(_Base):
@@ -6253,15 +6047,15 @@ class TestFindingsAreFiledAsIssues(_Base):
         # Reviewers write markdown; a title opening with a literal ** is
         # noise in a list, and a mid-token cut is worse.
         self.assertEqual(
-            R._issue_title_text(
+            _issue_title_text(
                 '**Terraform state migration is undocumented.** Adding '
                 '`count` to the role moves its state address.'
             ),
             'Terraform state migration is undocumented',
         )
         long = 'word ' * 60
-        self.assertTrue(R._issue_title_text(long).endswith('…'))
-        self.assertNotIn('  ', R._issue_title_text(long))
+        self.assertTrue(_issue_title_text(long).endswith('…'))
+        self.assertNotIn('  ', _issue_title_text(long))
 
     def test_the_pull_request_names_what_was_filed(self) -> None:
         # A tracker nobody is pointed at is barely better than none.
@@ -6723,7 +6517,7 @@ class TestTheVerificationGate(_Base):
         # THIS module's code answers the wrong question.
         pending = self._runner()._pending_findings()
         self.assertEqual(
-            [text for _rec, _i, text in pending],
+            [text for review_record, _i, text in pending],
             ['leaks a handle', 'no tests'],
         )
 
@@ -7181,51 +6975,6 @@ class TestEnvironmentLimitsAreTheirOwnSection(unittest.TestCase):
             'environment': ['keep', 7, None],
         }
         self.assertEqual(self._restored(raw).environment, ('keep',))
-
-
-class TestReviewRecordCarriesTheSections(unittest.TestCase):
-    """
-    The sections survive a resume, and their absence is not a failure.
-
-    State written before the split has no section keys. It must restore
-    as "uncategorized" rather than refusing to load — that is the whole
-    reason RUN_STATE_VERSION does not move for this change, and a run
-    was in flight when it landed.
-    """
-
-    def test_the_sections_round_trip_through_state(self) -> None:
-        rec = R.ReviewRecord(
-            chunk='m1', stage='review-a', reviewer='sec', round_no=1,
-            verdict='APPROVED', findings=('d', 'l', 'p'),
-            defects=('d',), later_increment=('l',), premises=('p',),
-        )
-        back = R.ReviewRecord.from_dict(rec.as_dict())
-        self.assertEqual(back.defects, ('d',))
-        self.assertEqual(back.later_increment, ('l',))
-        self.assertEqual(back.premises, ('p',))
-        self.assertEqual(back.findings, ('d', 'l', 'p'))
-
-    def test_state_without_the_section_keys_still_loads(self) -> None:
-        raw = {
-            'chunk': 'm0b', 'stage': 'review-a', 'reviewer': 'sec',
-            'round_no': 1, 'verdict': 'APPROVED',
-            'findings': ['raised before the split'], 'turns': [],
-        }
-        back = R.ReviewRecord.from_dict(raw)
-        self.assertEqual(back.findings, ('raised before the split',))
-        self.assertEqual(back.defects, ())
-        self.assertEqual(back.later_increment, ())
-        self.assertEqual(back.premises, ())
-
-    def test_a_malformed_section_entry_is_dropped_not_fatal(self) -> None:
-        raw = {
-            'stage': 'review-a', 'reviewer': 'sec', 'round_no': 1,
-            'verdict': 'APPROVED', 'turns': [],
-            'defects': ['keep', 7, None, 'also keep'],
-        }
-        self.assertEqual(
-            R.ReviewRecord.from_dict(raw).defects, ('keep', 'also keep')
-        )
 
 
 class TestTheIncrementBoundsEveryRole(_Base):
@@ -11105,11 +10854,11 @@ class TestLosingImplementationsAreKept(_Base):
 
     def test_a_bundle_outside_the_retained_tree_shows_its_name(self) -> None:
         self.assertEqual(
-            R.retained_bundle_ref('/elsewhere/x/impl-a.bundle'),
+            retained_bundle_ref('/elsewhere/x/impl-a.bundle'),
             'impl-a.bundle',
         )
         self.assertEqual(
-            R.retained_bundle_ref('/home/u/can/_retained/r1/impl-a.bundle'),
+            retained_bundle_ref('/home/u/can/_retained/r1/impl-a.bundle'),
             '_retained/r1/impl-a.bundle',
         )
 
@@ -14387,97 +14136,6 @@ class TestCrossModuleContext(_Base):
         self.assertEqual(runner._decisions, [])
 
 
-_SESSION_TURNS = [
-    ('assistant', '# Draft\n```mermaid\ngraph TD\n  A-->B\n```'),
-    ('user', 'Use ULIDs, not UUIDs.'),
-    ('assistant', '# Revised\n```sql\nCREATE TABLE t (id TEXT);\n```'),
-]
-
-
-class TestRenderPrBody(unittest.TestCase):
-    """A PR a reviewer can trust without reading the diff."""
-
-    def _verified(self, *, demo_ok=True, out='test result: ok. 42 passed'):
-        steps = [R.verify.StepOutcome('tests', 'cargo test', 0, out)]
-        steps.append(
-            R.verify.StepOutcome(
-                'demo', './scripts/demo.sh', 0 if demo_ok else 1,
-                'TLS1.3 X25519MLKEM768; wrote 17 rows',
-            )
-        )
-        return R.verify.VerifyOutcome(
-            ok=demo_ok, exit_code=0 if demo_ok else 1,
-            output=out, steps=tuple(steps),
-        )
-
-    def _body(self, **kw):
-        kw.setdefault('summary', '**[m1]** Storage & schema')
-        kw.setdefault('outcome', self._verified())
-        return R.render_pr_body(**kw)
-
-    def test_the_evidence_is_the_captured_output(self) -> None:
-        # Not "the tests passed" — the transcript of them passing.
-        body = self._body()
-        self.assertIn('test result: ok. 42 passed', body)
-        self.assertIn('TLS1.3 X25519MLKEM768; wrote 17 rows', body)
-        self.assertIn('cargo test', body)
-        self.assertIn('Exit status **0**', body)
-
-    def test_a_demonstration_is_shown_not_folded_away(self) -> None:
-        # It is the thing a reviewer came to SEE; the test log is
-        # corroboration and can be collapsed.
-        body = self._body()
-        demo_at = body.index('Proof it works')
-        tests_at = body.index('How it was proven')
-        self.assertLess(tests_at, demo_at)
-        self.assertIn('<details><summary>Full output</summary>', body)
-        self.assertNotIn('<details>', body[demo_at:])
-
-    def test_it_links_the_design_and_the_reasoning(self) -> None:
-        body = self._body(
-            plan_doc='docs/plans/d-m1.md',
-            session_doc='docs/plans/d-m1-session.md',
-        )
-        self.assertIn('`docs/plans/d-m1.md`', body)
-        self.assertIn('`docs/plans/d-m1-session.md`', body)
-
-    def test_no_gate_configured_still_renders(self) -> None:
-        body = self._body(outcome=None)
-        self.assertIn('[m1]', body)
-        self.assertNotIn('How it was proven', body)
-
-    def test_a_failing_step_is_labelled_as_such(self) -> None:
-        body = self._body(outcome=self._verified(demo_ok=False))
-        self.assertIn('Exit status **1** — FAILED.', body)
-
-    def test_huge_output_is_capped_and_says_so(self) -> None:
-        body = self._body(outcome=self._verified(out='x' * 50_000))
-        self.assertLess(len(body), 40_000)
-        self.assertIn('Truncated: showing the last', body)
-
-    def test_a_fence_in_the_output_cannot_break_the_block(self) -> None:
-        # Test output containing ``` would otherwise close the block
-        # early and spill raw output into the prose.
-        body = self._body(outcome=self._verified(out='before\n```\nafter'))
-        self.assertIn('````', body)
-
-
-class TestShortTitle(unittest.TestCase):
-    def test_it_keeps_the_leading_clause(self) -> None:
-        self.assertEqual(
-            R.short_title('Storage & schema — Postgres DDL + migrations'),
-            'Storage & schema',
-        )
-
-    def test_a_long_single_clause_is_truncated(self) -> None:
-        out = R.short_title('x' * 200)
-        self.assertLessEqual(len(out), 60)
-        self.assertTrue(out.endswith('…'))
-
-    def test_a_short_title_is_untouched(self) -> None:
-        self.assertEqual(R.short_title('AWS provider'), 'AWS provider')
-
-
 class TestPrEvidenceReachesTheRequest(_Base):
     """The gate's output has to survive as far as the PR."""
 
@@ -14531,46 +14189,6 @@ class TestPrEvidenceReachesTheRequest(_Base):
         )
         for title in wt.pr_titles:
             self.assertLess(len(title), 120)
-
-
-class TestRenderPlanningSession(unittest.TestCase):
-    """The design record: the conversation, not just its summary."""
-
-    def _doc(self, turns=None):
-        return R.render_planning_session(
-            _SESSION_TURNS if turns is None else turns,
-            title='Planning session — demo [m1]',
-            plan_doc='docs/plans/demo-m1.md',
-        )
-
-    def test_no_turns_renders_nothing(self) -> None:
-        self.assertEqual(self._doc([]), '')
-
-    def test_artifacts_survive_verbatim(self) -> None:
-        # THE point: the consolidated plan drops what it makes
-        # redundant. Observed live — a draft carried a mermaid diagram
-        # and nine SQL blocks; the revision that replaced it carried
-        # four and no diagram, and that is what would have shipped.
-        doc = self._doc()
-        self.assertIn('```mermaid', doc)
-        self.assertIn('graph TD', doc)
-        self.assertIn('CREATE TABLE t (id TEXT);', doc)
-
-    def test_the_humans_side_is_kept_too(self) -> None:
-        # The answers are half the reasoning and exist nowhere else.
-        self.assertIn('Use ULIDs, not UUIDs.', self._doc())
-
-    def test_turns_are_numbered_and_attributed(self) -> None:
-        doc = self._doc()
-        self.assertIn('## 1. Planner', doc)
-        self.assertIn('## 2. Human', doc)
-        self.assertIn('## 3. Planner', doc)
-
-    def test_it_points_at_the_plan_of_record(self) -> None:
-        self.assertIn('demo-m1.md', self._doc())
-
-    def test_an_unknown_role_is_not_dropped(self) -> None:
-        self.assertIn('note', self._doc([('note', 'from the system')]))
 
 
 class TestPlanningSessionCommitted(_Base):
