@@ -67,6 +67,7 @@ from sbx_omnigent.runner.progress import RunProgress
 from sbx_omnigent.runner.prompts.checks import (
     _CHECK_FINISH,
 )
+from sbx_omnigent.runner.prompts.policy import tests_only_instruction
 from sbx_omnigent.runner.records.findings import (
     blocking_finding_id,
     finding_id,
@@ -1321,11 +1322,10 @@ class TestAWriterDisputeHaltsTheRun(_Base):
         self.assertEqual(result.status, 'completed')
 
     def test_a_disputing_tests_stage_halts_rather_than_re_driving(self):
-        # _enforce_tests_only re-drives a strayed tests stage, and
-        # _require_implementation re-drives an empty one. Neither can
-        # answer "this contract is impossible", so the dispute is read
-        # first -- otherwise the run spends its retries on the wrong
-        # question.
+        # The writer policy re-drives a strayed tests stage, and an
+        # empty one. Neither can answer "this contract is impossible",
+        # so the dispute is read first -- otherwise the run spends its
+        # retries on the wrong question.
         with self.assertRaises(R.PipelineRunError) as caught:
             self._run(
                 _TDD_FULL,
@@ -7482,17 +7482,6 @@ class TestTheTestsStageIsToldWhatFreezingCosts(_Base):
         self.assertIn('do not freeze a claim about the outside world',
                       template)
         self.assertIn('loop-back', template)
-
-    def test_the_tests_only_gate_restates_it(self) -> None:
-        # That gate re-drives the tests stage over production edits,
-        # which is exactly a turn where it is deciding what to assert.
-        cfg = self._cfg(_TDD)
-        runner = R.PipelineRunner(
-            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
-            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
-            swap_age_s=lambda: 0.0,
-        )
-        self.assertIn('FROZEN', runner._tests_only_instruction('- src/x.py'))
 
 
 class TestADisputeNearMissIsReported(_Base):
@@ -14910,8 +14899,7 @@ class TestAWriterIsToldWhereToBuild(_Base):
         self._says_where(r._fix_instruction('- a blocking finding'))
 
     def test_a_tests_only_redrive_is_told(self) -> None:
-        r = self._runner(_TDD_FULL)
-        self._says_where(r._tests_only_instruction('  - src/lib.rs'))
+        self._says_where(tests_only_instruction('  - src/lib.rs'))
 
     def test_a_reviewer_is_not(self) -> None:
         # A reviewer has its own note, building in /tmp/review-target.

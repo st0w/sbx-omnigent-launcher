@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
-import fnmatch
 import functools
 import threading
 import time
@@ -86,6 +85,7 @@ from sbx_omnigent.runner.limits import (
     _WRITER_RETRY_BACKOFF_S,
     _WRITER_TURN_ATTEMPTS,
 )
+from sbx_omnigent.runner.lineage import review_target, seed_from, seed_ref
 from sbx_omnigent.runner.parsing.dispositions import (
     parse_blocking_dispositions,
     parse_dispositions,
@@ -187,6 +187,7 @@ from sbx_omnigent.runner.stage_kinds import (
     writer_is_terminal,
 )
 from sbx_omnigent.runner.triage import FindingTriage
+from sbx_omnigent.runner.writer_policy import WriterPolicy
 from sbx_omnigent.swarm import (
     credential_kind_for,
     mount_sentinel,
@@ -201,84 +202,6 @@ from sbx_omnigent.swarm_session import (
 from sbx_omnigent.worktrees import (
     WorktreeManager,
 )
-
-#: Ways to tell a coverage tool not to count a line. Each ecosystem
-#: spells the same escape hatch differently, and the launcher drives
-#: Python, Rust and JS projects alike.
-#:
-#: These exist for genuinely unreachable code, and a writer short of a
-#: coverage floor can reach for them instead of writing the test. The
-#: gate cannot tell earned coverage from suppressed coverage — the
-#: number moves either way — so the suppression itself is what gets
-#: checked. Live on `ingestion-m2-5`: a candidate sat at 90.87% against
-#: a 95% floor with the suite frozen, added 28 markers, and reported
-#: 95.03%; the excluded lines included rule-version checks, source
-#: discovery, and the first-poll branch of every source. Its sibling
-#: reached 95.07% with none, which is the proof it was avoidable.
-_COVERAGE_SUPPRESSORS = (
-    'pragma: no cover',
-    'pragma: no branch',
-    'istanbul ignore',
-    'tarpaulin_include',
-    'codecov:ignore',
-    'LCOV_EXCL',
-    'coverage: ignore',
-)
-
-
-#: Glob patterns for files that are BUILD OUTPUT, not implementation.
-#: A writer whose whole diff is these did not do the work — observed
-#: live: a coder reported success having changed only ``Cargo.lock``
-#: (its crate roots still held the test writer's "intentionally empty"
-#: placeholders), and TWO reviewers approved the branch anyway. Config
-#: ``generated:`` replaces this set.
-#: What a ``tests_only`` stage may change when the pipeline declares
-#: no ``test_paths`` of its own. Deliberately only TEST code: dependency
-#: manifests are handled by :data:`_GENERATED_GLOBS` and the ordinary
-#: guarded-file review, because a test needing a new dev-dependency must
-#: edit ``Cargo.toml`` and every greenfield module in this project's
-#: history did exactly that.
-_TEST_PATH_GLOBS: tuple[str, ...] = (
-    'tests/**',
-    '**/tests/**',
-    '*_test.*',
-    'test_*.*',
-    '*.test.*',
-    '*_spec.*',
-    'conftest.py',
-)
-
-#: Dependency manifests a ``tests_only`` stage may also change. A test
-#: needing a new dev-dependency MUST declare it — every greenfield
-#: module here did, and replaying the gate over them showed
-#: two (m1, m5) that would have been blocked for doing nothing else at
-#: all. Not folded into :data:`_TEST_PATH_GLOBS` (a manifest is not test
-#: code) nor :data:`_GENERATED_GLOBS` (nor build output).
-#:
-#: The compensating control already exists: manifests are in this
-#: project's ``guarded:`` list, so any edit is named to the reviewers as
-#: a required review item. Allowing them here does not make them
-#: invisible, it just stops them halting the stage.
-_DEPENDENCY_MANIFEST_GLOBS: tuple[str, ...] = (
-    'Cargo.toml',
-    'pyproject.toml',
-    'setup.cfg',
-    'package.json',
-    'go.mod',
-    'Gemfile',
-    'build.gradle',
-    'build.gradle.kts',
-    'pom.xml',
-)
-
-_GENERATED_GLOBS: tuple[str, ...] = (
-    '*.lock',
-    '*.sum',
-    'package-lock.json',
-    'npm-shrinkwrap.json',
-    'pnpm-lock.yaml',
-)
-
 
 #: Filename a node worktree carries an agy turn in (read by the agent,
 #: never pasted). Added to the clone's ``.git/info/exclude`` so it is
@@ -598,6 +521,9 @@ class PipelineRunner:
             max_rounds=max_review_rounds,
         )
         self._ledger = DecisionLedger(self._ctx)
+        self._policy = WriterPolicy(
+            self._ctx, redrive_writer=self._redrive_writer
+        )
         self._triage = FindingTriage(chunk_reviews=self._chunk_reviews)
         self._filing = FindingFiler(
             self._ctx,
@@ -1347,7 +1273,7 @@ class PipelineRunner:
         # records its vote, just without naming the candidate.
         stage = self._stage_by_id.get(stage_id)
         try:
-            target = self._review_target(stage) if stage else None
+            target = review_target(stage, self._nodes) if stage else None
         except PipelineRunError:
             target = None
         sections = FindingSections.of(fallback)
@@ -1435,7 +1361,7 @@ class PipelineRunner:
                     node,
                     # `base_branch:` is optional in a pipeline.yaml, and
                     # a None here would bundle against the literal ref
-                    # 'None'. Same fallback as _seed_ref.
+                    # 'None'. Same fallback as lineage.seed_ref.
                     against=self._config.base_branch or 'main',
                 )
             except Exception as exc:
@@ -2112,7 +2038,7 @@ class PipelineRunner:
             # scan runs; there is nothing to stand up in advance.
             return
         elif kind == 'review':
-            target_wt = self._nodes[self._review_target(stage)].worktree
+            target_wt = self._nodes[review_target(stage, self._nodes)].worktree
             assert target_wt is not None
             for reviewer in stage.run:
                 label = f'{stage.id}-{reviewer}'
@@ -2142,7 +2068,7 @@ class PipelineRunner:
     ) -> None:
         agent = stage.run[0]
         wt = self._wt.create_node_worktree(
-            self._run_id, stage.id, from_node=self._seed_from(stage),
+            self._run_id, stage.id, from_node=seed_from(stage, self._nodes),
             replace=self._resume,
         )
         session = self._create_session(agent, wt, mode, stage.id)
@@ -2227,7 +2153,7 @@ class PipelineRunner:
         # again, and must read the branch as it now is, not the clone
         # its first run left behind.
         wt = self._wt.create_node_worktree(
-            self._run_id, stage.id, from_node=self._seed_from(stage),
+            self._run_id, stage.id, from_node=seed_from(stage, self._nodes),
             replace=True,
         )
         session = self._create_session(agent, wt, 'ro', stage.id)
@@ -2258,7 +2184,7 @@ class PipelineRunner:
     def _run_reader(self, stage: pipeline.PipelineStage) -> None:
         agent = stage.run[0]
         wt = self._wt.create_node_worktree(
-            self._run_id, stage.id, from_node=self._seed_from(stage),
+            self._run_id, stage.id, from_node=seed_from(stage, self._nodes),
             replace=self._resume,
         )
         if is_planner(stage, self._config):
@@ -2888,7 +2814,7 @@ class PipelineRunner:
         assert check.checks is not None
         planner = self._stage_by_id[check.checks]
         wt = self._wt.create_node_worktree(
-            self._run_id, check.id, from_node=self._seed_from(planner),
+            self._run_id, check.id, from_node=seed_from(planner, self._nodes),
             replace=True,
         )
         session = self._create_session(check.run[0], wt, 'ro', check.id)
@@ -3166,7 +3092,7 @@ class PipelineRunner:
         agent = stage.run[0]
         self._require_seed(stage)
         wt = self._wt.create_node_worktree(
-            self._run_id, stage.id, from_node=self._seed_from(stage),
+            self._run_id, stage.id, from_node=seed_from(stage, self._nodes),
             replace=self._resume,
         )
         session = self._create_session(agent, wt, 'rw', stage.id)
@@ -3208,7 +3134,7 @@ class PipelineRunner:
                 or stage.id in self._nodes
             ):
                 continue
-            seed = self._seed_from(stage)
+            seed = seed_from(stage, self._nodes)
             if seed is not None and not self._has_branch(seed):
                 continue
             self._provision_writer(stage)
@@ -3227,7 +3153,7 @@ class PipelineRunner:
             # Pre-warmed during planning: the clone was seeded from the
             # upstream's BASE (the upstream had not committed yet), so
             # reseed onto its now-committed tip before driving.
-            seed = self._seed_from(stage)
+            seed = seed_from(stage, self._nodes)
             if seed is not None:
                 self._wt.reseed_node_worktree(
                     self._run_id, stage.id, seed
@@ -3244,10 +3170,7 @@ class PipelineRunner:
         # and a writer cannot re-drive its way out of a contract it
         # cannot satisfy.
         self._halt_on_writer_dispute(stage)
-        self._enforce_no_coverage_suppression(stage)
-        if stage.tests_only:
-            self._enforce_tests_only(stage)
-        self._require_implementation(stage)
+        self._policy.enforce(stage)
         self._progress.last_branch_node = stage.id
 
     def _drive_writer(
@@ -3330,390 +3253,6 @@ class PipelineRunner:
                 node.session = self._create_session(
                     stage.run[0], node.worktree, 'rw', stage.id
                 )
-
-    def _seed_ref(self, stage: pipeline.PipelineStage) -> str:
-        """The hub ref this writer's branch was cut from."""
-        seed = self._seed_from(stage)
-        if seed is not None:
-            return self._wt.node_branch(self._run_id, seed)
-        return self._config.base_branch or 'main'
-
-    def _is_generated(self, path: str) -> bool:
-        """Whether *path* is build output rather than implementation."""
-        globs = self._config.generated or _GENERATED_GLOBS
-        name = path.rsplit('/', 1)[-1]
-        return any(
-            fnmatch.fnmatch(path, g) or fnmatch.fnmatch(name, g)
-            for g in globs
-        )
-
-    def _is_test_path(self, path: str) -> bool:
-        """Whether *path* is something a tests-only stage may write."""
-        globs = (
-            self._config.test_paths or _TEST_PATH_GLOBS
-        ) + _DEPENDENCY_MANIFEST_GLOBS
-        name = path.rsplit('/', 1)[-1]
-        return any(
-            fnmatch.fnmatch(path, g) or fnmatch.fnmatch(name, g)
-            for g in globs
-        )
-
-    def _non_test_changes(self, stage: pipeline.PipelineStage) -> list[str]:
-        """
-        Production files a tests-only stage changed.
-
-        Diffed against the ref the writer was cut from, so this is what
-        THIS stage did rather than what its base already carried.
-        Generated files (lockfiles) are excused — a test that adds a
-        dev-dependency legitimately moves them.
-
-        :param stage: The tests-only writer stage that just committed.
-        :returns: Sorted repo-relative paths, or ``[]``.
-        """
-        try:
-            changed = self._wt.node_diff_files(
-                self._run_id, stage.id, against=self._seed_ref(stage)
-            )
-        except click.ClickException:
-            # A git hiccup must not fail a stage that may be perfectly
-            # fine; the gate is a check, not a source of flakiness.
-            return []
-        return sorted(
-            f for f in changed
-            if not self._is_test_path(f) and not self._is_generated(f)
-        )
-
-    def _suppressed_coverage(
-        self, stage: pipeline.PipelineStage
-    ) -> list[str]:
-        """
-        Coverage-exclusion markers this writer's branch ADDED.
-
-        :param stage: The writer stage that just committed.
-        :returns: The offending added lines, stripped, in order.
-        """
-        try:
-            added = self._wt.node_added_lines(
-                self._run_id, stage.id, against=self._seed_ref(stage)
-            )
-        except click.ClickException:
-            # A git hiccup must not fail a stage that may be fine; this
-            # is a check, not a source of flakiness.
-            return []
-        return [
-            line.strip()
-            for line in added
-            if any(m in line for m in _COVERAGE_SUPPRESSORS)
-        ]
-
-    def _enforce_no_coverage_suppression(
-        self, stage: pipeline.PipelineStage
-    ) -> None:
-        """
-        Refuse coverage bought with exclusion markers rather than tests.
-
-        A coverage floor asks "is this code exercised". A writer that
-        cannot reach the floor — because the suite is frozen and it may
-        not add tests — can instead mark the uncovered lines uncounted
-        and watch the number rise. The gate goes green over code nobody
-        ran, which is worse than a red gate: it launders untested code
-        as tested.
-
-        Re-driven once rather than halted, on the same reasoning as
-        :meth:`_enforce_tests_only` — the writer can undo this itself,
-        and an unattended run should not stop for something it can fix.
-        A writer that does it twice is not going to stop.
-
-        Genuinely untestable code is a design signal, not a licence for
-        this: an SDK boundary belongs behind an injected seam, which is
-        how a sibling candidate hit the same floor with zero markers.
-
-        :param stage: The writer stage that just committed.
-        :raises PipelineRunError: If the markers survive a re-drive.
-        """
-        found = self._suppressed_coverage(stage)
-        if not found:
-            return
-        listed = '\n'.join(f'  {line}' for line in found[:20])
-        click.echo(
-            f'[coverage] {stage.id}: added {len(found)} coverage-exclusion '
-            f'marker(s); re-driving to earn the coverage instead.'
-        )
-        self._redrive_writer(
-            stage.id,
-            listed,
-            message=f'{stage.id}: remove coverage suppression',
-            instruction=self._coverage_instruction(listed),
-        )
-        found = self._suppressed_coverage(stage)
-        if not found:
-            click.echo(
-                f'[coverage] {stage.id}: suppression removed.'
-            )
-            return
-        raise PipelineRunError(
-            f'{stage.id} added {len(found)} coverage-exclusion marker(s) '
-            f'and kept them after being asked to remove them:\n\n'
-            f'{listed}\n\nA coverage floor reached by marking lines '
-            f'uncounted is not coverage — it ships untested code through '
-            f'a green gate. Either test those paths, or restructure so '
-            f'they are testable (an SDK call belongs behind an injected '
-            f'seam). If some line truly cannot be exercised, that is a '
-            f'contract question for a human, not a marker for a writer '
-            f'to add on its own.'
-        )
-
-    def _coverage_instruction(self, listed: str) -> str:
-        """The re-drive turn for a writer that suppressed coverage."""
-        return (
-            'You added coverage-exclusion markers:\n\n'
-            f'{listed}\n\n'
-            'Remove every one of them. A coverage floor measures whether '
-            'code is exercised; marking a line uncounted moves the number '
-            'without testing anything, and ships untested code behind a '
-            'green gate. Earn the coverage instead: write the test if the '
-            'suite is yours to extend, or restructure so the path is '
-            'reachable — an SDK call behind an injected seam is testable '
-            'with a plain fake. If you believe a line genuinely cannot be '
-            'exercised, do NOT mark it: say so in your reply, label it '
-            'DISPUTED, and stop, because that is a contract question a '
-            'human settles.'
-        )
-
-    def _enforce_tests_only(self, stage: pipeline.PipelineStage) -> None:
-        """
-        Hold a tests-only stage to test code, re-driving if it strays.
-
-        The pipeline's central claim is that two models implement the
-        same frozen contract independently and a judge picks between
-        them. A tests stage that ships the implementation hands BOTH
-        writers one design — the judge then compares two edits of the
-        same code, and the second model's independent take never exists.
-        The comparison still runs; it stops measuring what it claims to.
-
-        Observed live on `gcp-scope-topology-1`: `identities-tests`
-        committed a 114-line `ServiceAccountCache` into
-        `providers/gcp/src/service_accounts.rs`. Its instruction already
-        said "you must NOT implement the feature yourself or modify any
-        production code", and its own test file never referenced the new
-        type — the suite compiled and failed against unmodified source,
-        so nothing forced it. A prompt is a request; this is the check.
-
-        RE-DRIVEN rather than halted on the first violation, because an
-        unattended run should not stop for something the writer can undo
-        itself. Nothing is auto-reverted: the runner rewriting an
-        agent's commit would leave a suite referencing code the runner
-        had just deleted, and the agent is the one that knows which of
-        its own changes to keep.
-
-        :param stage: The tests-only stage that just committed.
-        :raises PipelineRunError: If it strays a second time.
-        """
-        stray = self._non_test_changes(stage)
-        if not stray:
-            return
-        listed = '\n'.join(f'  - {path}' for path in stray)
-        click.echo(
-            f'[tests-only] {stage.id}: changed {len(stray)} production '
-            f'file(s); asking it to remove them and keep the tests.'
-        )
-        self._redrive_writer(
-            stage.id,
-            listed,
-            message=f'{stage.id}: restrict to test code',
-            instruction=self._tests_only_instruction(listed),
-        )
-        stray = self._non_test_changes(stage)
-        if not stray:
-            click.echo(f'[tests-only] {stage.id}: now test code only.')
-            return
-        listed = '\n'.join(f'  - {path}' for path in stray)
-        raise PipelineRunError(
-            f'{stage.id} is a tests-only stage but still changes '
-            f'production code after being asked to stop:\n{listed}\n'
-            f'Nothing was reverted — the branch is intact for you to '
-            f'inspect. Either the tests genuinely need this surface to '
-            f'exist (in which case the plan should say so for this '
-            f'increment), or the stage is implementing the feature.'
-        )
-
-    def _tests_only_instruction(self, listed: str) -> str:
-        """
-        The turn asking a tests stage to give back its production edits.
-
-        :param listed: The offending paths, one bullet per line.
-        :returns: The instruction.
-        """
-        return (
-            'This is a TESTS-ONLY stage, and your commit changed '
-            'production code:\n\n' + listed + '\n\nRemove those '
-            'changes and keep your tests. A separate implementer writes '
-            'the production code to make them pass; two implementers do '
-            'it independently and a judge compares them, so anything you '
-            'implement here is inherited by BOTH and the comparison '
-            'stops meaning anything.\n\nWrite the tests against the '
-            'EXISTING public surface — assert on observable behaviour '
-            '(calls made, values returned, records produced) rather than '
-            'on internals that do not exist yet. That is also the better '
-            'contract: it does not presuppose one implementation.\n\n'
-            'If a test genuinely CANNOT be written without new '
-            'production surface, do not add it. Say so in your reply, '
-            'name exactly what is needed and why, and leave that test '
-            'out. Stopping to ask is correct here; implementing is not.'
-            f'\n\n{_FROZEN_TESTS_CONTRACT}'
-            f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}\n\n{_WRITER_BUILD}'
-        )
-
-    def _is_guarded(self, path: str) -> bool:
-        """Whether *path* is one of the project's declared checks."""
-        name = path.rsplit('/', 1)[-1]
-        return any(
-            fnmatch.fnmatch(path, g) or fnmatch.fnmatch(name, g)
-            for g in self._config.guarded
-        )
-
-    def _guarded_changes(
-        self, stage: pipeline.PipelineStage
-    ) -> list[str]:
-        """
-        Declared checks the branch under review changed.
-
-        Diffed against the ref the writer was cut from, so this is what
-        THIS module did, not what the base branch already carried.
-
-        :param stage: The review stage about to run.
-        :returns: Sorted repo-relative paths, or ``[]``.
-        """
-        if not self._config.guarded:
-            return []
-        target = self._review_target(stage)
-        target_stage = self._stage_by_id.get(target)
-        if target_stage is None:
-            return []
-        try:
-            changed = self._wt.node_diff_files(
-                self._run_id, target, against=self._seed_ref(target_stage)
-            )
-        except click.ClickException:
-            # Never fail a review on a git hiccup; the reviewer still
-            # has the tree and the rest of its instruction.
-            return []
-        return sorted(f for f in changed if self._is_guarded(f))
-
-    def _guarded_block(self, stage: pipeline.PipelineStage) -> str:
-        """
-        Name the checks this branch changed, for the reviewers.
-
-        A blocking finding closed by editing the thing that produced it
-        is the one failure mode that leaves every gate green and no
-        trace. Live, m5 appended three advisory ids to an auditor's
-        ignore list and deleted the block documenting the one
-        pre-existing acceptance; two reviewers then approved the branch
-        without mentioning either. Naming the files does not forbid the
-        edit — a module whose job IS adding CI must edit CI — it only
-        makes passing over one silently impossible.
-
-        :param stage: The review stage about to run.
-        :returns: The block, or ``''`` when nothing guarded changed.
-        """
-        hits = self._guarded_changes(stage)
-        if not hits:
-            return ''
-        listed = '\n'.join(f'  - {path}' for path in hits)
-        return (
-            '\n\nThis branch CHANGED files this project declares to be '
-            'CHECKS — the configuration of a gate, linter, auditor or CI '
-            'workflow, or a suppression list one of them reads:\n\n'
-            + listed
-            + '\n\nEach is a required review item, not background noise. '
-            'Diff it and state, explicitly, whether it is a genuine fix '
-            'or a way to stop a check reporting. Closing a finding by '
-            'adding an ignore or allow-list entry, relaxing a threshold, '
-            'disabling a step, or deleting a documented rationale is not '
-            'a fix: it removes the thing that would have caught the next '
-            'regression, and the correct verdict is BLOCKING. If the '
-            'change is legitimate, say so and say why. Approving one of '
-            'these without mentioning it in your reply is itself a '
-            'review failure.'
-        )
-
-    def _require_implementation(
-        self, stage: pipeline.PipelineStage
-    ) -> None:
-        """
-        Refuse to pass on a writer that did not actually implement.
-
-        Every gate in this pipeline downstream of a writer is an agent's
-        WORD — a reviewer's ``VERDICT:``, a coder's "tests pass". None
-        of them executes anything. So a writer that does nothing and
-        reports success sails through: observed live, an implementer
-        left both crate roots holding the test author's "intentionally
-        empty" placeholder, changed only ``Cargo.lock``, and collected
-        ``VERDICT: APPROVED`` from two independent reviewers. Only the
-        judge caught it, by diffing.
-
-        This is the one check the ORCHESTRATOR can make honestly,
-        because it needs no execution: compare the branch to the tree it
-        was cut from and require at least one changed file that is not
-        build output. Pure git inspection in the trusted plane — running
-        the suite instead would mean executing agent-authored code on
-        the host, with the publish token in the environment.
-
-        A no-op is re-driven with the specific evidence, up to the
-        review round cap, then fails the stage rather than handing an
-        empty branch to reviewers who will rubber-stamp it.
-
-        :param stage: The writer stage just committed.
-        :raises PipelineRunError: If it never implements anything.
-        """
-        if not stage.write:
-            return
-        against = self._seed_ref(stage)
-        for _round in range(self._max_rounds):
-            try:
-                changed = self._wt.node_diff_files(
-                    self._run_id, stage.id, against=against
-                )
-            except click.ClickException:
-                return  # cannot tell; never fail a run on a git hiccup
-            if [f for f in changed if not self._is_generated(f)]:
-                return
-            click.echo(
-                f'[verify] {stage.id}: no implementation — changed '
-                f'{len(changed)} file(s), all build output. Re-driving.'
-            )
-            self._redrive_writer(
-                stage.id,
-                self._noop_findings(changed),
-                message=f'{stage.id}: implement (retry)',
-            )
-        raise PipelineRunError(
-            f'{stage.id} produced no implementation: after '
-            f'{self._max_rounds} attempt(s) its branch still differs '
-            f'from {against!r} only in generated files. It reported '
-            f'success without writing production code — do not trust a '
-            f'downstream review of this branch.'
-        )
-
-    def _noop_findings(self, changed: list[str]) -> str:
-        """Evidence handed back to a writer that implemented nothing."""
-        if changed:
-            what = (
-                'the only files you changed were generated build output:\n'
-                + '\n'.join(f'  - {f}' for f in changed[:20])
-            )
-        else:
-            what = 'you changed NO files at all.'
-        return (
-            'Your turn did not implement anything. Comparing your branch '
-            f'against the tree you started from, {what}\n\n'
-            'The failing test suite already in your worktree is the '
-            'binding contract: write the production code that makes it '
-            'pass. Do not report success, and do not stop, until you '
-            'have written real source changes. If something blocks you '
-            '(a missing toolchain, an unclear contract), say so '
-            'explicitly instead of finishing quietly.'
-        )
 
     def _finish_writer(
         self, stage_id: str, session: str, out: str
@@ -4044,7 +3583,7 @@ class PipelineRunner:
         )
 
     def _run_review(self, stage: pipeline.PipelineStage) -> None:
-        target = self._review_target(stage)
+        target = review_target(stage, self._nodes)
         # The budget is charged to the STAGE, not to this call: a
         # gate failure re-enters here, and held in a local the count
         # started over while the recorded number kept climbing.
@@ -4859,7 +4398,7 @@ class PipelineRunner:
         """
         Refuse to cut a writer that has lost the branch it inherits.
 
-        ``_seed_from`` returns ``None`` for two different situations:
+        ``seed_from`` returns ``None`` for two different situations:
         this writer legitimately starts from the base branch, and the
         writer it inherits from is missing. They are indistinguishable
         to the caller, and the second silently substitutes
@@ -4875,7 +4414,7 @@ class PipelineRunner:
         :raises PipelineRunError: When a needed writer/judge branch
             cannot be resolved.
         """
-        if self._seed_from(stage) is not None:
+        if seed_from(stage, self._nodes) is not None:
             return
         missing = self._branch_producing_needs(stage)
         if not missing:
@@ -4913,7 +4452,7 @@ class PipelineRunner:
             cand_stage = self._stage_by_id.get(cand)
             if cand_stage is None:
                 continue
-            seed = self._seed_from(cand_stage)
+            seed = seed_from(cand_stage, self._nodes)
             if seed is None or seed not in self._nodes:
                 continue
             if self._wt.branch_contains(
@@ -4927,26 +4466,6 @@ class PipelineRunner:
                 f'Judging it would compare two different contracts '
                 f'and record the result as a choice.'
             )
-
-    def _seed_from(self, stage: pipeline.PipelineStage) -> str | None:
-        """The upstream WRITER branch a node's worktree is cut from."""
-        if stage.from_branch:
-            return stage.from_branch
-        for need in stage.needs:
-            node = self._nodes.get(need)
-            if node and node.branch:
-                return need
-        return None
-
-    def _review_target(self, stage: pipeline.PipelineStage) -> str:
-        """The writer node a review stage inspects (first in needs)."""
-        for need in stage.needs:
-            node = self._nodes.get(need)
-            if node and node.branch:
-                return need
-        raise PipelineRunError(
-            f'review {stage.id!r} has no writer in needs'
-        )
 
     def _judge_candidates(
         self, stage: pipeline.PipelineStage
@@ -5638,7 +5157,7 @@ class PipelineRunner:
         target = self._stage_by_id[stage.checks]
         try:
             changed = self._wt.node_diff_files(
-                self._run_id, target.id, against=self._seed_ref(target)
+                self._run_id, target.id, against=seed_ref(self._ctx, target)
             )
         except click.ClickException:
             changed = []
@@ -5960,7 +5479,7 @@ class PipelineRunner:
         return bool(agent and agent.template == 'refactoring')
 
     def _has_upstream_tests(self, stage: pipeline.PipelineStage) -> bool:
-        seed = self._seed_from(stage)
+        seed = seed_from(stage, self._nodes)
         if seed is None:
             return False
         seed_stage = self._stage_by_id.get(seed)
@@ -5995,7 +5514,7 @@ class PipelineRunner:
             + self._ledger.rulings_block(self._progress.subtasks)
             + _FINDINGS_ASK
             + _ENVIRONMENT_ASK
-            + self._guarded_block(stage)
+            + self._policy.guarded_block(stage)
             + _REVIEW_DISPUTE
             + _REVIEW_VERDICT_LINE
         )
@@ -6011,7 +5530,7 @@ class PipelineRunner:
         # that cannot be resolved yet degrades to the implementation
         # instruction rather than killing the turn.
         try:
-            target = self._review_target(stage)
+            target = review_target(stage, self._nodes)
         except PipelineRunError:
             return False
         target_stage = self._stage_by_id.get(target)
@@ -6055,7 +5574,7 @@ class PipelineRunner:
         :param stage: The review stage about to run.
         :returns: The full instruction for a refactor reviewer.
         """
-        target = self._review_target(stage)
+        target = review_target(stage, self._nodes)
         changed = self._changed_files(target)
         listed = (
             '\n\nThe files this refactor touched:\n'
@@ -6101,7 +5620,7 @@ class PipelineRunner:
             + self._ledger.rulings_block(self._progress.subtasks)
             + _FINDINGS_ASK
             + _ENVIRONMENT_ASK
-            + self._guarded_block(stage)
+            + self._policy.guarded_block(stage)
             + _REVIEW_DISPUTE
             + _REVIEW_VERDICT_LINE
         )
@@ -6110,9 +5629,9 @@ class PipelineRunner:
         """
         The files a node changed against the branch it was cut from.
 
-        Computed on the HOST, like :meth:`_guarded_changes`, so a
-        reviewer is handed the scope rather than asked to derive it
-        from refs its own clone may not carry.
+        Computed on the HOST, like :meth:`WriterPolicy.guarded_block`,
+        so a reviewer is handed the scope rather than asked to derive
+        it from refs its own clone may not carry.
 
         :param target: The writer node whose diff is wanted.
         :returns: Sorted repo-relative paths, or ``[]`` if undecidable.
@@ -6123,7 +5642,8 @@ class PipelineRunner:
         try:
             return sorted(
                 self._wt.node_diff_files(
-                    self._run_id, target, against=self._seed_ref(target_stage)
+                    self._run_id, target,
+                    against=seed_ref(self._ctx, target_stage),
                 )
             )
         except click.ClickException:
