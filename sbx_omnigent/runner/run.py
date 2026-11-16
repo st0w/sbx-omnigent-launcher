@@ -60,6 +60,7 @@ from sbx_omnigent import (
 )
 from sbx_omnigent.launch_args import launch_args_for
 from sbx_omnigent.runner import state
+from sbx_omnigent.runner.campaign import Campaign, CampaignHooks
 from sbx_omnigent.runner.context import RunContext
 from sbx_omnigent.runner.errors import (
     LostTurn,
@@ -526,9 +527,10 @@ class PipelineRunner:
         self._sessions: list[str] = []
         #: Sessions already freed at stage completion (a finished
         #: reader or judge). Held as a SET rather than removed from
-        #: :attr:`_sessions`, because :meth:`_dispose_chunk_sessions`
-        #: slices that list by index — dropping an element from the
-        #: middle would shift the marks and free the wrong sessions.
+        #: :attr:`_sessions`, because the campaign frees a module's
+        #: sessions by slicing that list by index — dropping an
+        #: element from the middle would shift the marks and free the
+        #: wrong sessions.
         self._released: set[str] = set()
         #: node id -> its transcript, captured just before the session
         #: was freed. Disposing DELETES a session, so a reader whose
@@ -541,8 +543,9 @@ class PipelineRunner:
         #: Sessions whose delete FAILED. Kept so they stay in the run
         #: state and get another chance — at teardown, and again on the
         #: next --resume. Held apart from :attr:`_sessions` so the
-        #: mark-based slicing in :meth:`_dispose_chunk_sessions` keeps
-        #: its index semantics.
+        #: campaign's mark-based slicing (see
+        #: :meth:`Campaign._release_sessions`) keeps its index
+        #: semantics.
         self._undisposed: list[str] = []
         #: agy sessions get the native-TUI first-turn hardening (settle
         #: + resubmit); tracked so only each session's FIRST turn pays.
@@ -627,6 +630,24 @@ class PipelineRunner:
             save_state=self._save_state,
         )
         self._publisher.preflight()
+        self._campaign = Campaign(
+            self._ctx,
+            progress=self._progress,
+            publisher=self._publisher,
+            filing=self._filing,
+            keep=keep,
+            hooks=CampaignHooks(
+                run_stage=self._exec_top_level,
+                gate=self._verify_winner,
+                save_state=self._save_state,
+                dispose_prewarmed=self._dispose_prewarmed,
+                session_count=lambda: len(self._sessions),
+                dispose_sessions_since=(
+                    lambda mark: self._dispose_sessions(self._sessions[mark:])
+                ),
+                sample_disk=self._sample_disk,
+            ),
+        )
         self._gate = VerifyGate(
             self._ctx,
             egress=gate_egress,
@@ -675,15 +696,15 @@ class PipelineRunner:
                     # build) loops once per module — each module planned
                     # in-loop against the frozen prior modules.
                     self._progress.subtasks = list(self._config.subtasks)
-                    self._run_campaign(
+                    self._campaign.run(
                         list(self._config.stages), per_module=True
                     )
                 else:
                     # The planner runs ONCE (+ proposes the chunk list).
                     for stage in planner:
                         self._exec_top_level(stage)
-                    if self._is_campaign(build):
-                        self._run_campaign(build, per_module=False)
+                    if self._campaign.applies(build):
+                        self._campaign.run(build, per_module=False)
                     else:
                         for stage in build:
                             self._exec_top_level(stage)
@@ -705,116 +726,6 @@ class PipelineRunner:
             blocked_stage=blocked,
             nodes=dict(self._nodes),
         )
-
-    def _is_campaign(self, build_stages: list[pipeline.PipelineStage]) -> bool:
-        """
-        Whether to run the build cycle once per proposed chunk.
-
-        Engages only when the planner proposed ≥2 chunks and there are
-        build stages to loop; 0/1 chunks run the single pass unchanged
-        (so existing single-increment pipelines are untouched).
-        """
-        return len(self._progress.subtasks) >= 2 and bool(build_stages)
-
-    def _run_campaign(
-        self,
-        loop_stages: list[pipeline.PipelineStage],
-        *,
-        per_module: bool,
-    ) -> None:
-        """
-        Run *loop_stages* once per chunk, threaded and published.
-
-        Each chunk runs an id-namespaced copy of *loop_stages*
-        (``<chunk>-<node>``) so their branches never collide. The chunks
-        thread through one accumulating hub branch ``campaign``: chunk
-        0's entry node seeds from base, each later chunk's entry node
-        seeds ``from`` the campaign tip (the prior chunk's winner), and
-        after every chunk the winner is aliased onto ``campaign``. Each
-        chunk publishes separately. A chunk that blocks stops the
-        campaign there (earlier chunks stay published).
-
-        Two modes share this loop:
-
-        * flat campaign (``per_module=False``): a single up-front
-          planner proposed the chunk list; *loop_stages* are the
-          non-planner build stages, and refs to that shared planner
-          stay un-namespaced.
-        * per-module (``per_module=True``): the human supplied the
-          module list; *loop_stages* are the FULL pipeline including
-          its planner, so every ref is namespaced and each module runs
-          its own planner (in-loop, against the frozen prior modules).
-
-        :param loop_stages: The top-level stages to run per chunk.
-        :param per_module: Whether the planner is inside the loop.
-        """
-        # The pre-warmed (un-namespaced) writers are replaced by
-        # per-chunk ones — free their VMs so they don't idle here.
-        self._dispose_prewarmed()
-        # In per-module mode the planner is looped, so its refs must be
-        # namespaced too (each module has its own); in flat mode the
-        # shared up-front planner's refs stay un-prefixed.
-        planner_ids = (
-            set()
-            if per_module
-            else {
-                s.id for s in self._config.stages
-                if is_planner(s, self._config)
-            }
-        )
-        writer_ids = {
-            s.id for s in pipeline._iter_stages(loop_stages) if s.write
-        }
-        for index, sub in enumerate(self._progress.subtasks):
-            if sub.id in self._progress.completed_chunks:
-                click.echo(
-                    f'[resume] skipping chunk [{sub.id}] (already '
-                    f'published)'
-                )
-                continue
-            self._progress.start_module(sub, first=index == 0)
-            self._filing.start_module()
-            mark = len(self._sessions)
-            staged = self._namespace_stages(
-                sub.id, loop_stages, planner_ids, writer_ids,
-                seed_campaign=index > 0,
-            )
-            # Register the namespaced stages so a review loop-back can
-            # look its writer up by the namespaced id.
-            for st in pipeline._iter_stages(staged):
-                if st.run or st.parallel:
-                    self._stage_by_id[st.id] = st
-            for st in staged:
-                self._exec_top_level(st)
-            winner = self._resolve_campaign_winner(sub.id)
-            # Gate BEFORE the thread advances: a chunk that cannot pass
-            # verification must not become the base every later module
-            # is built on.
-            self._verify_winner(winner, staged)
-            self._publish_chunk(sub, winner, first=index == 0)
-            # Advance the campaign thread to this chunk's winner so the
-            # next chunk builds on it. AFTER the publish, which commits
-            # the chunk's plan, decisions and reviews onto the winner:
-            # the next planner is told they are in its worktree under
-            # docs/plans/, and before this they were only there if the
-            # chunk's PR had already been merged into the base.
-            self._wt.alias_node_branch(self._run_id, 'campaign', winner)
-            self._progress.completed_chunks.add(sub.id)
-            # Persist the completion NOW, not at the next stage's end.
-            # The next stage is the following module's PLANNER, which
-            # blocks on the human — so deferring this leaves a window
-            # (potentially an hour of approval time) where the on-disk
-            # state says a published chunk never finished. A resume in
-            # that window rebuilds the whole module and publishes a
-            # DUPLICATE PR for work that already shipped.
-            self._save_state()
-            # Published: this chunk's VMs AND clones are dead weight.
-            self._dispose_chunk_sessions(mark)
-            # The module's PEAK: every tree this chunk built is still
-            # on disk, one line before the reclaim takes them.
-            self._sample_disk('chunk-peak')
-            self._dispose_chunk_worktrees(staged, winner)
-            self._progress.end_module()
 
     def _load_state(self) -> None:
         """
@@ -1139,7 +1050,7 @@ class PipelineRunner:
         Tear down exactly the microVMs named, wherever they sit.
 
         The identity-based counterpart to
-        :meth:`_dispose_chunk_sessions`. Two review stages running at
+        :meth:`Campaign._release_sessions`. Two review stages running at
         the same time cannot both free their guests by an index mark:
         each takes its mark as ``len(self._sessions)``, so the stage
         that finishes second slices from ITS mark and deletes the
@@ -1198,163 +1109,6 @@ class PipelineRunner:
                 f'and --resume can try again.'
             )
         self._save_state()
-
-    def _dispose_chunk_sessions(self, mark: int) -> None:
-        """
-        Tear down the VMs a finished chunk created.
-
-        A published chunk's VMs are dead weight: its work is committed
-        to a branch and pushed, and the next chunk seeds from the hub,
-        never from a node's clone. Holding them cost a VM per node per
-        chunk for the WHOLE run — a 6-module full cadre peaked at ~72
-        live microVMs and exhausted the host's disk, which surfaces as
-        guest filesystems remounting read-only rather than as any
-        legible error. ``--keep`` still keeps everything.
-
-        :param mark: ``len(self._sessions)`` when the chunk started;
-            everything appended since belongs to it.
-        """
-        if self._keep:
-            return
-        self._dispose_sessions(self._sessions[mark:])
-
-    def _dispose_chunk_worktrees(
-        self, staged: list[pipeline.PipelineStage], winner: str
-    ) -> None:
-        """
-        Reclaim a published chunk's node clones.
-
-        Its work is committed to hub branches and pushed, the next chunk
-        seeds from the hub rather than from any clone, and a resume
-        skips a completed chunk wholesale — so the clones are dead
-        weight the moment it publishes. Keeping them makes disk cost
-        CUMULATIVE across a campaign: 2.2-26 GB per writer node for a
-        compiled language, which ran a host out of space two modules
-        into a six-module run. Reclaiming here makes the cost
-        per-module instead.
-
-        Called only AFTER the chunk's completion is persisted, so a
-        crash in between leaves a resume that skips the chunk anyway.
-        Branches are never touched; ``--keep`` keeps everything.
-
-        :param staged: The chunk's namespaced stages.
-        :param winner: The node whose branch published (its
-            verification clone, if any, is named after it).
-        """
-        if self._keep:
-            return
-        node_ids = [
-            st.id
-            for st in pipeline._iter_stages(staged)
-            if st.run or st.parallel
-        ]
-        # The gate cuts its own throwaway clone; sweep it up too.
-        node_ids.append(f'{winner}-verify')
-        try:
-            freed = self._wt.dispose_node_worktrees(self._run_id, node_ids)
-        except click.ClickException:
-            return  # reclaiming disk must never fail a healthy run
-        if freed:
-            click.echo(
-                f'[cleanup] reclaimed {freed} worktree(s) from the '
-                f'published chunk (their branches are on the hub).'
-            )
-
-    def _namespace_stages(
-        self,
-        chunk_id: str,
-        stages: list[pipeline.PipelineStage],
-        planner_ids: set[str],
-        writer_ids: set[str],
-        *,
-        seed_campaign: bool,
-    ) -> list[pipeline.PipelineStage]:
-        """Return *stages* with ids + refs namespaced for the chunk."""
-        out: list[pipeline.PipelineStage] = []
-        for stage in stages:
-            if stage.parallel:
-                subs = tuple(
-                    self._namespace_one(
-                        chunk_id, sub, planner_ids, writer_ids,
-                        seed_campaign=seed_campaign,
-                    )
-                    for sub in stage.parallel
-                )
-                out.append(
-                    replace(stage, id=f'{chunk_id}-{stage.id}', parallel=subs)
-                )
-            else:
-                out.append(
-                    self._namespace_one(
-                        chunk_id, stage, planner_ids, writer_ids,
-                        seed_campaign=seed_campaign,
-                    )
-                )
-        return out
-
-    def _namespace_one(
-        self,
-        chunk_id: str,
-        stage: pipeline.PipelineStage,
-        planner_ids: set[str],
-        writer_ids: set[str],
-        *,
-        seed_campaign: bool,
-    ) -> pipeline.PipelineStage:
-        """Namespace one stage's id + references (planner refs stay)."""
-        def ns(ref: str) -> str:
-            return ref if ref in planner_ids else f'{chunk_id}-{ref}'
-
-        new_from = ns(stage.from_branch) if stage.from_branch else None
-        # A chunk-entry node that cuts its own worktree (a reader like
-        # the per-module planner, or the entry writer) with no in-chunk
-        # writer upstream and no explicit from seeds from the campaign
-        # tip on chunks after the first — so it designs/builds against
-        # the frozen prior chunks. Reviews/judges don't cut from a seed,
-        # so leaving their from unset is a no-op for them.
-        if (
-            seed_campaign
-            and stage_kind(stage) in ('reader', 'writer')
-            and stage.from_branch is None
-            and not any(n in writer_ids for n in stage.needs)
-        ):
-            new_from = 'campaign'
-        return replace(
-            stage,
-            id=f'{chunk_id}-{stage.id}',
-            needs=tuple(ns(n) for n in stage.needs),
-            from_branch=new_from,
-            on_block=ns(stage.on_block) if stage.on_block else None,
-            checks=ns(stage.checks) if stage.checks else None,
-            scans=ns(stage.scans) if stage.scans else None,
-        )
-
-    def _resolve_campaign_winner(self, chunk_id: str) -> str:
-        """The node id whose branch this chunk publishes/threads."""
-        want = self._config.publish.branch
-        node_id = (
-            f'{chunk_id}-{want}' if want else self._progress.last_branch_node
-        )
-        node = self._nodes.get(node_id) if node_id else None
-        if node is None:
-            raise PipelineRunError(
-                f'chunk {chunk_id!r} produced no branch to publish'
-            )
-        return node.selected if node.kind == 'judge' else node_id
-
-    def _publish_chunk(
-        self, sub: pipeline.Subtask, winner: str, *, first: bool
-    ) -> None:
-        """Publish one module's winner; see :class:`Publisher`."""
-        plan, plan_path = self._chunk_plan_of_record(sub, first=first)
-        self._publisher.publish_module(
-            sub, winner,
-            first=first,
-            plan=plan,
-            plan_path=plan_path,
-            prior=self._progress.prior_module(),
-            subtasks=self._progress.subtasks,
-        )
 
     def _next_review_round(self, stage_id: str) -> int:
         """
@@ -1823,25 +1577,6 @@ class PipelineRunner:
         """This chunk's judge picks (all of them outside a campaign)."""
         chunk = self._progress.module_id
         return [p for p in self._picks if p.chunk == chunk]
-
-    def _chunk_plan_of_record(
-        self, sub: pipeline.Subtask, *, first: bool
-    ) -> tuple[str | None, str]:
-        """
-        The plan text + repo path to commit for a chunk, if any.
-
-        Per-module mode commits each module's OWN planner design to a
-        per-module path (``…-<module>.md``), so modules don't clobber
-        one another's plan doc as the campaign thread accumulates. Flat
-        mode commits the single shared plan of record once, on chunk 0's
-        branch (later chunks inherit it through the thread).
-        """
-        if self._config.subtasks:
-            node = self._nodes.get(f'{sub.id}-plan')
-            plan = node.output if node else None
-            return plan, chunk_plan_path(self._config, sub)
-        plan = self._progress.plan_of_record if first else None
-        return plan, chunk_plan_path(self._config, sub)
 
     def _chunk_preamble(self) -> str:
         """A directive scoping a builder turn to the active chunk."""
@@ -2582,10 +2317,10 @@ class PipelineRunner:
                 # Per-module: this planner's design reaches THIS
                 # module's builders via _reader_context (needs the
                 # planner node) and is committed per-module in
-                # _publish_chunk — it never overwrites the human module
-                # list nor the plan of record. What it CAN contribute
-                # beyond its own module is the decisions it settled that
-                # bind later ones.
+                # Campaign._publish — it never overwrites the human
+                # module list nor the plan of record. What it CAN
+                # contribute beyond its own module is the decisions it
+                # settled that bind later ones.
                 self._ledger.record_decisions(
                     self._progress.module_id,
                     node.output,

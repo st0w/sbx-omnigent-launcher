@@ -21,9 +21,10 @@ def max_concurrent_vms(
     One VM per node, and one per reviewer agent in a review stage.
     Campaign runs loop this same set per chunk and dispose each chunk's
     VMs as it publishes (see
-    :meth:`PipelineRunner._dispose_chunk_sessions`), so a pass is also
-    the campaign's peak — unless ``--keep`` suppresses that reclaim,
-    which :func:`preflight_disk` accounts for.
+    :meth:`~sbx_omnigent.runner.campaign.Campaign._release_sessions`),
+    so a pass is also the campaign's peak — unless ``--keep``
+    suppresses that reclaim, which :func:`preflight_disk` accounts
+    for.
 
 Only WRITERS now sum. Everything else is freed before the peak:
 

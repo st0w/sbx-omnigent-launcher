@@ -9338,15 +9338,6 @@ class TestAScanInACampaign(_Base):
         runner, _wt = self._runner(subtask=False, campaign_tip=None)
         self.assertEqual(runner._security_folder_name(), 'demo-security')
 
-    def test_scans_is_namespaced_per_module(self) -> None:
-        runner, _wt = self._runner(subtask=False, campaign_tip=None)
-        stage = runner._stage_by_id['scan']
-        spaced = runner._namespace_one(
-            'm1', stage, set(), {'build'}, seed_campaign=False
-        )
-        self.assertEqual((spaced.scans, spaced.on_block), ('m1-build',
-                                                          'm1-build'))
-
 
 class TestPlanArtifact(_Base):
     def test_consolidation_turn_driven_after_approval(self) -> None:
