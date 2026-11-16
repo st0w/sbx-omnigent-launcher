@@ -37,6 +37,7 @@ from sbx_omnigent.runner.limits import (
     _VM_DISK_BYTES,
     _WORKTREE_DISK_BYTES,
 )
+from sbx_omnigent.runner.parsing.decisions import parse_decisions_doc
 from sbx_omnigent.runner.parsing.dispositions import (
     DISPOSITION_ABSENT,
     DISPOSITION_FILED,
@@ -5717,7 +5718,7 @@ class TestTheLedgerSurvivesARun(_Base):
     """
     Decisions recorded by an earlier RUN reach this run's planner.
 
-    `_decisions` is filled from run state, which is per-run. A campaign
+    The ledger is filled from run state, which is per-run. A campaign
     that builds one module per run — the shape this project actually
     uses — therefore started every planner with an empty ledger, while
     the committed document sat in the worktree unread. Every decision
@@ -5735,32 +5736,12 @@ class TestTheLedgerSurvivesARun(_Base):
         runner._active_subtask = cfg.subtasks[-1]
         return runner
 
-    def test_a_committed_ledger_reaches_the_next_run_s_planner(
-        self,
-    ) -> None:
-        wt = FakeWT()
-        earlier = self._runner(wt)
-        earlier._active_subtask = earlier._subtasks[0]
-        earlier._decisions = [('m0', 'tuples are upserted, never inserted')]
-        committed = earlier._decisions_doc()
-
-        wt.branch_files[earlier._decisions_ledger_path()] = committed
-        later = self._runner(wt)
-        later._seed_decisions_from_ledger('/w/plan')
-
-        self.assertEqual(
-            later._decisions, [('m0', 'tuples are upserted, never inserted')]
-        )
-        self.assertIn(
-            'tuples are upserted, never inserted', later._decisions_block()
-        )
-
     def test_the_planner_stage_actually_seeds_from_the_ledger(
         self,
     ) -> None:
         """The wiring, not just the method.
 
-        Every other test here calls `_seed_decisions_from_ledger`
+        The ledger's own tests call ``DecisionLedger.seed_from``
         directly, which proves it works and NOT that anything invokes
         it — the bug being fixed was precisely that nothing did. This
         drives a real campaign and reads what the planner was sent.
@@ -5781,62 +5762,11 @@ class TestTheLedgerSurvivesARun(_Base):
 
         # The FIRST module planned in this run, specifically. Seeding
         # one stage too late still reaches the second module — by then
-        # `_decisions` is populated — so asserting on any planner at all
+        # the ledger is populated — so asserting on any planner at all
         # would pass with the ordering wrong.
         self.assertIn(
             'SEEDED-DECISION-MARKER', sc.message_for_label('m0-plan')
         )
-
-    def test_the_ledger_round_trips_through_the_document(self) -> None:
-        # The document IS the channel, so writing and reading it back
-        # has to be lossless — otherwise a decision degrades a little
-        # on every module that passes it along.
-        wt = FakeWT()
-        source = self._runner(wt)
-        source._decisions = [
-            ('m0', 'first decision'),
-            ('m0', 'second decision — with an em dash and `code`'),
-            ('m1', 'third decision'),
-        ]
-
-        parsed = R.parse_decisions_doc(source._decisions_doc())
-
-        self.assertEqual(parsed, source._decisions)
-
-    def test_a_referral_is_not_read_back_as_a_decision(self) -> None:
-        # Referrals are recorded as explicitly NOT binding. Reading one
-        # back as a decision would promote a reviewer's passing note
-        # into a constraint no later module may alter.
-        wt = FakeWT()
-        source = self._runner(wt)
-        source._decisions = [('m0', 'a real decision')]
-        source._referrals = [('m0', 'a reviewer note about [m1]')]
-
-        parsed = R.parse_decisions_doc(source._decisions_doc())
-
-        self.assertEqual(parsed, [('m0', 'a real decision')])
-
-    def test_seeding_twice_does_not_double_a_decision(self) -> None:
-        # A resumed run already holds them in state.
-        wt = FakeWT()
-        source = self._runner(wt)
-        source._decisions = [('m0', 'only once')]
-        wt.branch_files[source._decisions_ledger_path()] = (
-            source._decisions_doc()
-        )
-
-        source._seed_decisions_from_ledger('/w/plan')
-
-        self.assertEqual(source._decisions, [('m0', 'only once')])
-
-    def test_no_ledger_yet_seeds_nothing_and_is_not_an_error(self) -> None:
-        # The first module of a campaign, which is the normal case.
-        wt = FakeWT()
-        runner = self._runner(wt)
-
-        runner._seed_decisions_from_ledger('/w/plan')
-
-        self.assertEqual(runner._decisions, [])
 
     def test_a_human_annotation_is_not_swallowed_into_a_decision(
         self,
@@ -5854,7 +5784,7 @@ class TestTheLedgerSurvivesARun(_Base):
         )
 
         self.assertEqual(
-            R.parse_decisions_doc(doc), [('m0', 'the real decision')]
+            parse_decisions_doc(doc), [('m0', 'the real decision')]
         )
 
 
@@ -5917,6 +5847,11 @@ class TestLaterIncrementIsRoutedNotFiled(_Base):
         runner._active_subtask = cfg.subtasks[0]
         return runner
 
+    def _route(self, runner) -> None:
+        runner._ledger.record_referrals(
+            runner._active_subtask.id, runner._chunk_reviews(),
+        )
+
     def _voted(self, reviewer: str, *routed: str):
         return R.ReviewRecord(
             chunk='m0', stage='review', reviewer=reviewer, round_no=1,
@@ -5933,10 +5868,9 @@ class TestLaterIncrementIsRoutedNotFiled(_Base):
             self._voted('sec', 'pagination belongs to [m1]'),
             self._voted('bugs', 'pagination belongs to [m1]'),
         ]
-        runner._record_referrals()
-        self.assertEqual(
-            runner._decisions_doc().count('pagination belongs to [m1]'), 1
-        )
+        self._route(runner)
+        doc = runner._ledger.document(runner._subtasks)
+        self.assertEqual(doc.count('pagination belongs to [m1]'), 1)
 
     def test_the_ledger_says_a_routed_item_does_not_bind(self) -> None:
         # A decision is binding and changing one is a halt-and-escalate.
@@ -5945,8 +5879,8 @@ class TestLaterIncrementIsRoutedNotFiled(_Base):
         # been free to reject.
         runner = self._campaign_runner()
         runner._reviews = [self._voted('sec', 'pagination belongs to [m1]')]
-        runner._record_referrals()
-        doc = runner._decisions_doc()
+        self._route(runner)
+        doc = runner._ledger.document(runner._subtasks)
         self.assertIn('NOT binding', doc)
         self.assertIn('Raised by review', doc)
         self.assertIn('pagination belongs to [m1]', doc)
@@ -5957,10 +5891,12 @@ class TestLaterIncrementIsRoutedNotFiled(_Base):
         # Both reach the next planner in one block, so the block itself
         # has to say which of the two it is reading.
         runner = self._campaign_runner()
-        runner._decisions = [('m0', 'tuples are upserted, never inserted')]
+        runner._ledger.decisions = [
+            ('m0', 'tuples are upserted, never inserted'),
+        ]
         runner._reviews = [self._voted('sec', 'pagination belongs to [m1]')]
-        runner._record_referrals()
-        block = runner._decisions_block()
+        self._route(runner)
+        block = runner._ledger.planner_block(runner._subtasks)
         self.assertIn('tuples are upserted, never inserted', block)
         self.assertIn('pagination belongs to [m1]', block)
         self.assertIn('NOT decisions', block)
@@ -7057,7 +6993,7 @@ class TestSettledDecisionsReachTheReviewers(_Base):
     Observed live on `ingestion-m3-1`. The [m3c] planner recorded
     "One frozen assertion was amended under explicit human
     authorization (2026-09-04)" into the decisions ledger, exactly as
-    it was asked to. `_decisions_block` fed that ledger to the next
+    it was asked to. The planner block fed that ledger to the next
     PLANNER and to nobody else, so both bug reviewers found the
     amended assertion, had no way to know it was authorized, and
     raised DISPUTED. That is the correct move on the evidence they
@@ -7080,7 +7016,7 @@ class TestSettledDecisionsReachTheReviewers(_Base):
             swap_age_s=lambda: 0.0,
         )
         if decisions:
-            runner._decisions = [('m3c', self._RULING)]
+            runner._ledger.decisions = [('m3c', self._RULING)]
         return runner
 
     def test_the_reviewer_is_told_what_the_human_already_settled(
@@ -7126,7 +7062,7 @@ class TestSettledDecisionsReachTheReviewers(_Base):
         # a legitimate outcome". Presenting one beside real rulings
         # would let a reviewer treat an open question as closed.
         r = self._runner()
-        r._referrals = [('m3c', 'a reviewer wondered about pagination')]
+        r._ledger.referrals = [('m3c', 'a reviewer wondered about pagination')]
         msg = r._review_instruction(r._stage_by_id['review-a'])
         self.assertNotIn('wondered about pagination', msg)
 
@@ -14036,7 +13972,7 @@ class TestCrossModuleContext(_Base):
 
     def test_decisions_survive_a_crash(self) -> None:
         runner, _wt, _sc = self._runner()
-        runner._decisions = [('m0', 'ULIDs'), ('m1', 'diff in the DB')]
+        runner._ledger.decisions = [('m0', 'ULIDs'), ('m1', 'diff in the DB')]
         payload = runner._state_payload()
         self.assertEqual(
             payload['decisions'],
@@ -14048,7 +13984,7 @@ class TestCrossModuleContext(_Base):
         resumed, wt2, _sc2 = self._runner(resume=True)
         wt2.state_to_load = payload
         resumed._load_state()
-        self.assertEqual(resumed._decisions, runner._decisions)
+        self.assertEqual(resumed._ledger.decisions, runner._ledger.decisions)
 
     def test_a_state_without_decisions_resumes_clean(self) -> None:
         # State written by an older build carries no ledger.
@@ -14057,7 +13993,7 @@ class TestCrossModuleContext(_Base):
         payload.pop('decisions')
         wt.state_to_load = payload
         runner._load_state()
-        self.assertEqual(runner._decisions, [])
+        self.assertEqual(runner._ledger.decisions, [])
 
 
 class TestPrEvidenceReachesTheRequest(_Base):

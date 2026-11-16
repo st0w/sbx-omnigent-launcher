@@ -70,6 +70,7 @@ from sbx_omnigent.runner.errors import (
     _Blocked,
 )
 from sbx_omnigent.runner.gate import VerifyGate
+from sbx_omnigent.runner.ledger import DecisionLedger
 from sbx_omnigent.runner.limits import (
     _DEFAULT_MAX_ROUNDS,
     _FIRST_TURN_MAX_RESUBMITS,
@@ -84,10 +85,6 @@ from sbx_omnigent.runner.limits import (
     _VERDICT_POLL_INTERVAL_S,
     _WRITER_RETRY_BACKOFF_S,
     _WRITER_TURN_ATTEMPTS,
-)
-from sbx_omnigent.runner.parsing.decisions import (
-    parse_decisions,
-    parse_decisions_doc,
 )
 from sbx_omnigent.runner.parsing.dispositions import (
     Disposition,
@@ -121,6 +118,7 @@ from sbx_omnigent.runner.parsing.verdicts import (
     parse_verdict,
     work_finished,
 )
+from sbx_omnigent.runner.paths import plan_artifact_path
 from sbx_omnigent.runner.prompts.checks import (
     _APPROVED_AS_IS,
     _CHECK_COMPLETE,
@@ -139,7 +137,6 @@ from sbx_omnigent.runner.prompts.review import (
     _REVIEW_MOUNT,
     _REVIEW_NOT_THE_GATE,
     _REVIEW_NOT_WEIGHTED,
-    _REVIEW_SETTLED,
     _REVIEW_VERDICT_LINE,
     _REVIEW_VERIFY,
     _VERDICT_NUDGE,
@@ -618,19 +615,6 @@ class PipelineRunner:
         #: Whether the active chunk is the FIRST one — nothing has been
         #: built yet, so a turn must not be told to build on prior work.
         self._active_is_first = False
-        #: ``(module_id, decision)`` recorded by each module's approved
-        #: plan as binding on the modules that follow. Threaded into
-        #: every later planner's turn and committed as a ledger, since a
-        #: decision made in one module's session reaches no other.
-        self._decisions: list[tuple[str, str]] = []
-        #: Review observations addressed to a LATER module, as
-        #: ``(raising module, text)``. Kept apart from ``_decisions``
-        #: on purpose: a decision is BINDING and changing one is a
-        #: halt-and-escalate, while this is one reviewer's non-blocking
-        #: note. Merging them would promote a passing remark into a
-        #: constraint nobody may alter, which is worse than the tracker
-        #: they came from.
-        self._referrals: list[tuple[str, str]] = []
         #: A verifier's conclusion per finding, by positional id. Absent
         #: means "no conclusion", which files the finding — the gate's
         #: fail-open rule lives in that absence rather than in a flag.
@@ -672,6 +656,7 @@ class PipelineRunner:
             lock=self._lock,
             max_rounds=max_review_rounds,
         )
+        self._ledger = DecisionLedger(self._ctx)
         self._gate = VerifyGate(
             self._ctx,
             egress=gate_egress,
@@ -906,8 +891,8 @@ class PipelineRunner:
         self._chunk_publishes = restored.chunk_publishes
         self._reviewed_ok = restored.reviewed_ok
         self._stale_sessions = restored.sessions
-        self._decisions = restored.decisions
-        self._referrals = restored.referrals
+        self._ledger.decisions = restored.decisions
+        self._ledger.referrals = restored.referrals
         self._dispositions = restored.dispositions
         self._blocking_claims = restored.blocking_claims
         self._harness_versions = restored.harness_versions
@@ -997,8 +982,8 @@ class PipelineRunner:
                     for s in dict.fromkeys(self._sessions + self._undisposed)
                     if s not in self._released
                 ],
-                decisions=self._decisions,
-                referrals=self._referrals,
+                decisions=self._ledger.decisions,
+                referrals=self._ledger.referrals,
                 dispositions=self._dispositions,
                 blocking_claims=self._blocking_claims,
                 harness_versions=self._harness_versions,
@@ -1425,8 +1410,11 @@ class PipelineRunner:
                 message='docs: add plan of record',
                 author='planner <planner@pipeline.local>',
             )
-        self._record_referrals()
-        self._commit_decisions_ledger(winner)
+        self._ledger.record_referrals(
+            self._active_subtask.id if self._active_subtask else None,
+            self._chunk_reviews(),
+        )
+        self._ledger.commit(winner, self._subtasks)
         # Flat mode has ONE planner for the whole campaign, so its
         # session record is the same conversation every time, committed
         # once and carried to later chunks by the campaign thread.
@@ -2678,200 +2666,9 @@ class PipelineRunner:
             run's own plan path.
         """
         if sub is not None and self._config.subtasks:
-            p = PurePosixPath(self._plan_artifact_path())
+            p = PurePosixPath(plan_artifact_path(self._config))
             return str(p.with_name(f'{p.stem}-{sub.id}{p.suffix}'))
-        return self._plan_artifact_path()
-
-    def _record_decisions(self, plan: str | None) -> None:
-        """
-        Record what this module settled that binds the later ones.
-
-        :param plan: The module's approved plan of record.
-        """
-        sub = self._active_subtask
-        if sub is None:
-            return
-        seen = {text for _module, text in self._decisions}
-        fresh = [d for d in parse_decisions(plan) if d not in seen]
-        if not fresh:
-            return
-        self._decisions.extend((sub.id, d) for d in fresh)
-        click.echo(
-            f'[plan] [{sub.id}] recorded {len(fresh)} decision(s) '
-            f'binding on later modules.'
-        )
-
-    def _seed_decisions_from_ledger(self, worktree: str) -> None:
-        """
-        Load decisions this campaign recorded in an EARLIER run.
-
-        `_decisions` is otherwise filled only from run state, which is
-        per-run — so a project that builds one module per run started
-        every planner with an empty ledger and carried nothing forward,
-        while the committed document sat in the worktree unread. The
-        repo is the thing that survives a run; this is what reads it
-        back.
-
-        Deduplicated on text against what is already held, so a resumed
-        run that has the decisions in its state does not double them.
-        Best-effort: an unreadable or heading-less ledger seeds nothing
-        and the run proceeds exactly as it did before, because a missing
-        ledger is the normal first-module case.
-
-        :param worktree: The planner node's clone, cut from the repo and
-            therefore carrying whatever the last module published.
-        """
-        if not self._config.subtasks:
-            return
-        try:
-            text = self._wt.read_tracked_file(
-                worktree, self._decisions_ledger_path()
-            )
-        except click.ClickException:
-            return
-        seen = {held for _module, held in self._decisions}
-        fresh: list[tuple[str, str]] = []
-        for module, item in parse_decisions_doc(text):
-            if item in seen:
-                continue
-            seen.add(item)
-            fresh.append((module, item))
-        if not fresh:
-            return
-        self._decisions.extend(fresh)
-        modules = sorted({module for module, _ in fresh})
-        click.echo(
-            f'[plan] carried {len(fresh)} decision(s) forward from '
-            f'{", ".join(f"[{m}]" for m in modules)} — recorded by an '
-            f'earlier run and read back from '
-            f'{self._decisions_ledger_path()}.'
-        )
-
-    def _record_referrals(self) -> None:
-        """
-        Record what this chunk's reviewers addressed to a later module.
-
-        Deduplicated on text, like :meth:`_record_decisions`: both
-        reviewers noticing the same thing, and a reviewer re-raising it
-        each round, are the normal case, and the later planner needs the
-        observation once rather than six times. That is a different
-        judgement from :func:`finding_id`'s, which keeps duplicates
-        BECAUSE a re-raise after a round of work is its own event — here
-        the audience is a planner reading a ledger, not a human auditing
-        a review.
-        """
-        sub = self._active_subtask
-        if sub is None:
-            return
-        seen = {text for _module, text in self._referrals}
-        fresh: list[str] = []
-        for rec in self._chunk_reviews():
-            for text in rec.later_increment:
-                if text not in seen:
-                    seen.add(text)
-                    fresh.append(text)
-        if not fresh:
-            return
-        self._referrals.extend((sub.id, text) for text in fresh)
-        click.echo(
-            f'[findings] [{sub.id}] routed {len(fresh)} observation(s) '
-            f'to the decisions ledger for a later module.'
-        )
-
-    def _referrals_by_module(self) -> list[tuple[str, list[str]]]:
-        """The recorded referrals grouped by module, in module order."""
-        grouped: dict[str, list[str]] = {}
-        for module_id, text in self._referrals:
-            grouped.setdefault(module_id, []).append(text)
-        return list(grouped.items())
-
-    def _decisions_by_module(self) -> list[tuple[str, list[str]]]:
-        """The recorded decisions grouped by module, in module order."""
-        grouped: dict[str, list[str]] = {}
-        for module_id, text in self._decisions:
-            grouped.setdefault(module_id, []).append(text)
-        return list(grouped.items())
-
-    def _decisions_block(self) -> str:
-        """The decisions ledger, as a block for a planner turn."""
-        titles = {s.id: s.title for s in self._subtasks}
-        parts = []
-        for module_id, items in self._decisions_by_module():
-            head = f'[{module_id}] {titles.get(module_id, "")}'.strip()
-            body = '\n'.join(f'  - {text}' for text in items)
-            parts.append(f'{head}\n{body}')
-        referrals = self._referrals_by_module()
-        if referrals:
-            parts.append(
-                'Raised by REVIEW for a later module. These are '
-                'observations, NOT decisions: nothing here binds you, '
-                'and you may judge any of them wrong. Say what you '
-                'decided about the ones in your scope.'
-            )
-            for module_id, items in referrals:
-                head = f'raised in [{module_id}]'
-                body = '\n'.join(f'  - {text}' for text in items)
-                parts.append(f'{head}\n{body}')
-        return '\n'.join(parts)
-
-    def _rulings_block(self) -> str:
-        """
-        The settled decisions, framed for a reviewer turn.
-
-        :meth:`_decisions_block` serves the PLANNER, which is also
-        shown REFERRALS — open observations it may accept or reject.
-        A reviewer must not see those: a referral is explicitly not
-        binding, and one printed beside real rulings reads as a
-        closed question. Decisions only, therefore.
-
-        :returns: The block, or ``''`` when nothing has been settled.
-            An empty heading would assert that nothing was, which is
-            a claim; silence is not.
-        """
-        titles = {s.id: s.title for s in self._subtasks}
-        parts = []
-        for module_id, items in self._decisions_by_module():
-            head = f'[{module_id}] {titles.get(module_id, "")}'.strip()
-            body = '\n'.join(f'  - {text}' for text in items)
-            parts.append(f'{head}\n{body}')
-        if not parts:
-            return ''
-        return _REVIEW_SETTLED + '\n'.join(parts)
-
-    def _decisions_doc(self) -> str:
-        """The decisions ledger as the committed Markdown document."""
-        titles = {s.id: s.title for s in self._subtasks}
-        lines = [
-            f'# Decisions carried forward — {self._config.name}',
-            '',
-            "Recorded by each module's approved plan as BINDING on the "
-            'modules that follow. A later module designs against these; '
-            'a genuine need to change one is a halt-and-escalate to the '
-            'human, never a silent edit.',
-        ]
-        for module_id, items in self._decisions_by_module():
-            title = titles.get(module_id, '')
-            lines += ['', f'## [{module_id}] {title}'.rstrip(), '']
-            lines += [f'- {text}' for text in items]
-        referrals = self._referrals_by_module()
-        if referrals:
-            lines += [
-                '',
-                '# Raised by review, for a later module',
-                '',
-                'A reviewer noticed these and said they belong to a '
-                'module that had not been planned yet, so they are '
-                'routed here rather than filed as issues addressed to '
-                'nobody. They are NOT binding, unlike everything above: '
-                'the module that owns one decides what to do about it, '
-                'and deciding it is wrong is a legitimate outcome.',
-            ]
-            for module_id, items in referrals:
-                title = titles.get(module_id, '')
-                head = f'## Raised in [{module_id}] {title}'.rstrip()
-                lines += ['', head, '']
-                lines += [f'- {text}' for text in items]
-        return '\n'.join(lines) + '\n'
+        return plan_artifact_path(self._config)
 
     def _findings_ledger_path(self) -> str:
         """
@@ -2885,7 +2682,7 @@ class PipelineRunner:
 
         :returns: e.g. ``docs/plans/discover-findings.md``.
         """
-        p = PurePosixPath(self._plan_artifact_path())
+        p = PurePosixPath(plan_artifact_path(self._config))
         return str(p.with_name(f'{p.stem}-findings{p.suffix}'))
 
     def _publish_findings(
@@ -3349,46 +3146,6 @@ class PipelineRunner:
             f'to {path} — tracked for triage, nothing was changed.'
         )
         return path
-
-    def _decisions_ledger_path(self) -> str:
-        """
-        The decisions ledger's repo path — ONE per pipeline.
-
-        :returns: e.g. ``docs/plans/ingestion-decisions.md``.
-        """
-        artifact = PurePosixPath(self._plan_artifact_path())
-        return str(
-            artifact.with_name(
-                f'{artifact.stem}-decisions{artifact.suffix}'
-            )
-        )
-
-    def _commit_decisions_ledger(self, winner: str) -> None:
-        """
-        Commit the accumulated decisions onto a published module.
-
-        The ledger rides the campaign thread, so every later module's
-        worktree carries every decision recorded before it — and the
-        human reviewing the PRs gets one document instead of having to
-        reconstruct the reasoning from N separate plans.
-
-        :param winner: The node whose branch this module publishes.
-        """
-        if not (
-            self._config.subtasks
-            and (self._decisions or self._referrals)
-        ):
-            return
-        self._wt.write_tracked_file(
-            self._wt.node_worktree_path(self._run_id, winner),
-            self._decisions_ledger_path(),
-            self._decisions_doc(),
-        )
-        self._wt.commit_node(
-            self._run_id, winner,
-            message='docs: record decisions binding later modules',
-            author='planner <planner@pipeline.local>',
-        )
 
     def _chunk_preamble(self) -> str:
         """A directive scoping a builder turn to the active chunk."""
@@ -4285,9 +4042,9 @@ class PipelineRunner:
         )
         if self._is_planner(stage):
             # BEFORE the instruction is built: the ledger block is
-            # assembled from `_decisions`, so seeding after would hand
+            # assembled from the ledger, so seeding after would hand
             # this planner an empty one.
-            self._seed_decisions_from_ledger(wt)
+            self._ledger.seed_from(wt)
         session = self._create_session(agent, wt, 'ro', stage.id)
         out = self._drive(session, self._reader_instruction(stage))
         node = NodeResult(
@@ -4343,7 +4100,10 @@ class PipelineRunner:
                 # list nor the plan of record. What it CAN contribute
                 # beyond its own module is the decisions it settled that
                 # bind later ones.
-                self._record_decisions(node.output)
+                self._ledger.record_decisions(
+                    self._active_subtask.id if self._active_subtask else None,
+                    node.output,
+                )
 
     def _run_scan(self, stage: pipeline.PipelineStage) -> None:
         """
@@ -7760,7 +7520,7 @@ class PipelineRunner:
             # Per-module planner: design THIS module against the frozen
             # prior modules already in the worktree. The task text is
             # the shared brief (context); the module row is the scope.
-            ledger = self._decisions_block()
+            ledger = self._ledger.planner_block(self._subtasks)
             instr = (
                 'Produce a DESIGN PLAN (prose only — do NOT write code, '
                 'files, or commands; your role prompt has the full '
@@ -8018,7 +7778,7 @@ class PipelineRunner:
             + _REVIEW_NOT_THE_GATE
             + _REVIEW_NOT_WEIGHTED.format(later=later)
             + self._scope_block()
-            + self._rulings_block()
+            + self._ledger.rulings_block(self._subtasks)
             + _FINDINGS_ASK
             + _ENVIRONMENT_ASK
             + self._guarded_block(stage)
@@ -8124,7 +7884,7 @@ class PipelineRunner:
             + _REVIEW_VERIFY
             + _REVIEW_NOT_THE_GATE
             + _REVIEW_NOT_WEIGHTED.format(later='')
-            + self._rulings_block()
+            + self._ledger.rulings_block(self._subtasks)
             + _FINDINGS_ASK
             + _ENVIRONMENT_ASK
             + self._guarded_block(stage)
@@ -8394,13 +8154,6 @@ class PipelineRunner:
             return want
         return self._last_branch_node
 
-    def _plan_artifact_path(self) -> str:
-        """Repo path the plan of record is committed to on publish."""
-        return (
-            self._config.plan_artifact
-            or f'docs/plans/{self._config.name}.md'
-        )
-
     def _publish(self) -> str | None:
         if self._config.publish.mode == 'none':
             return None
@@ -8421,7 +8174,7 @@ class PipelineRunner:
         if self._plan_of_record:
             self._wt.write_tracked_file(
                 self._wt.node_worktree_path(self._run_id, branch_node),
-                self._plan_artifact_path(),
+                plan_artifact_path(self._config),
                 self._plan_of_record,
             )
             self._wt.commit_node(
@@ -8431,22 +8184,22 @@ class PipelineRunner:
                 author='planner <planner@pipeline.local>',
             )
             self._commit_planning_session(
-                branch_node, self._plan_artifact_path()
+                branch_node, plan_artifact_path(self._config)
             )
         # NOT gated on a plan existing: a pipeline with no planner still
         # has reviewers, and their reports are just as much the record.
         review_doc = self._commit_review_records(
-            branch_node, self._plan_artifact_path()
+            branch_node, plan_artifact_path(self._config)
         )
         self._commit_security_reports(
-            branch_node, self._plan_artifact_path()
+            branch_node, plan_artifact_path(self._config)
         )
         self._publish_findings(branch_node, review_doc)
         security_doc = self._commit_security_summary(
-            branch_node, self._plan_artifact_path()
+            branch_node, plan_artifact_path(self._config)
         )
         pick_doc = self._commit_judge_record(
-            branch_node, self._plan_artifact_path()
+            branch_node, plan_artifact_path(self._config)
         )
         result = self._wt.publish_node(
             self._run_id,
@@ -8455,7 +8208,7 @@ class PipelineRunner:
             title=f'[pipeline] {self._config.name}',
             body=self._pr_body(
                 branch_node,
-                self._plan_artifact_path(),
+                plan_artifact_path(self._config),
                 summary=f'Pipeline `{self._config.name}`',
                 task=self._config.task,
                 review_doc=review_doc,
