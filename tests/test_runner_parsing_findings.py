@@ -11,6 +11,7 @@ from sbx_omnigent.runner.parsing.findings import (
     FindingSections,
     parse_findings,
 )
+from sbx_omnigent.runner.records.reviews import ReviewRecord
 
 
 class TestFindingSections(unittest.TestCase):
@@ -143,6 +144,97 @@ class TestParseFindings(unittest.TestCase):
 
     def test_an_empty_block_yields_nothing(self) -> None:
         self.assertEqual(parse_findings('FINDINGS:\n\nVERDICT: OK'), ())
+
+
+class TestEnvironmentLimitsAreTheirOwnSection(unittest.TestCase):
+    """
+    A check the SANDBOX stopped is not a finding against the code (#41).
+
+    An advisory audit that could not reach its database was filed as
+    a finding by every reviewer, every round: 15 of 174 filed findings
+    in one module were that one sentence. It is lifted into its own
+    section and kept out of the union, so nothing files it.
+    """
+
+    _TEXT = (
+        'Ran the suite: 212 passed.\n\n'
+        'DEFECTS:\n- the retry budget is undocumented\n\n'
+        'ENVIRONMENT-LIMITS:\n'
+        '- cargo audit: api.osv.dev was refused by the sandbox\n\n'
+        'VERDICT: APPROVED'
+    )
+
+    def test_the_block_is_lifted_into_its_own_section(self) -> None:
+        self.assertEqual(
+            FindingSections.of(self._TEXT).environment,
+            ('cargo audit: api.osv.dev was refused by the sandbox',),
+        )
+
+    def test_it_is_not_part_of_the_findings_union(self) -> None:
+        # The union is what is filed, ledgered and verified.
+        self.assertEqual(
+            FindingSections.of(self._TEXT).all,
+            ('the retry budget is undocumented',),
+        )
+
+    def test_the_header_may_be_decorated_like_every_other_marker(
+        self,
+    ) -> None:
+        for header in ('ENVIRONMENT-LIMITS:', '## Environment limits',
+                       '**ENVIRONMENT_LIMITS:**', 'environment-limits'):
+            with self.subTest(header=header):
+                self.assertEqual(
+                    FindingSections.of(f'{header}\n- x').environment,
+                    ('x',),
+                )
+
+    def test_a_plain_environment_heading_is_not_the_block(self) -> None:
+        # Reviewers describe their setup under "## Environment". That
+        # is what they DID run, and must never read as what they could
+        # not.
+        for header in ('## Environment', 'ENVIRONMENT:', 'Environment'):
+            with self.subTest(header=header):
+                self.assertEqual(
+                    FindingSections.of(
+                        f'{header}\n- rustc 1.80 installed'
+                    ).environment,
+                    (),
+                )
+
+    def test_absent_is_empty(self) -> None:
+        for text in ('', None, 'VERDICT: APPROVED'):
+            with self.subTest(text=text):
+                self.assertEqual(FindingSections.of(text).environment, ())
+
+    def _restored(self, raw: dict) -> ReviewRecord:
+        rec = ReviewRecord.from_dict(raw)
+        if rec is None:
+            self.fail(f'the record did not restore: {raw!r}')
+        return rec
+
+    def test_the_section_round_trips_through_state(self) -> None:
+        rec = ReviewRecord(
+            chunk='m1', stage='review-a', reviewer='sec', round_no=1,
+            verdict='APPROVED', environment=('audit blocked',),
+        )
+        self.assertEqual(
+            self._restored(rec.as_dict()).environment, ('audit blocked',)
+        )
+
+    def test_state_written_before_it_still_loads(self) -> None:
+        raw = {
+            'stage': 'review-a', 'reviewer': 'sec', 'round_no': 1,
+            'verdict': 'APPROVED', 'turns': [],
+        }
+        self.assertEqual(self._restored(raw).environment, ())
+
+    def test_a_malformed_entry_is_dropped_not_fatal(self) -> None:
+        raw = {
+            'stage': 'review-a', 'reviewer': 'sec', 'round_no': 1,
+            'verdict': 'APPROVED', 'turns': [],
+            'environment': ['keep', 7, None],
+        }
+        self.assertEqual(self._restored(raw).environment, ('keep',))
 
 
 if __name__ == '__main__':
