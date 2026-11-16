@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+
+#: A git object id, the only thing let into a link in a PR description.
+_COMMIT_RE = re.compile(r'[0-9a-f]{7,64}')
 
 
 @dataclass(frozen=True)

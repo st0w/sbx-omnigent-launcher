@@ -36,7 +36,6 @@ import concurrent.futures
 import contextlib
 import fnmatch
 import functools
-import re
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -63,6 +62,7 @@ from sbx_omnigent import (
 )
 from sbx_omnigent.defaults import DEFAULT_EGRESS_ALLOW, DEFAULT_HOST_IMAGE
 from sbx_omnigent.launch_args import launch_args_for
+from sbx_omnigent.runner import state
 from sbx_omnigent.runner.errors import (
     LostTurn,
     PipelineRunError,
@@ -83,7 +83,6 @@ from sbx_omnigent.runner.limits import (
     _VERDICT_POLL_INTERVAL_S,
     _WRITER_RETRY_BACKOFF_S,
     _WRITER_TURN_ATTEMPTS,
-    RUN_STATE_VERSION,
 )
 from sbx_omnigent.runner.parsing.decisions import (
     parse_decisions,
@@ -168,6 +167,7 @@ from sbx_omnigent.runner.records.judging import (
     JudgePick,
 )
 from sbx_omnigent.runner.records.results import (
+    _COMMIT_RE,
     ChunkSpan,
     NodeResult,
     RunResult,
@@ -347,69 +347,6 @@ def _recorded_version(entry: dict[str, object], cli: str) -> str | None:
         return None
     version = versions.get(cli)
     return version if isinstance(version, str) else None
-
-
-#: A git object id, the only thing let into a link in a PR description.
-_COMMIT_RE = re.compile(r'[0-9a-f]{7,64}')
-
-
-def _restore_chunk_publishes(raw: object) -> dict[str, dict[str, str]]:
-    """
-    Rebuild each published chunk's record from run state.
-
-    :param raw: The ``chunk_publishes`` value from the state file.
-    :returns: ``{chunk: {'seed': commit, 'pr': url}}``. An entry that is
-        not a mapping is dropped; a malformed field becomes ``''`` so
-        the next chunk's PR simply goes without its link.
-    """
-    if not isinstance(raw, dict):
-        return {}
-    restored: dict[str, dict[str, str]] = {}
-    for chunk, entry in raw.items():
-        if not isinstance(chunk, str) or not isinstance(entry, dict):
-            continue
-        seed = entry.get('seed')
-        pr = entry.get('pr')
-        restored[chunk] = {
-            'seed': seed
-            if isinstance(seed, str) and _COMMIT_RE.fullmatch(seed)
-            else '',
-            'pr': pr if isinstance(pr, str) else '',
-        }
-    return restored
-
-
-def _restore_harness_versions(raw: object) -> dict[str, dict[str, object]]:
-    """
-    Rebuild the recorded harness versions from run state.
-
-    Anything malformed is dropped rather than trusted: a bad entry would
-    otherwise be compared against, and reported as a version change
-    that never happened.
-
-    :param raw: The ``harness_versions`` value from the state file.
-    :returns: ``{label: {'runs': cli, 'versions': {cli: version}}}``.
-    """
-    if not isinstance(raw, dict):
-        return {}
-    restored: dict[str, dict[str, object]] = {}
-    for label, entry in raw.items():
-        if not isinstance(label, str) or not isinstance(entry, dict):
-            continue
-        runs = entry.get('runs')
-        versions = entry.get('versions')
-        if runs not in harness_versions.CLIS or not isinstance(
-            versions, dict
-        ):
-            continue
-        kept = {
-            cli: version
-            for cli, version in versions.items()
-            if cli in harness_versions.CLIS and isinstance(version, str)
-        }
-        if kept:
-            restored[label] = {'runs': runs, 'versions': kept}
-    return restored
 
 
 def resolve_agent_ids(
@@ -969,131 +906,35 @@ class PipelineRunner:
         """
         Restore a previous attempt's bookkeeping.
 
-        Only stages recorded as COMPLETE are restored. An incomplete
-        node is deliberately left out of ``_nodes``: it must look like
-        it never ran, so it is re-cut and re-driven rather than treated
-        as an upstream that downstream stages can inherit from.
+        What is restored, and what is refused, is
+        :func:`sbx_omnigent.runner.state.decode`'s to decide. The active
+        module is not restored: the campaign loop sets it again as it
+        reaches each module.
 
         :raises PipelineRunError: If there is no state to resume, or it
-            was written by an incompatible version — better to refuse
-            than to resume from something misread.
+            was written by an incompatible version.
         """
-        state = self._wt.read_run_state(self._run_id)
-        if state is None:
-            raise PipelineRunError(
-                f'cannot resume run {self._run_id!r}: no usable state '
-                f'file. Runs started before state was recorded, or whose '
-                f'run directory was removed, cannot be resumed — start a '
-                f'fresh run id instead.'
-            )
-        version = state.get('version')
-        if version != RUN_STATE_VERSION:
-            raise PipelineRunError(
-                f'cannot resume run {self._run_id!r}: its state is '
-                f'version {version!r}, this build writes '
-                f'{RUN_STATE_VERSION}.'
-            )
-        self._completed = set(state.get('completed') or [])
-        self._completed_chunks = set(state.get('completed_chunks') or [])
-        # Absent before chunk PRs linked their own changes. Empty means
-        # the next PR goes without the link, so RUN_STATE_VERSION stays.
-        self._chunk_publishes = _restore_chunk_publishes(
-            state.get('chunk_publishes')
+        restored = state.decode(
+            self._wt.read_run_state(self._run_id), self._run_id
         )
-        # Absent from a state written before this key existed, which
-        # restores the old (empty) behaviour rather than failing — so
-        # RUN_STATE_VERSION does NOT move and an in-flight run stays
-        # resumable.
-        self._reviewed_ok = {
-            c for c in state.get('reviewed_ok') or [] if isinstance(c, str)
-        }
-        self._stale_sessions = [
-            s for s in state.get('sessions') or [] if isinstance(s, str)
-        ]
-        self._decisions = [
-            (d['module'], d['text'])
-            for d in state.get('decisions') or []
-            if isinstance(d, dict) and d.get('module') and d.get('text')
-        ]
-        # Absent from state written before referrals existed, which
-        # restores the old (empty) behaviour rather than failing — so
-        # RUN_STATE_VERSION does NOT move and an in-flight run stays
-        # resumable.
-        self._referrals = [
-            (d['module'], d['text'])
-            for d in state.get('referrals') or []
-            if isinstance(d, dict) and d.get('module') and d.get('text')
-        ]
-        # Absent before the gate existed. Empty restores the pre-gate
-        # behaviour (everything files), so RUN_STATE_VERSION stays put.
-        self._dispositions = {
-            ident: Disposition(
-                verdict=str(raw.get('verdict') or ''),
-                reason=str(raw.get('reason') or ''),
-            )
-            for ident, raw in (state.get('dispositions') or {}).items()
-            if isinstance(raw, dict)
-        }
-        # Absent before blocking claims were verified. Empty restores
-        # the old behaviour — no blocking claim files — so
-        # RUN_STATE_VERSION stays put.
-        self._blocking_claims = {
-            ident: text
-            for ident, text in (state.get('blocking_claims') or {}).items()
-            if isinstance(ident, str) and isinstance(text, str)
-        }
-        # Absent before versions were recorded (#17). Empty restores
-        # "nothing recorded", so RUN_STATE_VERSION stays put.
-        self._harness_versions = _restore_harness_versions(
-            state.get('harness_versions')
-        )
-        self._reviews = [
-            rec
-            for rec in (
-                ReviewRecord.from_dict(raw)
-                for raw in state.get('reviews') or []
-                if isinstance(raw, dict)
-            )
-            if rec is not None
-        ]
-        self._reader_turns = {
-            node: tuple(
-                (pair[0], pair[1])
-                for pair in turns
-                if isinstance(pair, (list, tuple)) and len(pair) == 2
-            )
-            for node, turns in (state.get('reader_turns') or {}).items()
-            if isinstance(node, str) and isinstance(turns, list)
-        }
-        self._picks = [
-            pick
-            for pick in (
-                JudgePick.from_dict(raw)
-                for raw in state.get('judge_picks') or []
-                if isinstance(raw, dict)
-            )
-            if pick is not None
-        ]
-        self._plan_of_record = state.get('plan_of_record')
-        self._published = list(state.get('published') or [])
-        self._last_branch_node = state.get('last_branch_node')
-        self._subtasks = [
-            pipeline.Subtask(id=s['id'], title=s['title'])
-            for s in state.get('subtasks') or []
-            if isinstance(s, dict) and s.get('id') and s.get('title')
-        ]
-        for node_id, raw in (state.get('nodes') or {}).items():
-            if node_id not in self._completed or not isinstance(raw, dict):
-                continue
-            self._nodes[node_id] = NodeResult(
-                node_id,
-                raw.get('kind') or 'reader',
-                branch=raw.get('branch'),
-                worktree=raw.get('worktree'),
-                output=raw.get('output') or '',
-                verdict=raw.get('verdict'),
-                selected=raw.get('selected'),
-            )
+        self._completed = restored.completed
+        self._completed_chunks = restored.completed_chunks
+        self._chunk_publishes = restored.chunk_publishes
+        self._reviewed_ok = restored.reviewed_ok
+        self._stale_sessions = restored.sessions
+        self._decisions = restored.decisions
+        self._referrals = restored.referrals
+        self._dispositions = restored.dispositions
+        self._blocking_claims = restored.blocking_claims
+        self._harness_versions = restored.harness_versions
+        self._reviews = restored.reviews
+        self._reader_turns = restored.reader_turns
+        self._picks = restored.picks
+        self._plan_of_record = restored.plan_of_record
+        self._published = restored.published
+        self._last_branch_node = restored.last_branch_node
+        self._subtasks = restored.subtasks
+        self._nodes.update(restored.nodes)
         done = len(self._completed)
         click.echo(
             f'[resume] run {self._run_id}: {done} stage(s) already '
@@ -1148,100 +989,46 @@ class PipelineRunner:
         """
         Snapshot everything a run cannot rebuild from git.
 
-        Node BRANCHES survive a crash on their own — every writer's tree
-        is committed to the hub. What does not survive is what only ever
-        lived in memory: which nodes ran, an approved plan of record, a
-        judge's selection, how far a campaign got. That is what this
-        captures.
-
         Sessions are recorded for ONE purpose: so a resume can dispose
-        the VMs the previous attempt left running. They are never
-        reattached to — a session belongs to a VM a later process
-        cannot drive — and are deliberately kept out of the per-node
-        records so nothing downstream can mistake one for live.
+        the VMs the previous attempt left running. Under --keep they
+        accumulate for the whole run, which is exactly the leak a
+        resume needs to clear, and undisposed handles ride along with
+        them. See :mod:`sbx_omnigent.runner.state` for the rest.
 
         :returns: A JSON-serializable snapshot of the run.
         """
-        return {
-            'version': RUN_STATE_VERSION,
-            'run_id': self._run_id,
-            'pipeline': self._config.name,
-            'plan_of_record': self._plan_of_record,
-            'subtasks': [
-                {'id': s.id, 'title': s.title} for s in self._subtasks
-            ],
-            'active_subtask': (
-                self._active_subtask.id if self._active_subtask else None
-            ),
-            'active_is_first': self._active_is_first,
-            'completed': sorted(self._completed),
-            # Cleanup handles only — see the docstring. Under --keep
-            # these accumulate for the whole run, which is exactly the
-            # leak a resume needs to clear.
-            # Undisposed handles ride along: this key is what a
-            # resume reads to reclaim the previous attempt's VMs.
-            'sessions': [
-                s
-                for s in dict.fromkeys(self._sessions + self._undisposed)
-                if s not in self._released
-            ],
-            'decisions': [
-                {'module': module_id, 'text': text}
-                for module_id, text in self._decisions
-            ],
-            'referrals': [
-                {'module': module_id, 'text': text}
-                for module_id, text in self._referrals
-            ],
-            'dispositions': {
-                ident: {'verdict': d.verdict, 'reason': d.reason}
-                for ident, d in self._dispositions.items()
-            },
-            'blocking_claims': dict(self._blocking_claims),
-            'harness_versions': {
-                label: {
-                    'runs': entry['runs'],
-                    'versions': dict(entry['versions']),
-                }
-                for label, entry in self._harness_versions.items()
-            },
-            'completed_chunks': sorted(self._completed_chunks),
-            'chunk_publishes': {
-                chunk: dict(entry)
-                for chunk, entry in self._chunk_publishes.items()
-            },
-            # Which writers already cleared a review gate IN THIS RUN.
-            # Held in memory it was lost on --resume, and the judge was
-            # then told nothing — so it started a verification build it
-            # could never finish inside one turn, stated no SELECT, and
-            # the first candidate won by default.
-            'reviewed_ok': sorted(self._reviewed_ok),
-            'reviews': [r.as_dict() for r in self._reviews],
-            # The planner's conversation is buffered in memory the
-            # moment its VM is freed, and that VM is then DELETED — so
-            # this buffer is the only copy. Without it in the state, a
-            # --resume past the plan stage publishes with no session
-            # record at all: the stage is already `completed` so it
-            # never re-runs, and the session it would re-read is gone.
-            'reader_turns': {
-                node: [list(pair) for pair in turns]
-                for node, turns in self._reader_turns.items()
-            },
-            'judge_picks': [p.as_dict() for p in self._picks],
-            'last_branch_node': self._last_branch_node,
-            'published': list(self._published),
-            'nodes': {
-                node_id: {
-                    'kind': node.kind,
-                    'branch': node.branch,
-                    'worktree': node.worktree,
-                    'output': node.output,
-                    'verdict': node.verdict,
-                    'selected': node.selected,
-                }
-                for node_id, node in self._nodes.items()
-            },
-        }
+        return state.encode(
+            state.RunState(
+                run_id=self._run_id,
+                pipeline=self._config.name,
+                plan_of_record=self._plan_of_record,
+                subtasks=self._subtasks,
+                active_subtask=(
+                    self._active_subtask.id if self._active_subtask else None
+                ),
+                active_is_first=self._active_is_first,
+                completed=self._completed,
+                sessions=[
+                    s
+                    for s in dict.fromkeys(self._sessions + self._undisposed)
+                    if s not in self._released
+                ],
+                decisions=self._decisions,
+                referrals=self._referrals,
+                dispositions=self._dispositions,
+                blocking_claims=self._blocking_claims,
+                harness_versions=self._harness_versions,
+                completed_chunks=self._completed_chunks,
+                chunk_publishes=self._chunk_publishes,
+                reviewed_ok=self._reviewed_ok,
+                reviews=self._reviews,
+                reader_turns=self._reader_turns,
+                picks=self._picks,
+                last_branch_node=self._last_branch_node,
+                published=self._published,
+                nodes=self._nodes,
+            )
+        )
 
     def _save_state(self) -> None:
         """

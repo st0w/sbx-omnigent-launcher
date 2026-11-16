@@ -70,6 +70,10 @@ from sbx_omnigent.runner.resume import (
     reclaim_for_resume,
 )
 from sbx_omnigent.runner.stage_kinds import stage_kind, writer_is_terminal
+from sbx_omnigent.runner.state import (
+    RUN_STATE_VERSION,
+    _restore_harness_versions,
+)
 from sbx_omnigent.swarm_session import (
     PlanDecision,
     SwarmRunnerUnavailable,
@@ -1839,7 +1843,7 @@ class TestAContractCheck(_Base):
         kinds = {'plan': 'reader', 'tests': 'writer', 'check': 'check'}
         wt = self._wt()
         wt.state_to_load = {
-            'version': R.RUN_STATE_VERSION,
+            'version': RUN_STATE_VERSION,
             'completed': completed,
             'completed_chunks': [],
             'plan_of_record': 'THE PLAN',
@@ -2311,7 +2315,7 @@ class TestThePlanCheckInsideApproval(_Base):
         cfg = self._cfg(_PLAN_CHECKED)
         wt = FakeWT()
         wt.state_to_load = {
-            'version': R.RUN_STATE_VERSION, 'completed': ['plan'],
+            'version': RUN_STATE_VERSION, 'completed': ['plan'],
             'completed_chunks': [], 'plan_of_record': 'THE PLAN',
             'published': [], 'last_branch_node': None, 'subtasks': [],
             'nodes': {'plan': {
@@ -2608,7 +2612,7 @@ class TestAResumeRerunsACheckThatNeverFinished(_Base):
     @staticmethod
     def _state(completed, outputs, kinds):
         return {
-            'version': R.RUN_STATE_VERSION,
+            'version': RUN_STATE_VERSION,
             'completed': list(completed),
             'completed_chunks': [],
             'plan_of_record': 'THE PLAN',
@@ -5135,18 +5139,6 @@ class TestAChunkPullRequestLinksItsOwnChanges(_Base):
         self.assertRegex(kept['m0']['seed'], r'^[0-9a-f]{40}$')
         self.assertEqual(
             kept['m0']['pr'], 'https://github.com/org/proj/pull/601'
-        )
-
-    def test_a_malformed_record_is_dropped_on_restore(self) -> None:
-        self.assertEqual(R._restore_chunk_publishes(None), {})
-        self.assertEqual(
-            R._restore_chunk_publishes({
-                'm0': {'seed': 'abc1234', 'pr': 'https://x/pull/1'},
-                'bad': 'nope',
-                'worse': {'seed': 'not a sha', 'pr': 3},
-            }),
-            {'m0': {'seed': 'abc1234', 'pr': 'https://x/pull/1'},
-             'worse': {'seed': '', 'pr': ''}},
         )
 
 
@@ -9926,7 +9918,7 @@ class TestAPlanCheckReadsItsPlansTree(_Base):
         reader = {'kind': 'reader', 'branch': None, 'verdict': None,
                   'selected': None}
         wt.state_to_load = {
-            'version': R.RUN_STATE_VERSION,
+            'version': RUN_STATE_VERSION,
             'completed': [
                 'm0-plan', 'm0-plan-check', 'm0-tests', 'm0-build',
                 'm1-plan',
@@ -11221,7 +11213,7 @@ class TestAResumeIsNotAMidSessionUpdate(_Base):
             run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0,
         )
-        runner._harness_versions = R._restore_harness_versions({
+        runner._harness_versions = _restore_harness_versions({
             'build': {
                 'runs': 'claude',
                 'versions': {**_KNOWN_GOOD, 'claude': '2.1.266'},
@@ -11809,7 +11801,7 @@ class TestAResumeDisposesEachVmOnce(_Base):
             worktree_root=str(self.root / 'w'),
         )
         wm.write_run_state('r1', {
-            'version': R.RUN_STATE_VERSION,
+            'version': RUN_STATE_VERSION,
             'sessions': ['s1', 's2'],
         })
         sc = _DisposeRecorder()
@@ -12226,7 +12218,7 @@ class TestRunStatePersistence(_Base):
 
     def test_state_is_versioned(self) -> None:
         _, _sc, wt = self._run(_LINEAR, dict(_LINEAR_REPLIES))
-        self.assertEqual(wt.states[-1]['version'], R.RUN_STATE_VERSION)
+        self.assertEqual(wt.states[-1]['version'], RUN_STATE_VERSION)
 
 
 class TestResume(_Base):
@@ -12234,7 +12226,7 @@ class TestResume(_Base):
 
     def _finished_state(self, completed, **over):
         state = {
-            'version': R.RUN_STATE_VERSION,
+            'version': RUN_STATE_VERSION,
             'completed': list(completed),
             'completed_chunks': [],
             'plan_of_record': 'PLAN',
@@ -12355,7 +12347,7 @@ class TestResume(_Base):
 
     def test_resume_refuses_a_foreign_state_version(self) -> None:
         state = self._finished_state(['plan'])
-        state['version'] = R.RUN_STATE_VERSION + 99
+        state['version'] = RUN_STATE_VERSION + 99
         with self.assertRaises(R.PipelineRunError) as ctx:
             self._resume(state)
         self.assertIn('version', str(ctx.exception))
@@ -12369,7 +12361,7 @@ class TestResume(_Base):
         cfg = self._cfg(_PER_MODULE)
         wt, sc = FakeWT(), FakeSC({'m0-plan': 'D0', 'm1-plan': 'D1'})
         wt.state_to_load = {
-            'version': R.RUN_STATE_VERSION,
+            'version': RUN_STATE_VERSION,
             'completed': [], 'completed_chunks': ['m0'],
             'plan_of_record': None, 'published': ['pipeline/r1-m0'],
             'last_branch_node': None,
@@ -12417,7 +12409,7 @@ class TestResumeLoopBack(_Base):
 
     def _state(self, completed):
         return {
-            'version': R.RUN_STATE_VERSION,
+            'version': RUN_STATE_VERSION,
             'completed': list(completed), 'completed_chunks': [],
             'plan_of_record': 'PLAN', 'published': [],
             'last_branch_node': 'build', 'subtasks': [], 'decisions': [],
@@ -12492,7 +12484,7 @@ class TestResumeDisposesPriorVms(_Base):
 
     def _state(self, sessions):
         return {
-            'version': R.RUN_STATE_VERSION,
+            'version': RUN_STATE_VERSION,
             'completed': ['plan'], 'completed_chunks': [],
             'plan_of_record': 'PLAN', 'published': [],
             'last_branch_node': None, 'subtasks': [], 'decisions': [],

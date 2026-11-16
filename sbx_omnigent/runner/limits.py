@@ -42,12 +42,6 @@ _DISK_FLOOR_BYTES = 5_000_000_000
 #: calibration and the two things that multiply it.
 _WORKTREE_DISK_BYTES = 4_000_000_000
 
-#: Schema version of the run-state file (see
-#: :meth:`PipelineRunner._save_state`). Bumped when the payload's shape
-#: changes, so a reader can refuse state it does not understand rather
-#: than resume from a misread one.
-RUN_STATE_VERSION = 1
-
 #: agy (native-TUI) turn-delivery hardening, all launcher-side. The agy
 #: bridge types a turn into the TUI and waits a few seconds for the
 #: paste to RENDER in the composer before Enter, then fails the turn if
