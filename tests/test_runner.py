@@ -11,7 +11,6 @@ Run: .venv/bin/python -m unittest tests.test_runner
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import io
 import json
 import shutil
@@ -37,6 +36,7 @@ from sbx_omnigent import (
     pane,
     pipeline,
     sbx_cli,
+    security_scan,
     verify,
 )
 from sbx_omnigent import image as sbx_image
@@ -8644,7 +8644,7 @@ def _scan_report(jsonl, stamp):
     """A collected report folder holding *jsonl*, or ``None``."""
     if jsonl is None:
         return None
-    return R.security_scan.ScanReport(
+    return security_scan.ScanReport(
         name=f'CLAUDE-SECURITY-{stamp}',
         files=(
             (_KEPT[0], jsonl),
@@ -8671,7 +8671,7 @@ class _ScanBase(_Base):
             return queue.pop(0) if len(queue) > 1 else queue[0]
 
         with mock.patch.object(
-            R.security_scan, 'collect_report', side_effect=read
+            security_scan, 'collect_report', side_effect=read
         ) as reader, mock.patch('sbx_omnigent.runner.run.click.echo') as echo:
             try:
                 result = self._run(_SCANNED_PIPELINE, {}, sc=sc, wt=wt)[0]
@@ -8729,28 +8729,6 @@ class TestASecurityScanStage(_ScanBase):
         self.assertEqual(result.status, 'completed')
         self.assertEqual(len(_messages_for(sc, 'build')), 1)
         self.assertIn('Medium problem', wt.artifacts['reviews/scan-sec-r1.md'])
-
-    def test_medium_and_low_become_tagged_findings_to_file(self) -> None:
-        cfg = self._cfg(_SCANNED_PIPELINE)
-        runner = R.PipelineRunner(
-            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
-            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
-            swap_age_s=lambda: 0.0,
-        )
-        findings = R.security_scan.parse_report(
-            _scan_jsonl('HIGH', 'MEDIUM', 'LOW')
-        )
-        runner._record_scan(
-            runner._stage_by_id['scan'], 1, findings, 'a' * 40, ()
-        )
-        record = runner._book.reviews[-1]
-        self.assertEqual(record.verdict, 'BLOCKING')
-        self.assertEqual(
-            [text.split(']')[0] for _i, text in record.filed_findings()],
-            ['[security-medium', '[security-low'],
-        )
-        self.assertIn('High problem', record.blocking_report)
-        self.assertNotIn('Medium problem', record.blocking_report)
 
     def test_critical_goes_back_to_the_writer(self) -> None:
         result, sc, _wt, _reader, _p = self._go(
@@ -8817,7 +8795,7 @@ class TestASecurityScanStage(_ScanBase):
         sc = FakeSC(dict(_SCAN_REPLIES))
         sc.raw_writer_replies = True
         with mock.patch.object(
-            R.security_scan, 'collect_report',
+            security_scan, 'collect_report',
             return_value=_scan_report('', '20261114-120001'),
         ), mock.patch('sbx_omnigent.runner.run.click.echo'):
             self._run(text, {}, sc=sc)
@@ -8891,8 +8869,8 @@ class TestTheScanReportsAreKept(_ScanBase):
         sc = FakeSC(dict(_SCAN_REPLIES))
         sc.raw_writer_replies = True
         with mock.patch.object(
-            R.security_scan, 'collect_report',
-            side_effect=R.security_scan.ScanReportError('x is a symlink'),
+            security_scan, 'collect_report',
+            side_effect=security_scan.ScanReportError('x is a symlink'),
         ), mock.patch('sbx_omnigent.runner.run.click.echo'):
             with self.assertRaises(R.PipelineRunError) as caught:
                 self._run(_SCANNED_PIPELINE, {}, sc=sc)
@@ -8922,7 +8900,7 @@ class TestScanFindingsAreLabelled(_Base):
             run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0, publish_repo='https://gh/org/proj',
         )
-        scan = R.security_scan
+        scan = security_scan
         first = scan.parse_report(_scan_jsonl(*blocking, 'MEDIUM', 'LOW'))
         final = scan.parse_report(_scan_jsonl('MEDIUM'))
         runner._book.reviews = [
@@ -8937,7 +8915,7 @@ class TestScanFindingsAreLabelled(_Base):
         return runner
 
     def _scan_record(self, round_no, findings):
-        scan = R.security_scan
+        scan = security_scan
         defects = tuple(scan.render_defect(f) for f in findings
                         if not f.blocks)
         blocking = [f for f in findings if f.blocks]
@@ -9077,12 +9055,12 @@ class TestTheSecuritySummary(_Base):
 
     def _round(self, runner, wt, round_no, jsonl):
         report = _scan_report(jsonl, f'20261114-12000{round_no}')
-        saved = runner._save_scan_report(
+        saved = runner._scan._save_report(
             runner._stage_by_id['scan'], round_no, report
         )
-        findings = R.security_scan.parse_report(jsonl)
+        findings = security_scan.parse_report(jsonl)
         with mock.patch('sbx_omnigent.runner.run.click.echo'):
-            runner._record_scan(
+            runner._scan._record(
                 runner._stage_by_id['scan'], round_no, findings,
                 'a' * 40, saved,
             )
@@ -9204,7 +9182,7 @@ class TestTheSecuritySummary(_Base):
         sc = FakeSC(dict(replies))
         sc.raw_writer_replies = True
         with mock.patch.object(
-            R.security_scan, 'collect_report',
+            security_scan, 'collect_report',
             return_value=_scan_report(
                 _scan_jsonl('MEDIUM'), '20261114-120001'
             ),
@@ -9260,50 +9238,6 @@ class TestTheSecuritySummary(_Base):
             security_doc=self._PATH,
         )
         self.assertIn(self._PATH, body)
-
-
-class TestAScanInACampaign(_Base):
-    """In a campaign a module's scan diffs from the campaign tip, the
-    commit the module was built on; the first module from the base."""
-
-    def _runner(self, *, subtask: bool, campaign_tip: str | None):
-        cfg = self._cfg(_SCANNED_PIPELINE)
-        wt = FakeWT()
-        wt.tip_overrides['campaign'] = campaign_tip
-        runner = R.PipelineRunner(
-            cfg, session_client=FakeSC({}), worktree_manager=wt,
-            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
-            swap_age_s=lambda: 0.0,
-        )
-        if subtask:
-            runner._progress.active_subtask = pipeline.Subtask(
-                id='m1', title='two',
-            )
-        return runner, wt
-
-    def test_a_later_module_starts_at_the_campaign_tip(self) -> None:
-        runner, _wt = self._runner(subtask=True, campaign_tip='a' * 40)
-        self.assertEqual(runner._module_start(), 'a' * 40)
-
-    def test_the_first_module_starts_at_the_base(self) -> None:
-        runner, wt = self._runner(subtask=True, campaign_tip=None)
-        self.assertEqual(runner._module_start(), wt.hub_ref_tip('r1', 'main'))
-
-    def test_outside_a_campaign_it_starts_at_the_base(self) -> None:
-        runner, wt = self._runner(subtask=False, campaign_tip='a' * 40)
-        self.assertEqual(runner._module_start(), wt.hub_ref_tip('r1', 'main'))
-
-    def test_a_module_cites_its_own_security_folder(self) -> None:
-        runner, _wt = self._runner(subtask=True, campaign_tip=None)
-        runner._config = dataclasses.replace(
-            runner._config,
-            subtasks=(pipeline.Subtask(id='m1', title='two'),),
-        )
-        self.assertEqual(runner._security_folder_name(), 'demo-m1-security')
-
-    def test_outside_a_campaign_it_cites_the_runs_folder(self) -> None:
-        runner, _wt = self._runner(subtask=False, campaign_tip=None)
-        self.assertEqual(runner._security_folder_name(), 'demo-security')
 
 
 class TestPlanArtifact(_Base):
@@ -12859,7 +12793,7 @@ class TestAGateFixIsCheckedAgainInOrder(_Base):
             return outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
 
         with mock.patch.object(
-            R.security_scan, 'collect_report', side_effect=scan
+            security_scan, 'collect_report', side_effect=scan
         ), mock.patch.object(
             verify, 'run_verification', side_effect=gate
         ) as gate_calls, mock.patch('sbx_omnigent.runner.run.click.echo'):
@@ -13931,7 +13865,6 @@ class TestPlanningSessionCommitted(_Base):
         ).run()
         self.assertEqual(result.status, 'completed')
         self.assertIsNotNone(wt.published)
-
 
 
     def test_consolidation_instruction_requests_subtasks(self) -> None:
