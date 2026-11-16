@@ -203,7 +203,7 @@ def decode(raw: dict | None, run_id: str) -> RunState:
             f'version {version!r}, this build writes '
             f'{RUN_STATE_VERSION}.'
         )
-    completed = set(raw.get('completed') or [])
+    completed = set(_strings(raw.get('completed')))
     name = raw.get('pipeline')
     active = raw.get('active_subtask')
     return RunState(
@@ -214,7 +214,7 @@ def decode(raw: dict | None, run_id: str) -> RunState:
         active_subtask=active if isinstance(active, str) else None,
         active_is_first=raw.get('active_is_first') is True,
         completed=completed,
-        sessions=[s for s in raw.get('sessions') or [] if isinstance(s, str)],
+        sessions=_strings(raw.get('sessions')),
         # Absent from state written before referrals existed, which
         # restores the old (empty) behaviour rather than failing.
         decisions=_restore_module_notes(raw.get('decisions')),
@@ -226,7 +226,7 @@ def decode(raw: dict | None, run_id: str) -> RunState:
         # the old behaviour — no blocking claim files.
         blocking_claims={
             ident: text
-            for ident, text in (raw.get('blocking_claims') or {}).items()
+            for ident, text in _mapping(raw.get('blocking_claims')).items()
             if isinstance(ident, str) and isinstance(text, str)
         },
         # Absent before versions were recorded (#17). Empty restores
@@ -234,18 +234,16 @@ def decode(raw: dict | None, run_id: str) -> RunState:
         harness_versions=_restore_harness_versions(
             raw.get('harness_versions')
         ),
-        completed_chunks=set(raw.get('completed_chunks') or []),
+        completed_chunks=set(_strings(raw.get('completed_chunks'))),
         # Absent before chunk PRs linked their own changes. Empty means
         # the next PR goes without the link.
         chunk_publishes=_restore_chunk_publishes(raw.get('chunk_publishes')),
-        reviewed_ok={
-            c for c in raw.get('reviewed_ok') or [] if isinstance(c, str)
-        },
+        reviewed_ok=set(_strings(raw.get('reviewed_ok'))),
         reviews=_restore_reviews(raw.get('reviews')),
         reader_turns=_restore_reader_turns(raw.get('reader_turns')),
         picks=_restore_picks(raw.get('judge_picks')),
         last_branch_node=raw.get('last_branch_node'),
-        published=list(raw.get('published') or []),
+        published=_strings(raw.get('published')),
         nodes=_restore_nodes(raw.get('nodes'), completed),
     )
 
@@ -254,6 +252,20 @@ def _entries(raw: object) -> list[object]:
     """:returns: *raw* if it is a list, else none: the wrong type is
     dropped like a malformed entry, not iterated."""
     return raw if isinstance(raw, list) else []
+
+
+def _strings(raw: object) -> list[str]:
+    """
+    The string entries of a list of ids or URLs.
+
+    Every such list in the state goes through this: a string in place
+    of the list would otherwise be read letter by letter, and a
+    non-string entry in ``completed`` failed the resume outright.
+
+    :param raw: The value from the state file.
+    :returns: Its string entries if it is a list, else none.
+    """
+    return [entry for entry in _entries(raw) if isinstance(entry, str)]
 
 
 def _mapping(raw: object) -> dict[object, object]:

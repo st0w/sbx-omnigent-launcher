@@ -296,5 +296,38 @@ class TestAValueOfTheWrongTypeIsDropped(unittest.TestCase):
                 restored = decode(_encoded(**{key: ['x']}), 'r1')
                 self.assertEqual(restored, decode(_encoded(**{key: {}}), 'r1'))
 
+
+class TestStringListsHoldOnlyStrings(unittest.TestCase):
+    """Stage ids, module ids, session ids and PR URLs are strings. An
+    entry that is not one is dropped: in ``completed`` it used to fail
+    the resume, being unhashable."""
+
+    _FIELDS = (
+        'completed', 'completed_chunks', 'published', 'sessions',
+        'reviewed_ok',
+    )
+
+    def test_an_entry_that_is_not_a_string_is_dropped(self) -> None:
+        for key in self._FIELDS:
+            with self.subTest(key=key):
+                restored = decode(_encoded(**{key: ['a', {'x': 1}, 3]}), 'r1')
+                self.assertEqual(sorted(getattr(restored, key)), ['a'])
+
+    def test_a_string_is_not_read_as_a_list_of_letters(self) -> None:
+        for key in self._FIELDS:
+            with self.subTest(key=key):
+                restored = decode(_encoded(**{key: 'abc'}), 'r1')
+                self.assertEqual(list(getattr(restored, key)), [])
+
+    def test_a_number_restores_empty(self) -> None:
+        for key in self._FIELDS:
+            with self.subTest(key=key):
+                restored = decode(_encoded(**{key: 7}), 'r1')
+                self.assertEqual(list(getattr(restored, key)), [])
+
+    def test_blocking_claims_holding_a_list_restore_empty(self) -> None:
+        restored = decode(_encoded(blocking_claims=['x']), 'r1')
+        self.assertEqual(restored.blocking_claims, {})
+
 if __name__ == '__main__':
     unittest.main()
