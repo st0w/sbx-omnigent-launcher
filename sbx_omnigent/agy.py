@@ -976,7 +976,7 @@ def build_bridge_patch_script(
         placeholder. Either way the turn dies with "agy did not render
         the pasted message", which is what a HUMAN's reply to an
         interactive planner hits (the runner's own turns dodge it by
-        going through :data:`_AGY_TASK_FILE`). The patch re-checks the
+        going through the runner's task file). The patch re-checks the
         WHOLE pane, whitespace-collapsed so a wrapped line still
         matches, and accepts the placeholder — both mean agy really did
         take the paste. A pane showing neither still fails.

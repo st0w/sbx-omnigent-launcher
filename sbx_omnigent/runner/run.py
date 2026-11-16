@@ -38,39 +38,28 @@ import functools
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 import click
 
 from sbx_omnigent import (
     agy,
-    background,
-    claude,
-    codex,
     disk_metrics,
     orphans,
-    pane,
     pipeline,
-    readback,
     security_scan,
 )
-from sbx_omnigent.launch_args import launch_args_for
 from sbx_omnigent.runner import state
 from sbx_omnigent.runner.campaign import Campaign, CampaignHooks
 from sbx_omnigent.runner.captures import TurnCapture
 from sbx_omnigent.runner.context import RunContext
 from sbx_omnigent.runner.errors import (
-    LostTurn,
     PipelineRunError,
-    RunInterrupted,
     _Blocked,
 )
 from sbx_omnigent.runner.failure_notes import (
     FailureNotes,
     lost_not_failed,
-    session_failure_note,
-    turn_was_lost,
 )
 from sbx_omnigent.runner.filing import FindingFiler
 from sbx_omnigent.runner.gate import VerifyGate
@@ -78,8 +67,6 @@ from sbx_omnigent.runner.harness_record import HarnessRecord
 from sbx_omnigent.runner.ledger import DecisionLedger
 from sbx_omnigent.runner.limits import (
     _DEFAULT_MAX_ROUNDS,
-    _FIRST_TURN_MAX_RESUBMITS,
-    _FIRST_TURN_REDELIVER_DELAY_S,
     _LAUNCH_ATTEMPTS,
     _MAX_PARALLEL_NODES,
     _MAX_SILENT_REVIEW_ROUNDS,
@@ -107,7 +94,6 @@ from sbx_omnigent.runner.parsing.plans import (
 from sbx_omnigent.runner.parsing.text import (
     _excerpt,
     _printable,
-    _single_line,
 )
 from sbx_omnigent.runner.parsing.verdicts import (
     _UNVERIFIED,
@@ -173,8 +159,9 @@ from sbx_omnigent.runner.render.pr_body import (
 )
 from sbx_omnigent.runner.repo_records import RepoRecords
 from sbx_omnigent.runner.review_book import ReviewBook
-from sbx_omnigent.runner.sandboxes import sandbox_for
 from sbx_omnigent.runner.security_records import SecurityRecords
+from sbx_omnigent.runner.session_disposal import SessionDisposal
+from sbx_omnigent.runner.session_driver import SessionDriver
 from sbx_omnigent.runner.session_registry import SessionRegistry
 from sbx_omnigent.runner.stage_kinds import (
     is_planner,
@@ -183,10 +170,6 @@ from sbx_omnigent.runner.stage_kinds import (
 )
 from sbx_omnigent.runner.triage import FindingTriage
 from sbx_omnigent.runner.writer_policy import WriterPolicy
-from sbx_omnigent.swarm import (
-    credential_kind_for,
-    mount_sentinel,
-)
 from sbx_omnigent.swarm_session import (
     SwarmRunnerUnavailable,
     SwarmSessionClient,
@@ -195,11 +178,6 @@ from sbx_omnigent.swarm_session import (
 from sbx_omnigent.worktrees import (
     WorktreeManager,
 )
-
-#: Filename a node worktree carries an agy turn in (read by the agent,
-#: never pasted). Added to the clone's ``.git/info/exclude`` so it is
-#: neither committed nor seen by the settle-wait's ``git status``.
-_AGY_TASK_FILE = 'OMNI_TASK.md'
 
 
 class PipelineRunner:
@@ -249,10 +227,8 @@ class PipelineRunner:
         self._sc = session_client
         self._wt = worktree_manager
         self._run_id = run_id
-        self._agent_ids = agent_ids
         self._publish_repo = publish_repo or config.repo
         self._max_rounds = max_review_rounds
-        self._turn_timeout = turn_timeout
         self._keep = keep
         #: Block the PLANNING phase (only) on human approval: the
         #: planner asks questions, a human answers + posts APPROVED,
@@ -281,8 +257,6 @@ class PipelineRunner:
         #: always did. Degrading to the slower-but-correct behaviour is
         #: the right failure for a claim about what was checked.
         self._reviewed_ok: set[str] = set()
-        #: Age of the agy swap secret, guarding every agy turn.
-        self._swap_age_s = swap_age_s or agy.harvest_age_s
         #: The operator's allowlist for the verify gate, as the server
         #: published it (see :func:`read_operator_egress`). ``None``
         #: only when built outside ``main()``, which keeps the default.
@@ -307,7 +281,7 @@ class PipelineRunner:
         #: walks the session list and the node map, so an append from
         #: another node mid-walk raises "changed size during
         #: iteration". Re-entrant because the guarded paths nest:
-        #: _create_session saves state, and so does stage completion.
+        #: creating a session saves state, and so does stage completion.
         self._lock = threading.RLock()
         #: Caps microVMs driven at once ACROSS the whole run, not per
         #: call. Parallelism nests — a parallel block of review stages
@@ -339,6 +313,24 @@ class PipelineRunner:
         )
         self._notes = FailureNotes(
             self._ctx, registry=self._registry, keep=keep
+        )
+        self._driver = SessionDriver(
+            self._ctx,
+            registry=self._registry,
+            harness=self._harness,
+            capture=self._capture,
+            notes=self._notes,
+            agent_ids=agent_ids,
+            turn_timeout=turn_timeout,
+            swap_age_s=swap_age_s or agy.harvest_age_s,
+            interrupted=self._interrupted,
+            save_state=self._save_state,
+        )
+        self._disposal = SessionDisposal(
+            self._ctx,
+            registry=self._registry,
+            keep=keep,
+            save_state=self._save_state,
         )
         self._ledger = DecisionLedger(self._ctx)
         self._policy = WriterPolicy(
@@ -389,7 +381,7 @@ class PipelineRunner:
                 dispose_prewarmed=self._dispose_prewarmed,
                 session_count=lambda: len(self._registry.sessions),
                 dispose_sessions_since=(
-                    lambda mark: self._dispose_sessions(
+                    lambda mark: self._disposal.dispose(
                         self._registry.sessions[mark:]
                     )
                 ),
@@ -465,7 +457,7 @@ class PipelineRunner:
             # Anything short of a clean finish — a raise, or a blocked
             # gate — keeps the run directory, because that is the only
             # copy of what --resume needs.
-            self._teardown(preserve_run=not finished)
+            self._disposal.teardown(preserve_run=not finished)
         return RunResult(
             run_id=self._run_id,
             status='blocked' if blocked else 'completed',
@@ -519,49 +511,7 @@ class PipelineRunner:
                 else ''
             )
         )
-        self._dispose_stale_sessions()
-
-    def _dispose_stale_sessions(self) -> None:
-        """
-        Tear down the VMs the previous attempt of this run left up.
-
-        ``--keep`` plus ``--resume`` leaks by construction: the earlier
-        process kept its microVMs deliberately, and the resuming
-        process starts with an empty session list, so nothing it owns
-        would ever dispose them — not at a chunk boundary, not at
-        teardown. They would sit holding disk (and their sandbox
-        runtimes) for the whole continued run, on top of the VMs it
-        stands up itself. Observed live: 12 microVMs from a finished
-        module still running eight hours later, on a host at 100%
-        capacity — the same exhaustion that remounts guest filesystems
-        read-only.
-
-        Best-effort and never fatal: a resume must not fail because a
-        VM it was cleaning is already gone (``dispose`` treats a 404 as
-        success), and ``--keep`` is honored, since the human asked for
-        the previous attempt's VMs to stay.
-        """
-        stale, self._registry.stale = self._registry.stale, []
-        if not stale:
-            return
-        if self._keep:
-            click.echo(
-                f'[resume] --keep: leaving {len(stale)} microVM(s) from '
-                f'the previous attempt up (they are no longer tracked, '
-                f'so nothing will dispose them later).'
-            )
-            return
-        gone = 0
-        for session in stale:
-            try:
-                self._sc.dispose(session)
-                gone += 1
-            except SwarmSessionError:
-                pass  # already torn down, or the server lost it
-        click.echo(
-            f'[resume] disposed {gone}/{len(stale)} microVM(s) left '
-            f'running by the previous attempt.'
-        )
+        self._disposal.dispose_stale()
 
     def _state_payload(self) -> dict:
         """
@@ -674,7 +624,7 @@ class PipelineRunner:
 
         Sessions used to live until the CHUNK published, which for a
         reader or a judge is pure waste: neither is ever driven again.
-        Every ``_drive`` on one happens inside its own stage, and the
+        Every turn on one is driven inside its own stage, and the
         two loop-back paths — a blocking review and a failed
         verification gate — resolve only to WRITERS. So a judge that
         finished picking sat on a full guest through the refactor, the
@@ -736,36 +686,12 @@ class PipelineRunner:
                     f'EMPTY, so there is nothing to buffer. The design '
                     f'conversation dies with this VM.'
                 )
-        self._free_session(
+        self._disposal.free(
             session,
             f'{stage.id}: freed its microVM — a {kind} is never '
             f're-driven, and holding it costs a full guest for the '
             f'rest of the module.',
         )
-
-    def _free_session(self, session: str, why: str) -> bool:
-        """
-        Dispose one session and stop treating it as live.
-
-        The single place a VM is handed back early. A delete that FAILS
-        deliberately leaves the session in the registry, so the
-        chunk disposal and teardown both try again — a microVM that may
-        still be running must never stop being tracked.
-
-        :param session: The session to free.
-        :param why: One line for the log, naming what was freed and why.
-        :returns: Whether the microVM was actually released.
-        """
-        if self._keep or session in self._registry.released:
-            return False
-        try:
-            self._sc.dispose(session)
-        except SwarmSessionError:
-            return False
-        self._registry.released.add(session)
-        self._registry.forget(session)
-        click.echo(f'[cleanup] {why}')
-        return True
 
     def _writer_never_re_driven(
         self, stage: pipeline.PipelineStage
@@ -787,70 +713,6 @@ class PipelineRunner:
         if sub is not None and stage_id.startswith(f'{sub.id}-'):
             stage_id = stage_id[len(sub.id) + 1 :]
         return writer_is_terminal(self._config, stage_id)
-
-    def _dispose_sessions(self, sessions: Sequence[str]) -> None:
-        """
-        Tear down exactly the microVMs named, wherever they sit.
-
-        The identity-based counterpart to
-        :meth:`Campaign._release_sessions`. Two review stages running at
-        the same time cannot both free their guests by an index mark:
-        each takes its mark as the length of the registry's session
-        list, so the stage that finishes second slices from ITS mark
-        and deletes the sessions the first one is still driving.
-        Naming the sessions removes the ambiguity — a stage frees what
-        it created and nothing else.
-
-        Outstanding marks survive this. A mark is taken when a chunk
-        begins and the sessions removed here are always created after
-        it, so they sit at an index at or beyond every live mark, and
-        dropping them leaves ``_sessions[mark:]`` meaning what it did
-        before: everything still live that the chunk created.
-
-        The delete itself is deliberately OUTSIDE the lock. It is a
-        network round trip per guest, and holding the lock across it
-        would serialize the very teardown running stages in parallel
-        exists to overlap.
-
-        :param sessions: The sessions to free. Already-freed ones are
-            skipped, so this is safe as a backstop after each turn has
-            released its own guest.
-        """
-        if self._keep or not sessions:
-            return
-        with self._lock:
-            doomed = set(sessions)
-            live = [s for s in sessions if s not in self._registry.released]
-            # Freed already by the turn that owned them; forget the
-            # bookkeeping now that nothing will ask about them again.
-            self._registry.released.difference_update(doomed)
-        failed: list[str] = []
-        for session in live:
-            try:
-                self._sc.dispose(session)
-            except SwarmSessionError:
-                # The delete failed, so the microVM may well still be
-                # up. Dropping the handle here would strand it: it is
-                # cut from the state file at the next write, and then
-                # nothing — not teardown, not a later --resume — knows
-                # it exists. That is how a run leaks gigabytes of image
-                # store with no record of what is holding them.
-                failed.append(session)
-        with self._lock:
-            for session in live:
-                self._registry.forget(session)
-            self._registry.sessions[:] = [
-                s for s in self._registry.sessions if s not in doomed
-            ]
-            if failed:
-                self._registry.undisposed.extend(failed)
-        if failed:
-            click.echo(
-                f'[cleanup] {len(failed)} microVM(s) refused to '
-                f'dispose; keeping them in the run state so teardown '
-                f'and --resume can try again.'
-            )
-        self._save_state()
 
     def _security_folder_name(self) -> str:
         """The scan reports' folder name, for the record to cite."""
@@ -1044,16 +906,16 @@ class PipelineRunner:
         Tear down writers pre-warmed during planning (campaign).
 
         A campaign's nodes are named ``<chunk>-<stage>``, so it can use
-        none of these. Each VM goes through :meth:`_free_session`, so
-        teardown does not dispose it a second time, and the clones are
-        removed now rather than left on disk until the run ends (#31).
-        ``--keep`` keeps both.
+        none of these. Each VM goes through
+        :meth:`SessionDisposal.free`, so teardown does not dispose it a
+        second time, and the clones are removed now rather than left on
+        disk until the run ends (#31). ``--keep`` keeps both.
         """
         prewarmed = sorted(self._prewarmed)
         for node_id in prewarmed:
             node = self._nodes.pop(node_id, None)
             if node and node.session:
-                self._free_session(
+                self._disposal.free(
                     node.session,
                     f'{node_id}: pre-warmed, but the plan chunked, so a '
                     f'per-chunk writer replaces it.',
@@ -1132,61 +994,6 @@ class PipelineRunner:
         for node_id, exc in failures[1:]:
             click.echo(f'[parallel] {label}: {node_id} also failed: {exc}')
         raise failures[0][1]
-
-    def _await_background(
-        self,
-        session: str,
-        since: str | None,
-        reply: str,
-        done: Callable[[str], bool] | None,
-        deadline: float,
-    ) -> str:
-        """
-        Wait out the background work a turn ended on.
-
-        See :mod:`sbx_omnigent.background`.
-
-        :param session: The session whose turn just ended.
-        :param since: Its newest item before the turn.
-        :param reply: The turn's reply.
-        :param done: Whether a reply is finished; ``None`` waits until
-            no background work this turn started is left.
-        :param deadline: When the turn's own timeout runs out.
-        :returns: The reply, with any woken replies appended.
-        """
-        label = self._registry.label_of(session)
-        try:
-            return background.await_background(
-                self._sc,
-                session,
-                since=since,
-                reply=reply,
-                done=done or (lambda _reply: False),
-                deadline=deadline,
-                label=label,
-                stop=lambda: self._refuse_if_interrupted(label),
-                poll_s=background.POLL_S,
-            )
-        except SwarmSessionError as exc:
-            # Following the work is best-effort: without it the reply is
-            # handled exactly as it was before this wait existed.
-            click.echo(
-                f'[background] {label}: could not follow its background '
-                f'work ({exc}); using the reply as it stands.'
-            )
-            return reply
-
-    def _refuse_if_interrupted(self, label: str) -> None:
-        """
-        Start nothing once the run has been interrupted.
-
-        :param label: The node about to boot a VM or drive a turn.
-        :raises RunInterrupted: When Ctrl-C has been pressed.
-        """
-        if self._interrupted.is_set():
-            raise RunInterrupted(
-                f'{label}: the run was interrupted, so nothing new starts'
-            )
 
     def _forfeit_blocked_reviews(
         self,
@@ -1454,7 +1261,7 @@ class PipelineRunner:
             for stage in self._config.stages:
                 self._provision_stage(stage)
         except Exception:
-            self._teardown(preserve_run=True)
+            self._disposal.teardown(preserve_run=True)
             raise
         return RunResult(
             run_id=self._run_id,
@@ -1484,7 +1291,7 @@ class PipelineRunner:
             assert target_wt is not None
             for reviewer in stage.run:
                 label = f'{stage.id}-{reviewer}'
-                session = self._create_session(
+                session = self._driver.create(
                     reviewer, target_wt, 'ro', label
                 )
                 self._bind(label, reviewer, session, target_wt, 'ro')
@@ -1497,7 +1304,7 @@ class PipelineRunner:
                 self._run_id, stage.id, candidates,
                 replace=self._resume,
             )
-            session = self._create_session(
+            session = self._driver.create(
                 stage.run[0], wt, 'ro', stage.id
             )
             self._nodes[stage.id] = NodeResult(
@@ -1513,7 +1320,7 @@ class PipelineRunner:
             self._run_id, stage.id, from_node=seed_from(stage, self._nodes),
             replace=self._resume,
         )
-        session = self._create_session(agent, wt, mode, stage.id)
+        session = self._driver.create(agent, wt, mode, stage.id)
         branch = (
             self._wt.node_branch(self._run_id, stage.id)
             if kind == 'writer'
@@ -1598,8 +1405,8 @@ class PipelineRunner:
             self._run_id, stage.id, from_node=seed_from(stage, self._nodes),
             replace=True,
         )
-        session = self._create_session(agent, wt, 'ro', stage.id)
-        out = self._drive(
+        session = self._driver.create(agent, wt, 'ro', stage.id)
+        out = self._driver.drive(
             session, self._verify_instruction(pending, reports)
         )
         self._nodes[stage.id] = NodeResult(
@@ -1634,8 +1441,8 @@ class PipelineRunner:
             # assembled from the ledger, so seeding after would hand
             # this planner an empty one.
             self._ledger.seed_from(wt)
-        session = self._create_session(agent, wt, 'ro', stage.id)
-        out = self._drive(session, self._reader_instruction(stage))
+        session = self._driver.create(agent, wt, 'ro', stage.id)
+        out = self._driver.drive(session, self._reader_instruction(stage))
         node = NodeResult(
             stage.id, 'reader', worktree=wt, session=session, output=out
         )
@@ -1658,7 +1465,7 @@ class PipelineRunner:
                 )
             else:
                 # Unattended: an agy planner's reply lags its single
-                # turn, so _drive can return empty under load — leaving
+                # turn, so a turn can return empty under load — leaving
                 # the plan unshared and uncommitted. Read the SETTLED
                 # session for the final plan (the same settled-capture
                 # the interactive consolidation turn uses).
@@ -1826,9 +1633,9 @@ class PipelineRunner:
             file that cannot be read safely.
         """
         assert stage.scan_effort is not None
-        session = self._create_session(stage.run[0], worktree, 'rw', stage.id)
+        session = self._driver.create(stage.run[0], worktree, 'rw', stage.id)
         try:
-            self._drive(
+            self._driver.drive(
                 session,
                 security_scan.instruction(base=base, effort=stage.scan_effort),
             )
@@ -1837,7 +1644,7 @@ class PipelineRunner:
                 self._capture.turn(session, 'the scan wrote no report')
             return report
         finally:
-            self._free_session(
+            self._disposal.free(
                 session, f'{stage.id}: the scan is done with its VM.'
             )
 
@@ -1961,8 +1768,8 @@ class PipelineRunner:
             self._run_id, stage.id, from_node=stage.checks,
             replace=self._resume,
         )
-        session = self._create_session(stage.run[0], wt, 'ro', stage.id)
-        first = self._drive(
+        session = self._driver.create(stage.run[0], wt, 'ro', stage.id)
+        first = self._driver.drive(
             session, self._check_instruction(stage), done=_check_done
         )
         out = self._finish_check(stage.id, session, first)
@@ -2157,7 +1964,7 @@ class PipelineRunner:
         # consolidation turn doesn't race it, drive the turn, then let
         # THAT settle and read the final message (agy's reply lags).
         self._sc.wait_for_session_idle(session)
-        self._drive(session, self._plan_consolidation_instruction())
+        self._driver.drive(session, self._plan_consolidation_instruction())
         self._sc.wait_for_session_idle(session)
         consolidated = self._sc.read_latest_reply(session)
         # Never trust the consolidation reply blind: a planner that has
@@ -2250,10 +2057,10 @@ class PipelineRunner:
             self._run_id, check.id, from_node=seed_from(planner, self._nodes),
             replace=True,
         )
-        session = self._create_session(check.run[0], wt, 'ro', check.id)
+        session = self._driver.create(check.run[0], wt, 'ro', check.id)
         out = self._finish_check(
             check.id, session,
-            self._drive(
+            self._driver.drive(
                 session,
                 self._plan_check_instruction(check, plan),
                 done=_check_done,
@@ -2302,7 +2109,7 @@ class PipelineRunner:
             f'ended with {_CHECK_COMPLETE}, so it has not finished; '
             f'asking it once to finish.'
         )
-        return self._drive(session, _CHECK_FINISH_ASK, done=_check_done)
+        return self._driver.drive(session, _CHECK_FINISH_ASK, done=_check_done)
 
     def _halt_on_unfinished_check(
         self, stage: pipeline.PipelineStage, session: str, out: str
@@ -2360,7 +2167,7 @@ class PipelineRunner:
             'The report from the check follows, sent to the planner, '
             'which will walk you through each problem.',
         )
-        self._drive(
+        self._driver.drive(
             session,
             f'From the pipeline, not the human: a read-only check of the '
             f'plan you just consolidated found {len(disputes)} problem(s): '
@@ -2528,7 +2335,7 @@ class PipelineRunner:
             self._run_id, stage.id, from_node=seed_from(stage, self._nodes),
             replace=self._resume,
         )
-        session = self._create_session(agent, wt, 'rw', stage.id)
+        session = self._driver.create(agent, wt, 'rw', stage.id)
         node = NodeResult(
             stage.id,
             'writer',
@@ -2639,7 +2446,7 @@ class PipelineRunner:
                 node.output = self._finish_writer(
                     stage.id,
                     node.session,
-                    self._drive(
+                    self._driver.drive(
                         node.session,
                         self._writer_instruction(stage) + _WRITER_FINISH,
                         done=_writer_done,
@@ -2663,7 +2470,7 @@ class PipelineRunner:
                         attempt == _WRITER_TURN_ATTEMPTS
                         or not lost_not_failed(exc)
                     )
-                if exhausted or not self._free_session(
+                if exhausted or not self._disposal.free(
                     node.session,
                     f'{stage.id}: freeing the VM that lost its turn.',
                 ):
@@ -2683,7 +2490,7 @@ class PipelineRunner:
                 # out while a dead VM holds its slot.
                 time.sleep(_WRITER_RETRY_BACKOFF_S)
                 assert node.worktree is not None
-                node.session = self._create_session(
+                node.session = self._driver.create(
                     stage.run[0], node.worktree, 'rw', stage.id
                 )
 
@@ -2709,7 +2516,9 @@ class PipelineRunner:
             f'{_WORK_COMPLETE}, so it has not finished; asking it once to '
             f'finish before anything is committed.'
         )
-        return self._drive(session, _WRITER_FINISH_ASK, done=_writer_done)
+        return self._driver.drive(
+            session, _WRITER_FINISH_ASK, done=_writer_done
+        )
 
     def _halt_on_unfinished_writer(
         self, stage_id: str, session: str, out: str
@@ -2796,7 +2605,7 @@ class PipelineRunner:
             f'[resume] {stage.id}: re-attaching a session to its '
             f'existing worktree so the loop-back can run.'
         )
-        node.session = self._create_session(
+        node.session = self._driver.create(
             stage.run[0], node.worktree, 'rw', stage.id
         )
 
@@ -2835,7 +2644,7 @@ class PipelineRunner:
             turn = f'{_FROZEN_TESTS_CONTRACT}\n\n{turn}'
         node.output = self._finish_writer(
             stage_id, node.session,
-            self._drive(
+            self._driver.drive(
                 node.session, turn + _WRITER_FINISH, done=_writer_done
             ),
         )
@@ -2931,14 +2740,14 @@ class PipelineRunner:
         """
         attempt = launches = 0
         while True:
-            session = self._create_session(reviewer, target_wt, 'ro', label)
+            session = self._driver.create(reviewer, target_wt, 'ro', label)
             # Recorded the moment it exists, not once the turn succeeds,
             # so a reviewer that dies mid-review still hands its
             # guest to the stage backstop instead of leaking it.
             with self._lock:
                 created.append(session)
             try:
-                return session, self._drive(
+                return session, self._driver.drive(
                     session, self._review_instruction(stage),
                     done=_review_done,
                 )
@@ -2971,7 +2780,7 @@ class PipelineRunner:
                     f'{_REVIEW_RETRY_BACKOFF_S:.0f}s, then booting a '
                     f'fresh guest and reviewing again.'
                 )
-            self._free_session(
+            self._disposal.free(
                 session, f'{label}: freeing the guest that died.'
             )
             # AFTER the guest is freed, so an outage is not waited out
@@ -3009,7 +2818,7 @@ class PipelineRunner:
         # still ran in series: one voted APPROVED and its idle 6 GB
         # guest stayed up for 1h50m while the remaining reviewer's
         # build thrashed at load 18 with every linker at 0% CPU.
-        self._free_session(
+        self._disposal.free(
             session,
             f'{label}: voted — freeing its microVM now so the '
             f'reviewers still working are not starved.',
@@ -3071,7 +2880,7 @@ class PipelineRunner:
                 # Before the snapshot goes: those guests have it
                 # mounted. In a `finally` so a turn that raises frees
                 # both rather than leaking a guest AND a clone.
-                self._dispose_sessions(created)
+                self._disposal.dispose(created)
                 self._dispose_review_snapshot(stage.id, round_no)
             self._note_environment_limits(stage.id, round_no)
             # A reviewer that never stated a verdict did not vote
@@ -3554,7 +3363,7 @@ class PipelineRunner:
         an opening narration, are what loop back to the writer).
 
         :param session: The reviewer session just driven.
-        :param streamed: The turn's streamed reply from :meth:`_drive`.
+        :param streamed: The turn's streamed reply.
         :param label: The reviewer's node label (for the capture log).
         :returns: ``(verdict, reply_text)`` — verdict is ``'APPROVED'``,
             ``'BLOCKING'``, or ``None``.
@@ -3567,7 +3376,7 @@ class PipelineRunner:
         self._sc.wait_for_session_idle(session)
         started = time.monotonic()
         deadline = started + _VERDICT_POLL_DEADLINE_S
-        marker = self._newest_item_id(session)
+        marker = self._driver.newest_item_id(session)
         while True:
             settled = self._sc.read_recent_reply_text(session)
             if settled:
@@ -3583,7 +3392,7 @@ class PipelineRunner:
             ):
                 break
             time.sleep(_VERDICT_POLL_INTERVAL_S)
-            current = self._newest_item_id(session)
+            current = self._driver.newest_item_id(session)
             if current != marker:
                 # It is still producing output, so it is not silent —
                 # restart the silence clock. The ceiling above still
@@ -3591,26 +3400,6 @@ class PipelineRunner:
                 marker = current
                 deadline = time.monotonic() + _VERDICT_POLL_DEADLINE_S
         return self._nudge_for_verdict(session, label, text)
-
-    def _newest_item_id(self, session: str) -> str | None:
-        """
-        Id of the session's newest item, as an activity marker.
-
-        A DELTA, not a snapshot: comparing this across polls is what
-        distinguishes a reviewer that is working from one that has gone
-        quiet. Status cannot — a settled session reads idle between
-        tool rounds — and the item TYPE cannot either, because a
-        reviewer mid-build looks identical to one that stopped.
-
-        :param session: The reviewer session.
-        :returns: The newest item's id, or ``None`` when the session
-            has none or cannot be read.
-        """
-        try:
-            items = self._sc.read_items(session, tail=1)
-        except SwarmSessionError:
-            return None
-        return items[-1].get('id') if items else None
 
     def _nudge_for_verdict(
         self, session: str, label: str, text: str
@@ -3637,7 +3426,7 @@ class PipelineRunner:
             # inline: an agy reviewer would otherwise get this as a
             # pointer to a file it must choose to re-read — which is
             # exactly what it does not do when it thinks it is mid-work.
-            nudged = self._drive(
+            nudged = self._driver.drive(
                 session, _VERDICT_NUDGE, inline=True, done=_review_done
             )
         except PipelineRunError:
@@ -3684,8 +3473,8 @@ class PipelineRunner:
             self._run_id, stage.id, candidates, replace=self._resume
         )
         agent = stage.run[0]
-        session = self._create_session(agent, wt, 'ro', stage.id)
-        out = self._drive(
+        session = self._driver.create(agent, wt, 'ro', stage.id)
+        out = self._driver.drive(
             session, self._judge_instruction(stage, candidates)
         )
         stated = parse_select(out, candidates)
@@ -3701,7 +3490,7 @@ class PipelineRunner:
                 f'[judge] {stage.id}: no SELECT line in the first '
                 f'reply — asking once more before halting.'
             )
-            retry = self._drive(
+            retry = self._driver.drive(
                 session, self._judge_retry_instruction(candidates)
             )
             again = parse_select(retry, candidates)
@@ -3918,335 +3707,6 @@ class PipelineRunner:
         ]
 
     # ── session + turn plumbing ───────────────────────────────────
-
-    def _verify_launch(self, session: str) -> None:
-        """
-        Say so when a harness did not launch with what we asked for.
-
-        The launcher asks for a model, an effort and a permission mode,
-        and until now never checked it got any of them. Four separate
-        failures in two days turned on exactly that: a mode downgraded
-        because the model lacked a capability, an effort discarded, a
-        model substituted. Every one was invisible in the launcher's
-        logs and plainly on the agent's screen.
-
-        WARNS, never raises. It reads a TUI mid-draw, so a false alarm
-        is entirely possible and must not be able to fail a run — and a
-        read-back that cries wolf is one somebody switches off, after
-        which the next silent substitution costs another day.
-        :func:`readback.launch_mismatches` is conservative for the same
-        reason: what it cannot read, it does not report.
-
-        :param session: The session whose first turn just completed.
-        """
-        agent = self._registry.agents.get(session)
-        if agent is None:
-            return
-        label = self._registry.label_of(session)
-        sandbox = sandbox_for(self._sc, session)
-        if sandbox is None:
-            return
-        # capture_pane never raises by contract. Guarded anyway: this
-        # read-back only warns, and must never be what fails a run.
-        try:
-            text = pane.capture_pane(sandbox) or ''
-        except Exception:
-            return
-        mode = None
-        if agent.harness not in agy.AGY_HARNESSES | codex.CODEX_HARNESSES:
-            args = list(launch_args_for(agent.harness, agent.effort))
-            if '--permission-mode' in args:
-                mode = args[args.index('--permission-mode') + 1]
-        for why in readback.launch_mismatches(
-            agent.harness,
-            text,
-            model=agent.model,
-            effort=agent.effort,
-            permission_mode=mode,
-        ):
-            click.echo(f'[launch] {label}: {why}')
-
-    def _create_session(
-        self,
-        agent_name: str,
-        worktree: str,
-        mode: str,
-        label: str,
-    ) -> str:
-        self._refuse_if_interrupted(label)
-        agent = self._config.agents[agent_name]
-        is_agy = agent.harness in agy.AGY_HARNESSES
-        credential = credential_kind_for(agent.harness)
-        session = self._sc.create(
-            agent_id=self._agent_ids[agent_name],
-            workspace=mount_sentinel(
-                worktree, mode,
-                credential=credential,
-                # A Claude VM's /model picker lists only the family
-                # aliases unless told; the launcher adds this model so
-                # Omnigent launches it instead of the default.
-                model=agent.model if credential is None else None,
-            ),
-            title=f'{self._run_id}/{label}',
-            terminal_launch_args=list(
-                launch_args_for(agent.harness, agent.effort)
-            ),
-            model_override=agent.model,
-            reasoning_effort=agent.effort,
-        )
-        # One critical section for the whole registration: the
-        # save below snapshots exactly these collections, so a node
-        # registering concurrently must not land halfway through.
-        with self._lock:
-            self._registry.register(
-                session, label=label, agent=agent, worktree=worktree
-            )
-        # Persist NOW, not at the next stage boundary. State is
-        # otherwise written only when a stage or review round
-        # completes, so a session created inside that window is
-        # invisible to --resume forever: `_dispose_stale_sessions`
-        # disposes what the state file recorded, and nothing else knows
-        # this VM exists. Observed live — a reviewer session created at
-        # 01:24, the minute the machine crashed, survived every
-        # subsequent resume and had to be found and deleted by hand.
-        # One cheap write buys a VM that can always be reclaimed.
-        self._save_state()
-        if is_agy:
-            self._registry.agy.add(session)
-            # Warm the just-created agy TUI before it is driven, so the
-            # first turn's paste hits a ready composer (see the module
-            # note + wait_for_terminal_ready).
-            self._sc.wait_for_terminal_ready(session)
-        return session
-
-    def _drive(
-        self,
-        session: str,
-        instruction: str,
-        *,
-        inline: bool = False,
-        done: Callable[[str], bool] | None = None,
-    ) -> str:
-        """
-        Run one turn on *session* and return its reply.
-
-        A turn the agent ended on background work it started is
-        followed until the agent is woken and replies (see
-        :mod:`sbx_omnigent.background`), so the reply returned is the
-        one it gave once that work finished.
-
-        :param session: The session to drive.
-        :param instruction: The turn text.
-        :param inline: Paste the turn directly instead of staging it as
-            a file for an agy session. For SHORT, urgent turns whose
-            whole point is that the agent acts on them right now: the
-            file indirection buries them. See :data:`_VERDICT_NUDGE`.
-        :param done: Whether a reply is finished, so a finished reply
-            never waits on a server the agent left running. ``None``
-            waits until no background work this turn started is left.
-        :returns: The assistant's reply.
-        :raises PipelineRunError: If the turn failed.
-        """
-        self._refuse_if_interrupted(
-            self._registry.label_of(session)
-        )
-        is_agy = session in self._registry.agy
-        # agy drops a multi-line paste before it renders AND collapses
-        # an over-long paste into an unsubmittable placeholder — so an
-        # agy turn is never pasted whole: it is handed over as a file
-        # the agent reads and only a tiny pointer is pasted (see
-        # _agy_deliverable). A first agy turn also gets a re-delivery
-        # net if it fails before starting.
-        if is_agy:
-            self._require_fresh_swap(session)
-            instruction = (
-                # Flattened, not staged: agy still cannot take a
-                # multi-line paste, but a one-line turn renders fine and
-                # arrives where the agent will actually read it.
-                _single_line(instruction)
-                if inline
-                else self._agy_deliverable(session, instruction)
-            )
-        first_turn = self._registry.first_turn(session)
-        since = self._newest_item_id(session)
-        deadline = time.monotonic() + self._turn_timeout
-        with self._lock:
-            self._registry.in_turn.add(session)
-        try:
-            result = self._sc.send_and_wait(
-                session,
-                instruction,
-                timeout=self._turn_timeout,
-                max_resubmits=(
-                    _FIRST_TURN_MAX_RESUBMITS if first_turn else 0
-                ),
-                redeliver_delay_s=(
-                    _FIRST_TURN_REDELIVER_DELAY_S if first_turn else 0.0
-                ),
-            )
-            # Inside the try, so the session stays "in turn" for Ctrl-C
-            # while the agent's background work runs.
-            if result.ok and not claude.api_error_reply(result.reply):
-                waited = self._await_background(
-                    session, since, result.reply or '', done, deadline
-                )
-                if waited != (result.reply or ''):
-                    result = replace(result, reply=waited)
-        except SwarmSessionError as exc:
-            # The turn never came back. Teardown is seconds away and
-            # will delete this session, so capture NOW or the only
-            # evidence is the timeout line itself.
-            self._capture.turn(
-                session,
-                f'the turn did not return: {exc}',
-                with_pane=True,
-            )
-            raise
-        except KeyboardInterrupt:
-            # Ctrl-C on a turn that LOOKS stuck is exactly when someone
-            # wants to know what it was doing — and it is the one exit
-            # that skipped this, because KeyboardInterrupt is not an
-            # Exception. Observed live: a reviewer that had installed a
-            # toolchain, built the workspace and launched the suite was
-            # interrupted, and its transcript had to be pulled out of
-            # the API by hand before teardown deleted it.
-            self._capture.turn(
-                session,
-                'interrupted (Ctrl-C) mid-turn',
-                with_pane=True,
-            )
-            raise
-        finally:
-            with self._lock:
-                self._registry.in_turn.discard(session)
-        if first_turn and result.ok:
-            # AFTER the first turn, not at create: the TUI has not
-            # finished drawing when a session is created, so the pane
-            # carries nothing to compare and the check would silently
-            # never fire (observed — it read an empty pane every time).
-            # One turn late still beats stage 6 of 8, and costs no wait.
-            self._verify_launch(session)
-            self._harness.record_first_turn(session)
-        api_error = claude.api_error_reply(result.reply) if result.ok else None
-        if api_error is not None:
-            # The reply is Claude Code's refusal, not work. It can come
-            # back before the server's failed status does, so it is
-            # read here rather than trusted to that race.
-            result = replace(result, status='failed', error=api_error)
-        if not result.ok:
-            snap = self._notes.snapshot(session)
-            note = session_failure_note(snap) + claude.version_hint(
-                result.error
-            )
-            auth = self._notes.auth(session, result.error, snap)
-            # A rejected credential is the more specific reading, so a
-            # rate-limit note is only added when there is none.
-            limit = '' if auth else self._notes.rate_limit(
-                session, result.error, snap
-            )
-            note += limit
-            pane_path = self._capture.turn(
-                session,
-                f'the turn failed: {result.error}{note}{auth}',
-                with_pane=True,
-            )
-            # Name the pane IN the error. A bare "failed: None" is what
-            # cost a day on the codex-3 run — the blocking migration
-            # picker was on screen the whole time and nothing
-            # pointed at it.
-            # Say why there is no pane rather than dropping the
-            # suffix. A bare 'failed: None' with nothing to open is what
-            # the pane capture exists to prevent, and a capture that
-            # returned nothing silently reproduced it.
-            where = (
-                f' — see {pane_path}' if pane_path
-                else self._notes.no_pane(session)
-            )
-            # A rejected credential is not a lost turn: retrying it on a
-            # fresh VM would only fail the same way.
-            error = (
-                LostTurn if not auth and turn_was_lost(result.error, snap)
-                else PipelineRunError
-            )
-            raise error(
-                f'turn on {session} failed: '
-                f'{result.error}{note}{auth}{where}'
-            )
-        return result.reply
-
-    def _require_fresh_swap(self, session: str) -> None:
-        """
-        Refuse an agy turn whose swap token has already expired.
-
-        An agy agent VM carries only a placeholder; the sbx proxy swaps
-        in the harvested token on the wire. Once that token expires, agy
-        fails to authenticate INSIDE ITS OWN TUI — which the bridge
-        never surfaces as a failed session — so the turn simply hangs to
-        the turn timeout and reports a misleading "did not complete",
-        with an empty session and no error anywhere. Burning 30 minutes
-        to learn nothing is strictly worse than stopping here.
-
-        No grace wait: :data:`agy.MAX_SWAP_AGE_S` already allows half an
-        interval of slack past a healthy refresh, so exceeding it means
-        the harvester is not working, not that it is mid-cycle.
-
-        :param session: The agy session about to be driven.
-        :raises PipelineRunError: If the secret is stale or unknown.
-        """
-        age = self._swap_age_s()
-        if age is not None and age <= agy.MAX_SWAP_AGE_S:
-            return
-        seen = (
-            'has never been recorded'
-            if age is None
-            else f'was last refreshed {age / 60:.0f} min ago'
-        )
-        raise PipelineRunError(
-            f'refusing to drive agy session {session}: the swap secret '
-            f'{seen} (limit {agy.MAX_SWAP_AGE_S / 60:.0f} min), so its '
-            f'access token has expired and agy would fail to '
-            f'authenticate inside its own TUI — the turn would hang for '
-            f'{self._turn_timeout:.0f}s and report nothing. The token '
-            f'harvester is not refreshing: check {agy.HARVEST_LOG}, and '
-            f"if the trusted box cannot re-mint, run 'agy /login' on it."
-        )
-
-    def _agy_deliverable(self, session: str, instruction: str) -> str:
-        """
-        Deliver an agy turn as a file + a tiny pointer to paste.
-
-        agy fails a turn at paste time whenever the paste is multi-line
-        (dropped before it renders) or long (collapses into a
-        ``[Pasted text …]`` placeholder the bridge cannot verify), so
-        nothing substantial is ever pasted. The full turn — original
-        formatting intact, which reads better than a flattened blob — is
-        written to :data:`_AGY_TASK_FILE` at the root of the agent's own
-        worktree, and only a short one-line pointer telling the agent to
-        read it is pasted. The file is git-ignored in the node's clone,
-        so a writer never commits it and the settle-wait never mistakes
-        it for the agent's output. Reading a task file is a normal,
-        allowed action for every agy role (the planner may read, just
-        not write).
-
-        :param session: The agy session being driven.
-        :param instruction: The full turn text.
-        :returns: The one-line pointer to paste (or, defensively, the
-            flattened turn if the session has no worktree to stage
-            into).
-        """
-        worktree = self._registry.worktrees.get(session)
-        if worktree is None:
-            # No worktree to stage into (should not happen — every
-            # session is created with one): flatten and paste, so the
-            # turn is at least attempted rather than lost.
-            return _single_line(instruction)
-        self._wt.write_ignored_file(worktree, _AGY_TASK_FILE, instruction)
-        return _single_line(
-            f'Your full instructions are in the file {_AGY_TASK_FILE} at '
-            'the root of your workspace (your current directory). Read '
-            'that file now, then carry out the task exactly as it '
-            'describes.'
-        )
 
     def _commit(self, node_id: str, message: str) -> None:
         """
@@ -5074,43 +4534,3 @@ class PipelineRunner:
             plan=self._progress.plan_of_record,
             module=self._progress.active_subtask,
         )
-
-    def _teardown(self, *, preserve_run: bool = False) -> None:
-        """
-        Dispose the run's microVMs — and its directory only if done.
-
-        The VMs always go: they are expensive and useless the moment
-        this process ends. The RUN DIRECTORY is different. It holds the
-        hub clone carrying every node branch, and state.json — together,
-        the only record of what the run achieved and the only thing
-        ``--resume`` can read. Removing it on a FAILED run destroys
-        exactly what resume exists for.
-
-        Observed live: a run died standing up one session, teardown
-        wiped the directory, and a finished module's approved plan, its
-        frozen test suite, and both competing implementations went with
-        it — none of it published, so nothing remained anywhere. Until
-        now only ``--keep`` prevented that, which made resume-after-
-        failure work by accident rather than by design.
-
-        :param preserve_run: Keep the run directory (a failed or
-            blocked run). ``--keep`` still preserves everything.
-        """
-        if self._keep:
-            return
-        for session in self._registry.outstanding():
-            try:
-                self._sc.dispose(session)
-            except SwarmSessionError:
-                pass
-        if preserve_run:
-            click.echo(
-                f"[cleanup] disposed this run's microVMs; kept "
-                f'{self._wt.run_dir(self._run_id)} so '
-                f'--run-id {self._run_id} --resume can continue it.'
-            )
-            return
-        try:
-            self._wt.dispose_run(self._run_id)
-        except click.ClickException:
-            pass

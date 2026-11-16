@@ -52,7 +52,7 @@ _WORKTREE_DISK_BYTES = 4_000_000_000
 #: "[Pasted text #N … chars]" PLACEHOLDER the bridge cannot verify.
 #: Rather than tune around agy's exact limits, NOTHING substantial is
 #: ever pasted: every agy turn is written to a file the agent reads
-#: (:data:`_AGY_TASK_FILE`) and only a tiny one-line pointer is pasted
+#: (``OMNI_TASK.md``) and only a tiny one-line pointer is pasted
 #: (:func:`_single_line` keeps even that pointer single-line). The file
 #: also keeps the turn's original formatting, which reads better than a
 #: flattened blob. Two cheap safety nets back the pointer up: WARM the
@@ -103,7 +103,7 @@ _FIRST_TURN_REDELIVER_DELAY_S = 0.0
 #: round plus a re-driven coder.
 #:
 #: So the clock restarts whenever the reviewer produces anything (see
-#: :meth:`PipelineRunner._newest_item_id`). A reviewer emitting items
+#: :meth:`SessionDriver.newest_item_id`). A reviewer emitting items
 #: is not silent, whatever it is emitting.
 _VERDICT_POLL_DEADLINE_S = 900.0
 _VERDICT_POLL_INTERVAL_S = 5.0

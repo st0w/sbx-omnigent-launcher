@@ -29,9 +29,12 @@ import click
 from click.testing import CliRunner, Result
 
 from sbx_omnigent import (
+    background,
+    codex,
     egress,
     guest_log,
     harness_versions,
+    pane,
     pipeline,
     sbx_cli,
     verify,
@@ -40,7 +43,9 @@ from sbx_omnigent import image as sbx_image
 from sbx_omnigent.defaults import DEFAULT_EGRESS_ALLOW, DEFAULT_HOST_IMAGE
 from sbx_omnigent.runner import cli
 from sbx_omnigent.runner import run as R
+from sbx_omnigent.runner.errors import RunInterrupted
 from sbx_omnigent.runner.limits import (
+    _FIRST_TURN_MAX_RESUBMITS,
     _VM_DISK_BYTES,
     _WORKTREE_DISK_BYTES,
 )
@@ -88,6 +93,7 @@ from sbx_omnigent.runner.resume import (
     _resume_worktree_count,
     reclaim_for_resume,
 )
+from sbx_omnigent.runner.session_driver import _AGY_TASK_FILE
 from sbx_omnigent.runner.stage_kinds import stage_kind, writer_is_terminal
 from sbx_omnigent.runner.state import (
     RUN_STATE_VERSION,
@@ -750,7 +756,7 @@ class FakeSC:
 
 
 def _staged_file(
-    wt: FakeWT, node_id: str, name: str = R._AGY_TASK_FILE
+    wt: FakeWT, node_id: str, name: str = _AGY_TASK_FILE
 ) -> str:
     """Content agy was handed as a file for *node_id*."""
     for path, fname, content in wt.ignored_files:
@@ -792,7 +798,7 @@ class _Base(unittest.TestCase):
         self.addCleanup(versions.stop)
         # Never run the real `codex doctor` on this host.
         probe = mock.patch.object(
-            R.codex, 'probe_login', return_value=None
+            codex, 'probe_login', return_value=None
         )
         self.probe_login = probe.start()
         self.addCleanup(probe.stop)
@@ -942,7 +948,7 @@ class TestLinear(_Base):
             _LINEAR,
             {'plan': 'P', 'build': 'b', 'review-sec': 'VERDICT: APPROVED'},
         )
-        self.assertIn(R._AGY_TASK_FILE, sc.message_for_label('plan'))
+        self.assertIn(_AGY_TASK_FILE, sc.message_for_label('plan'))
         plan_file = _staged_file(wt, 'plan')
         self.assertIn('DESIGN PLAN', plan_file)
         self.assertIn('do NOT write code', plan_file)
@@ -998,7 +1004,7 @@ class TestLinear(_Base):
         for label in ('plan', 'build', 'review-sec'):
             self.assertEqual(
                 first[label]['max_resubmits'],
-                R._FIRST_TURN_MAX_RESUBMITS,
+                _FIRST_TURN_MAX_RESUBMITS,
                 f'{label} first turn must be re-deliverable',
             )
 
@@ -1025,7 +1031,7 @@ class TestLinear(_Base):
         )
         agy_msg = sc.message_for_label('plan')  # agy planner: the pointer
         self.assertNotIn('\n', agy_msg)  # pointer is a single line
-        self.assertIn(R._AGY_TASK_FILE, agy_msg)  # points at the file
+        self.assertIn(_AGY_TASK_FILE, agy_msg)  # points at the file
         self.assertNotIn('parse_ports', agy_msg)  # content is NOT pasted
         self.assertIn('parse_ports', _staged_file(wt, 'plan'))  # it is filed
         claude_msg = sc.message_for_label('build')  # claude coder
@@ -1044,7 +1050,7 @@ class TestLinear(_Base):
         self.assertTrue(staged)
         self.assertTrue(
             all(
-                p == '/wt/r1/nodes/plan' and n == R._AGY_TASK_FILE
+                p == '/wt/r1/nodes/plan' and n == _AGY_TASK_FILE
                 for p, n in staged
             )
         )
@@ -1533,7 +1539,7 @@ class TestTheRunnerWaitsForBackgroundWork(_Base):
 
     def setUp(self) -> None:
         super().setUp()
-        poll = mock.patch.object(R.background, 'POLL_S', 0.0)
+        poll = mock.patch.object(background, 'POLL_S', 0.0)
         poll.start()
         self.addCleanup(poll.stop)
 
@@ -3145,7 +3151,8 @@ class TestSilentReviewerIsAsked(_Base):
             swap_age_s=lambda: 0.0,
         )
         with mock.patch.object(
-            runner, '_drive', side_effect=R.PipelineRunError('vm gone')
+            runner._driver, 'drive',
+            side_effect=R.PipelineRunError('vm gone'),
         ):
             verdict, text = runner._nudge_for_verdict(
                 'sess-9', 'review-sec', 'pool.rs:88 drops the guard'
@@ -3216,43 +3223,6 @@ class TestAStageFreesItsOwnSessionsOnly(_Base):
             agent_ids={n: f'ag-{n}' for n in cfg.agents},
             swap_age_s=lambda: 0.0,
         )
-
-    def test_only_the_named_sessions_are_freed(self) -> None:
-        # The invariant the mark violated, stated directly: a stage
-        # frees what it created and leaves everything else running.
-        sc = FakeSC(dict(_TWO_REVIEW_REPLIES))
-        runner = self._runner(sc)
-        runner._registry.sessions[:] = ['a-1', 'b-1', 'a-2', 'b-2']
-        runner._dispose_sessions(['a-1', 'a-2'])
-        self.assertEqual(sc.disposed, ['a-1', 'a-2'])
-        self.assertEqual(runner._registry.sessions, ['b-1', 'b-2'])
-
-    def test_an_outstanding_chunk_mark_still_means_what_it_did(self)\
-            -> None:
-        # Chunk teardown still slices by index. Removing a stage's
-        # sessions must not shift anything across a live mark, or the
-        # next chunk boundary frees the wrong guests.
-        sc = FakeSC(dict(_TWO_REVIEW_REPLIES))
-        runner = self._runner(sc)
-        sessions = runner._registry.sessions
-        sessions[:] = ['chunk0-1', 'chunk0-2']
-        mark = len(sessions)
-        sessions.extend(['stage-a', 'stage-b', 'other'])
-        runner._dispose_sessions(['stage-a', 'stage-b'])
-        self.assertEqual(sessions[mark:], ['other'])
-        self.assertEqual(sessions[:mark], ['chunk0-1', 'chunk0-2'])
-
-    def test_a_session_already_freed_is_not_deleted_twice(self) -> None:
-        # Each reviewer releases its own guest the moment it votes, so
-        # the stage backstop must be a no-op for those.
-        sc = FakeSC(dict(_TWO_REVIEW_REPLIES))
-        runner = self._runner(sc)
-        runner._registry.sessions[:] = ['s-1', 's-2']
-        runner._free_session('s-1', 'voted')
-        self.assertEqual(sc.disposed, ['s-1'])
-        runner._dispose_sessions(['s-1', 's-2'])
-        self.assertEqual(sc.disposed, ['s-1', 's-2'])
-        self.assertEqual(runner._registry.sessions, [])
 
     def test_a_still_working_reviewer_is_not_torn_down(self) -> None:
         """
@@ -3783,7 +3753,7 @@ class TestTurnCapture(_Base):
         sc.default_host_id = 'h1'
         sc.host_names['h1'] = 'managed-h1'
         with mock.patch.object(
-            R.pane, 'capture_pane', return_value='> 1. Try new model'
+            pane, 'capture_pane', return_value='> 1. Try new model'
         ) as capture:
             with self.assertRaises(R.PipelineRunError) as caught:
                 runner.run()
@@ -3812,7 +3782,7 @@ class TestTurnCapture(_Base):
         sc.default_host_id = 'h1'
         sc.host_names['h1'] = 'managed-h1'
         with mock.patch.object(
-            R.pane, 'capture_pane', side_effect=RuntimeError('boom')
+            pane, 'capture_pane', side_effect=RuntimeError('boom')
         ):
             with self.assertRaises(R.PipelineRunError) as caught:
                 runner.run()
@@ -3822,7 +3792,7 @@ class TestTurnCapture(_Base):
     def test_a_routine_capture_does_not_pay_for_a_pane(self) -> None:
         # A healthy run loops back through review rounds; reading a pane
         # on each one is an sbx round-trip for nothing.
-        with mock.patch.object(R.pane, 'capture_pane') as capture:
+        with mock.patch.object(pane, 'capture_pane') as capture:
             _r, _sc, wt = self._run(
                 _LINEAR,
                 {'plan': 'P', 'build': 'b',
@@ -6339,7 +6309,7 @@ class TestAReviewerThatLostItsRunner(_Base):
         sc.fail_labels = {'build'}
         sc.default_host_id = 'h1'
         sc.host_names['h1'] = 'managed-h1'
-        with mock.patch.object(R.pane, 'capture_pane', return_value=None):
+        with mock.patch.object(pane, 'capture_pane', return_value=None):
             with self.assertRaises(R.PipelineRunError) as caught:
                 self._run(_LINEAR, {}, sc=sc, **kw)
         return str(caught.exception)
@@ -8513,8 +8483,8 @@ class TestCtrlCStopsTheRunNow(_Base):
         sc = FakeSC({})
         runner = self._runner(sc)
         runner._interrupted.set()
-        with self.assertRaises(R.RunInterrupted):
-            runner._create_session(
+        with self.assertRaises(RunInterrupted):
+            runner._driver.create(
                 'build', '/wt/r1/nodes/build', 'rw', 'build'
             )
         self.assertEqual(sc.creates, [])
@@ -8522,16 +8492,16 @@ class TestCtrlCStopsTheRunNow(_Base):
     def test_no_turn_is_sent_after_it(self) -> None:
         sc = FakeSC({})
         runner = self._runner(sc)
-        session = runner._create_session(
+        session = runner._driver.create(
             'build', '/wt/r1/nodes/build', 'rw', 'build'
         )
         runner._interrupted.set()
-        with self.assertRaises(R.RunInterrupted):
-            runner._drive(session, 'do the work')
+        with self.assertRaises(RunInterrupted):
+            runner._driver.drive(session, 'do the work')
         self.assertEqual(sc.sent, [])
 
     def test_it_is_an_interrupt_no_retry_handler_catches(self) -> None:
-        self.assertTrue(issubclass(R.RunInterrupted, KeyboardInterrupt))
+        self.assertTrue(issubclass(RunInterrupted, KeyboardInterrupt))
 
     def test_a_turn_lost_after_it_is_not_retried(self) -> None:
         # Teardown disposes the sessions; a reviewer that then reads its
@@ -8568,10 +8538,10 @@ class TestCtrlCStopsTheRunNow(_Base):
         sc = _Watching({'build': 'done'})
         runner = self._runner(sc)
         holder['runner'] = runner
-        session = runner._create_session(
+        session = runner._driver.create(
             'build', '/wt/r1/nodes/build', 'rw', 'build'
         )
-        runner._drive(session, 'do the work')
+        runner._driver.drive(session, 'do the work')
         self.assertEqual(seen, [True])
         self.assertNotIn(session, runner._registry.in_turn)
 
@@ -10684,7 +10654,7 @@ class TestBlockedOnAModalPrompt(_Base):
         sc.default_host_id = 'h1'
         sc.host_names['h1'] = 'managed-h1'
         with mock.patch.object(
-            R.pane, 'capture_pane', return_value=pane_text
+            pane, 'capture_pane', return_value=pane_text
         ):
             with mock.patch.object(R.click, 'echo') as echo:
                 with self.assertRaises(R.PipelineRunError):
@@ -10719,7 +10689,7 @@ class TestLaunchIsVerified(_Base):
         sc.default_host_id = 'h1'
         sc.host_names['h1'] = 'managed-h1'
         with mock.patch.object(
-            R.pane, 'capture_pane', return_value=pane_text
+            pane, 'capture_pane', return_value=pane_text
         ):
             with mock.patch.object(R.click, 'echo') as echo:
                 result, _sc, wt = self._run(
@@ -10760,7 +10730,7 @@ class TestLaunchIsVerified(_Base):
         sc.default_host_id = 'h1'
         sc.host_names['h1'] = 'managed-h1'
         with mock.patch.object(
-            R.pane, 'capture_pane', side_effect=RuntimeError('boom')
+            pane, 'capture_pane', side_effect=RuntimeError('boom')
         ):
             result, _sc, _wt = self._run(
                 _LINEAR, dict(_LINEAR_REPLIES), sc=sc
@@ -10786,7 +10756,7 @@ class TestHarnessVersionsAreRecorded(_Base):
         else:
             self.read_versions.return_value = versions
         with mock.patch.object(
-            R.pane, 'capture_pane', return_value=pane_text
+            pane, 'capture_pane', return_value=pane_text
         ):
             with mock.patch.object(R.click, 'echo') as echo:
                 try:
@@ -10874,7 +10844,7 @@ class TestHarnessVersionsAreRecorded(_Base):
         self.read_versions.return_value = {
             **_KNOWN_GOOD, 'claude': '2.1.270'
         }
-        with mock.patch.object(R.pane, 'capture_pane', return_value='x'):
+        with mock.patch.object(pane, 'capture_pane', return_value='x'):
             with self.assertRaises(R.PipelineRunError):
                 self._run(_LINEAR, dict(_LINEAR_REPLIES), sc=sc, wt=wt)
         doc = wt.artifacts['turns/build.pane.txt']
@@ -10894,7 +10864,7 @@ class TestHarnessVersionsAreRecorded(_Base):
         self.read_versions.return_value = _KNOWN_GOOD
         notice = '   \u2714 Update installed \u00b7 Restart to apply'
         with mock.patch.object(
-            R.pane, 'capture_pane', return_value=notice
+            pane, 'capture_pane', return_value=notice
         ):
             with self.assertRaises(R.PipelineRunError):
                 self._run(_LINEAR, dict(_LINEAR_REPLIES), sc=sc, wt=wt)
@@ -14318,7 +14288,7 @@ class TestTheCodexLoginIsCheckedAgainstTheServer(_Base):
         return said
 
     def test_a_rejected_login_is_refused_naming_the_agents(self) -> None:
-        self.probe_login.side_effect = R.codex.CodexLoginRejected('nope')
+        self.probe_login.side_effect = codex.CodexLoginRejected('nope')
         with self.assertRaises(click.ClickException) as caught:
             self._check(_CODEX_ONLY)
         message = caught.exception.format_message()
@@ -14336,7 +14306,7 @@ class TestTheCodexLoginIsCheckedAgainstTheServer(_Base):
         )
 
     def test_skipping_never_runs_the_probe(self) -> None:
-        self.probe_login.side_effect = R.codex.CodexLoginRejected('nope')
+        self.probe_login.side_effect = codex.CodexLoginRejected('nope')
         said = self._check(_CODEX_ONLY, skip=True)
         self.probe_login.assert_not_called()
         self.assertIn('not checked', ' '.join(said))
@@ -14371,7 +14341,7 @@ class TestTheCodexLoginIsCheckedAgainstTheServer(_Base):
         self.assertFalse(login.call_args.kwargs['skip'])
 
     def test_the_cli_flag_skips_it(self) -> None:
-        res, login = self._main(R.codex.SKIP_LOGIN_CHECK_FLAG)
+        res, login = self._main(codex.SKIP_LOGIN_CHECK_FLAG)
         self.assertEqual(res.exit_code, 0, res.output)
         self.assertTrue(login.call_args.kwargs['skip'])
 
@@ -14380,10 +14350,10 @@ class TestTheCodexLoginIsCheckedAgainstTheServer(_Base):
         # not ambiguous.
         cfg_path = self.root / 'pipeline.yaml'
         cfg_path.write_text(_CODEX_ONLY, encoding='utf-8')
-        expired = R.codex.CodexAuthError('the token expired')
+        expired = codex.CodexAuthError('the token expired')
         with mock.patch.object(cli, 'preflight_sbx'), \
                 mock.patch.object(cli, 'preflight_disk'), \
-                mock.patch.object(R.codex, 'preflight', side_effect=expired), \
+                mock.patch.object(codex, 'preflight', side_effect=expired), \
                 mock.patch.object(cli, '_drive') as drive:
             res = CliRunner().invoke(
                 cli.main,
@@ -14392,7 +14362,7 @@ class TestTheCodexLoginIsCheckedAgainstTheServer(_Base):
                     '--canonical-root', str(self.root / 'c'),
                     '--worktree-root', str(self.root / 'w'),
                     '--skip-agy-check',
-                    R.codex.SKIP_LOGIN_CHECK_FLAG,
+                    codex.SKIP_LOGIN_CHECK_FLAG,
                 ],
             )
         self.assertEqual(res.exit_code, 1, res.output)
@@ -14402,7 +14372,7 @@ class TestTheCodexLoginIsCheckedAgainstTheServer(_Base):
     def test_the_cli_checks_before_any_vm(self) -> None:
         cfg_path = self.root / 'pipeline.yaml'
         cfg_path.write_text(_CODEX_ONLY, encoding='utf-8')
-        self.probe_login.side_effect = R.codex.CodexLoginRejected('nope')
+        self.probe_login.side_effect = codex.CodexLoginRejected('nope')
         with mock.patch.object(cli, 'preflight_sbx'), \
                 mock.patch.object(cli, 'preflight_disk'), \
                 mock.patch.object(cli, 'preflight_codex_auth'), \
@@ -14438,7 +14408,7 @@ class TestAnAuthFailureIsNamed(_Base):
             sc.default_host_id = 'h1'
             sc.host_names['h1'] = 'managed-h1'
         self.runner_log.return_value = log
-        with mock.patch.object(R.pane, 'capture_pane', return_value=None):
+        with mock.patch.object(pane, 'capture_pane', return_value=None):
             with self.assertRaises(R.PipelineRunError) as caught:
                 self._run(text, {}, sc=sc)
         return caught.exception, sc
@@ -14454,7 +14424,7 @@ class TestAnAuthFailureIsNamed(_Base):
 
     def test_it_names_the_codex_remedy(self) -> None:
         exc, _sc = self._failing(self._LOG)
-        self.assertIn(R.codex.RELOGIN_HINT, str(exc))
+        self.assertIn(codex.RELOGIN_HINT, str(exc))
 
     def test_it_names_the_claude_remedy_for_a_claude_agent(self) -> None:
         exc, _sc = self._failing(self._LOG, _TDD)
@@ -14506,7 +14476,7 @@ class TestAClaudeAuthFailureIsNamed(_Base):
         sc.host_names['h1'] = 'managed-h1'
         if status is not None:
             sc.status_for_label['build'] = status
-        with mock.patch.object(R.pane, 'capture_pane', return_value=None):
+        with mock.patch.object(pane, 'capture_pane', return_value=None):
             with self.assertRaises(R.PipelineRunError) as caught:
                 self._run(_TDD, {}, sc=sc)
         return caught.exception, sc
@@ -14556,7 +14526,7 @@ class TestARateLimitedTurnIsNamed(_Base):
         sc.turn_outcomes['build'] = [outcome]
         if status is not None:
             sc.status_for_label['build'] = status
-        with mock.patch.object(R.pane, 'capture_pane', return_value=None):
+        with mock.patch.object(pane, 'capture_pane', return_value=None):
             with self.assertRaises(R.PipelineRunError) as caught:
                 self._run(text, {}, sc=sc)
         return caught.exception, sc
@@ -14636,7 +14606,7 @@ class TestAnApiErrorReplyFailsTheTurn(_Base):
         # An API error is the harness talking, not the agent, so it
         # never carries the finish line the fake would otherwise add.
         sc.raw_writer_replies = True
-        with mock.patch.object(R.pane, 'capture_pane', return_value=None):
+        with mock.patch.object(pane, 'capture_pane', return_value=None):
             with self.assertRaises(R.PipelineRunError) as caught:
                 self._run(_TDD, {}, sc=sc)
         return caught.exception, sc

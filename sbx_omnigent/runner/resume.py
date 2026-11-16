@@ -247,7 +247,7 @@ def reclaim_for_resume(
             f'running, before measuring disk.'
         )
         # The runner disposes whatever the state still lists (see
-        # PipelineRunner._dispose_stale_sessions). Left in, it disposed
+        # SessionDisposal.dispose_stale). Left in, it disposed
         # every one of these a second time and logged that as success,
         # since a 404 counts as disposed (#32).
         wt.write_run_state(run_id, {**state, 'sessions': left})
