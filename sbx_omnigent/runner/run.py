@@ -120,6 +120,7 @@ from sbx_omnigent.runner.paths import (
     chunk_plan_path,
     security_folder,
 )
+from sbx_omnigent.runner.progress import RunProgress
 from sbx_omnigent.runner.prompts.checks import (
     _APPROVED_AS_IS,
     _CHECK_COMPLETE,
@@ -451,6 +452,7 @@ class PipelineRunner:
         gate_egress: tuple[str, ...] | None = None,
     ) -> None:
         self._config = config
+        self._progress = RunProgress()
         self._sc = session_client
         self._wt = worktree_manager
         self._run_id = run_id
@@ -470,8 +472,6 @@ class PipelineRunner:
         #: a resume may skip — deliberately not "has a branch", since a
         #: pre-warmed writer has a branch before it has ever run.
         self._completed: set[str] = set()
-        #: Chunk ids already built AND published.
-        self._completed_chunks: set[str] = set()
         #: Nodes withdrawn because their review never reached consensus
         #: — the blocked review stage and the writer it was vetting. A
         #: forfeited candidate is excluded from judging: comparing a
@@ -564,22 +564,6 @@ class PipelineRunner:
         #: what each one was doing before teardown deletes it.
         self._in_turn: set[str] = set()
         self._bindings: list[dict[str, str]] = []
-        self._last_branch_node: str | None = None
-        #: The approved, consolidated plan of record (planner's final
-        #: output) — shared with builders and committed to the published
-        #: branch at publish. None until a planner node runs.
-        self._plan_of_record: str | None = None
-        #: Ordered build chunks: planner-proposed (flat campaign, see
-        #: :func:`parse_subtasks`) or human-supplied modules (per-module
-        #: mode, ``config.subtasks``). Empty = single pass.
-        self._subtasks: list[pipeline.Subtask] = []
-        #: The chunk currently being built (campaign mode), so the
-        #: builder instructions can scope the turn to it. None = single
-        #: pass / not in a chunk.
-        self._active_subtask: pipeline.Subtask | None = None
-        #: Whether the active chunk is the FIRST one — nothing has been
-        #: built yet, so a turn must not be told to build on prior work.
-        self._active_is_first = False
         #: Node ids pre-warmed during planning — disposed at campaign
         #: start (their un-namespaced VMs are replaced per chunk).
         self._prewarmed: set[str] = set()
@@ -690,7 +674,7 @@ class PipelineRunner:
                     # list, so the WHOLE pipeline (its own planner +
                     # build) loops once per module — each module planned
                     # in-loop against the frozen prior modules.
-                    self._subtasks = list(self._config.subtasks)
+                    self._progress.subtasks = list(self._config.subtasks)
                     self._run_campaign(
                         list(self._config.stages), per_module=True
                     )
@@ -717,7 +701,7 @@ class PipelineRunner:
             run_id=self._run_id,
             status='blocked' if blocked else 'completed',
             published='; '.join(self._publisher.published) or None,
-            final_node=self._last_branch_node,
+            final_node=self._progress.last_branch_node,
             blocked_stage=blocked,
             nodes=dict(self._nodes),
         )
@@ -730,7 +714,7 @@ class PipelineRunner:
         build stages to loop; 0/1 chunks run the single pass unchanged
         (so existing single-increment pipelines are untouched).
         """
-        return len(self._subtasks) >= 2 and bool(build_stages)
+        return len(self._progress.subtasks) >= 2 and bool(build_stages)
 
     def _run_campaign(
         self,
@@ -781,15 +765,14 @@ class PipelineRunner:
         writer_ids = {
             s.id for s in pipeline._iter_stages(loop_stages) if s.write
         }
-        for index, sub in enumerate(self._subtasks):
-            if sub.id in self._completed_chunks:
+        for index, sub in enumerate(self._progress.subtasks):
+            if sub.id in self._progress.completed_chunks:
                 click.echo(
                     f'[resume] skipping chunk [{sub.id}] (already '
                     f'published)'
                 )
                 continue
-            self._active_subtask = sub
-            self._active_is_first = index == 0
+            self._progress.start_module(sub, first=index == 0)
             self._filing.start_module()
             mark = len(self._sessions)
             staged = self._namespace_stages(
@@ -816,7 +799,7 @@ class PipelineRunner:
             # docs/plans/, and before this they were only there if the
             # chunk's PR had already been merged into the base.
             self._wt.alias_node_branch(self._run_id, 'campaign', winner)
-            self._completed_chunks.add(sub.id)
+            self._progress.completed_chunks.add(sub.id)
             # Persist the completion NOW, not at the next stage's end.
             # The next stage is the following module's PLANNER, which
             # blocks on the human — so deferring this leaves a window
@@ -831,8 +814,7 @@ class PipelineRunner:
             # on disk, one line before the reclaim takes them.
             self._sample_disk('chunk-peak')
             self._dispose_chunk_worktrees(staged, winner)
-            self._active_subtask = None
-            self._active_is_first = False
+            self._progress.end_module()
 
     def _load_state(self) -> None:
         """
@@ -850,7 +832,7 @@ class PipelineRunner:
             self._wt.read_run_state(self._run_id), self._run_id
         )
         self._completed = restored.completed
-        self._completed_chunks = restored.completed_chunks
+        self._progress.completed_chunks = restored.completed_chunks
         self._publisher.chunk_publishes = restored.chunk_publishes
         self._reviewed_ok = restored.reviewed_ok
         self._stale_sessions = restored.sessions
@@ -862,16 +844,21 @@ class PipelineRunner:
         self._reviews = restored.reviews
         self._reader_turns = restored.reader_turns
         self._picks = restored.picks
-        self._plan_of_record = restored.plan_of_record
+        self._progress.plan_of_record = restored.plan_of_record
         self._publisher.published = restored.published
-        self._last_branch_node = restored.last_branch_node
-        self._subtasks = restored.subtasks
+        self._progress.last_branch_node = restored.last_branch_node
+        self._progress.subtasks = restored.subtasks
         self._nodes.update(restored.nodes)
         done = len(self._completed)
+        published = len(self._progress.completed_chunks)
         click.echo(
             f'[resume] run {self._run_id}: {done} stage(s) already '
-            f'complete, {len(self._completed_chunks)} chunk(s) published'
-            + (' — plan of record restored' if self._plan_of_record else '')
+            f'complete, {published} chunk(s) published'
+            + (
+                ' — plan of record restored'
+                if self._progress.plan_of_record
+                else ''
+            )
         )
         self._dispose_stale_sessions()
 
@@ -933,12 +920,12 @@ class PipelineRunner:
             state.RunState(
                 run_id=self._run_id,
                 pipeline=self._config.name,
-                plan_of_record=self._plan_of_record,
-                subtasks=self._subtasks,
+                plan_of_record=self._progress.plan_of_record,
+                subtasks=self._progress.subtasks,
                 active_subtask=(
-                    self._active_subtask.id if self._active_subtask else None
+                    self._progress.module_id
                 ),
-                active_is_first=self._active_is_first,
+                active_is_first=self._progress.active_is_first,
                 completed=self._completed,
                 sessions=[
                     s
@@ -950,13 +937,13 @@ class PipelineRunner:
                 dispositions=self._triage.dispositions,
                 blocking_claims=self._triage.blocking_claims,
                 harness_versions=self._harness_versions,
-                completed_chunks=self._completed_chunks,
+                completed_chunks=self._progress.completed_chunks,
                 chunk_publishes=self._publisher.chunk_publishes,
                 reviewed_ok=self._reviewed_ok,
                 reviews=self._reviews,
                 reader_turns=self._reader_turns,
                 picks=self._picks,
-                last_branch_node=self._last_branch_node,
+                last_branch_node=self._progress.last_branch_node,
                 published=self._publisher.published,
                 nodes=self._nodes,
             )
@@ -1142,7 +1129,7 @@ class PipelineRunner:
         :returns: Whether it is safe to free its microVM.
         """
         stage_id = stage.id
-        sub = self._active_subtask
+        sub = self._progress.active_subtask
         if sub is not None and stage_id.startswith(f'{sub.id}-'):
             stage_id = stage_id[len(sub.id) + 1 :]
         return writer_is_terminal(self._config, stage_id)
@@ -1346,7 +1333,7 @@ class PipelineRunner:
         """The node id whose branch this chunk publishes/threads."""
         want = self._config.publish.branch
         node_id = (
-            f'{chunk_id}-{want}' if want else self._last_branch_node
+            f'{chunk_id}-{want}' if want else self._progress.last_branch_node
         )
         node = self._nodes.get(node_id) if node_id else None
         if node is None:
@@ -1365,31 +1352,9 @@ class PipelineRunner:
             first=first,
             plan=plan,
             plan_path=plan_path,
-            prior=self._prior_chunk(),
-            subtasks=self._subtasks,
+            prior=self._progress.prior_module(),
+            subtasks=self._progress.subtasks,
         )
-
-    def _prior_chunk(self) -> str | None:
-        """
-        The chunk that published last before the active one.
-
-        Derived from the chunks that have published rather than
-        remembered, so a resumed campaign finds it too. The module list
-        supplies the order; a set of published ids alone would not
-        (``m10`` sorts before ``m2``).
-
-        :returns: Its id, or ``None`` for the first chunk.
-        """
-        active = self._active_subtask
-        if active is None:
-            return None
-        prior = None
-        for sub in self._subtasks:
-            if sub.id == active.id:
-                break
-            if sub.id in self._completed_chunks:
-                prior = sub.id
-        return prior
 
     def _next_review_round(self, stage_id: str) -> int:
         """
@@ -1645,7 +1610,7 @@ class PipelineRunner:
                 f'reply is in the run directory.'
             )
         record = ReviewRecord(
-            chunk=self._active_subtask.id if self._active_subtask else None,
+            chunk=self._progress.module_id,
             stage=stage_id,
             reviewer=reviewer,
             round_no=round_no,
@@ -1674,14 +1639,14 @@ class PipelineRunner:
 
     def _chunk_reviews(self) -> list[ReviewRecord]:
         """:returns: The votes belonging to the publishing chunk."""
-        chunk = self._active_subtask.id if self._active_subtask else None
+        chunk = self._progress.module_id
         return [r for r in self._reviews if r.chunk == chunk]
 
     def _security_folder_name(self) -> str:
         """The scan reports' folder name, for the record to cite."""
         return PurePosixPath(
             security_folder(
-                chunk_plan_path(self._config, self._active_subtask)
+                chunk_plan_path(self._config, self._progress.active_subtask)
             )
         ).name
 
@@ -1765,11 +1730,7 @@ class PipelineRunner:
                 run_id=self._run_id,
                 event=event,
                 run_dir=self._wt.run_dir(self._run_id),
-                chunk=(
-                    self._active_subtask.id
-                    if self._active_subtask
-                    else None
-                ),
+                chunk=self._progress.module_id,
                 kinds={
                     node: result.kind
                     for node, result in self._nodes.items()
@@ -1827,7 +1788,7 @@ class PipelineRunner:
         :param uncontested: Only one candidate was left; no judge ran.
         """
         pick = JudgePick(
-            chunk=self._active_subtask.id if self._active_subtask else None,
+            chunk=self._progress.module_id,
             stage=stage_id,
             candidates=tuple(candidates),
             selected=selected,
@@ -1860,7 +1821,7 @@ class PipelineRunner:
 
     def _chunk_picks(self) -> list[JudgePick]:
         """This chunk's judge picks (all of them outside a campaign)."""
-        chunk = self._active_subtask.id if self._active_subtask else None
+        chunk = self._progress.module_id
         return [p for p in self._picks if p.chunk == chunk]
 
     def _chunk_plan_of_record(
@@ -1879,19 +1840,19 @@ class PipelineRunner:
             node = self._nodes.get(f'{sub.id}-plan')
             plan = node.output if node else None
             return plan, chunk_plan_path(self._config, sub)
-        plan = self._plan_of_record if first else None
+        plan = self._progress.plan_of_record if first else None
         return plan, chunk_plan_path(self._config, sub)
 
     def _chunk_preamble(self) -> str:
         """A directive scoping a builder turn to the active chunk."""
-        sub = self._active_subtask
+        sub = self._progress.active_subtask
         if sub is None:
             return ''
         # Claiming prior work on the FIRST increment sends an agent
         # hunting for artifacts that cannot exist, and a careful one
         # then (rightly) refuses to build against the missing baseline.
         #
-        # But `_active_is_first` is a POSITION in this run's row list,
+        # But `active_is_first` is a POSITION in this run's row list,
         # not a claim about the tree, and the two came apart the moment
         # a campaign ran against a repo with earlier modules already
         # merged. On `ingestion-m3-1` every m3a agent was told the tree
@@ -1904,7 +1865,7 @@ class PipelineRunner:
             'below has been built yet; do not go looking for their '
             'artifacts. Anything already in your worktree is earlier, '
             'separate work — treat it as frozen and build against it.'
-            if self._active_is_first
+            if self._progress.active_is_first
             else 'Earlier increments are already implemented in your '
             'worktree; later ones come afterwards.'
         )
@@ -1950,10 +1911,10 @@ class PipelineRunner:
             still to come.
         """
         rows = []
-        for other in self._subtasks:
+        for other in self._progress.subtasks:
             if other.id == sub.id:
                 mark = '▶'
-            elif other.id in self._completed_chunks:
+            elif other.id in self._progress.completed_chunks:
                 mark = '✓'
             else:
                 mark = ' '
@@ -2579,7 +2540,7 @@ class PipelineRunner:
         if not is_planner(stage, self._config):
             self._halt_on_reader_dispute(stage)
         if is_planner(stage, self._config):
-            in_module = self._active_subtask is not None
+            in_module = self._progress.active_subtask is not None
             if self._interactive_plan:
                 # The up-front planner posted its questions; the human
                 # replies in the UI while these writer VMs boot, so
@@ -2609,12 +2570,12 @@ class PipelineRunner:
                 # Flat/single-pass: the up-front planner's final output
                 # is THE plan of record (shared with builders, committed
                 # on publish) and carries the ordered chunk list.
-                self._plan_of_record = node.output
-                self._subtasks = parse_subtasks(node.output)
-                if self._subtasks:
-                    ids = ', '.join(s.id for s in self._subtasks)
+                self._progress.plan_of_record = node.output
+                self._progress.subtasks = parse_subtasks(node.output)
+                if self._progress.subtasks:
+                    ids = ', '.join(s.id for s in self._progress.subtasks)
                     click.echo(
-                        f'[plan] {len(self._subtasks)} subtask(s) '
+                        f'[plan] {len(self._progress.subtasks)} subtask(s) '
                         f'proposed: {ids}'
                     )
             else:
@@ -2626,7 +2587,7 @@ class PipelineRunner:
                 # beyond its own module is the decisions it settled that
                 # bind later ones.
                 self._ledger.record_decisions(
-                    self._active_subtask.id if self._active_subtask else None,
+                    self._progress.module_id,
                     node.output,
                 )
 
@@ -2816,7 +2777,7 @@ class PipelineRunner:
             )
         verdict = 'BLOCKING' if blocking else 'APPROVED'
         record = ReviewRecord(
-            chunk=self._active_subtask.id if self._active_subtask else None,
+            chunk=self._progress.module_id,
             stage=stage.id,
             reviewer=stage.run[0],
             round_no=round_no,
@@ -2852,7 +2813,7 @@ class PipelineRunner:
         :returns: A commit id on the run's hub.
         :raises PipelineRunError: If neither resolves.
         """
-        if self._active_subtask is not None:
+        if self._progress.active_subtask is not None:
             tip = self._wt.hub_branch_tip(self._run_id, 'campaign')
             if tip:
                 return tip
@@ -3384,7 +3345,7 @@ class PipelineRunner:
             'reached, NOT summarizing away detail: a shorter document '
             'that dropped a diagram is a worse one.'
         )
-        sub = self._active_subtask
+        sub = self._progress.active_subtask
         if sub is not None:
             # Per-module planner: consolidate THIS module's design only.
             # The module list is human-supplied, so no SUBTASKS block —
@@ -3552,7 +3513,7 @@ class PipelineRunner:
         if stage.tests_only:
             self._enforce_tests_only(stage)
         self._require_implementation(stage)
-        self._last_branch_node = stage.id
+        self._progress.last_branch_node = stage.id
 
     def _drive_writer(
         self, stage: pipeline.PipelineStage, node: NodeResult
@@ -5096,7 +5057,7 @@ class PipelineRunner:
             output=out,
             selected=sel,
         )
-        self._last_branch_node = stage.id
+        self._progress.last_branch_node = stage.id
 
     def _select_uncontested(
         self,
@@ -5135,7 +5096,7 @@ class PipelineRunner:
             branch=self._nodes[selected].branch,
             selected=selected,
         )
-        self._last_branch_node = stage.id
+        self._progress.last_branch_node = stage.id
 
     # ── wiring helpers ────────────────────────────────────────────
 
@@ -6025,7 +5986,7 @@ class PipelineRunner:
         return '\n'.join(
             f'{"▶ " if other.id == sub.id else "  "}'
             f'[{other.id}] {other.title}'
-            for other in self._subtasks
+            for other in self._progress.subtasks
         )
 
     def _planner_instruction(self, stage: pipeline.PipelineStage) -> str:
@@ -6040,12 +6001,12 @@ class PipelineRunner:
         paste cap (:data:`_AGY_PASTE_SAFE_MAX`) so the planner turn
         renders inline instead of collapsing into a placeholder.
         """
-        sub = self._active_subtask
+        sub = self._progress.active_subtask
         if sub is not None:
             # Per-module planner: design THIS module against the frozen
             # prior modules already in the worktree. The task text is
             # the shared brief (context); the module row is the scope.
-            ledger = self._ledger.planner_block(self._subtasks)
+            ledger = self._ledger.planner_block(self._progress.subtasks)
             instr = (
                 'Produce a DESIGN PLAN (prose only — do NOT write code, '
                 'files, or commands; your role prompt has the full '
@@ -6065,7 +6026,7 @@ class PipelineRunner:
                     'work — treat it as a fixed contract, and a '
                     'genuine need to change it is a halt-and-escalate '
                     'to the human, never a silent edit.'
-                    if self._active_is_first
+                    if self._progress.active_is_first
                     else 'The artifacts from prior modules are already '
                     'implemented and FROZEN in your worktree — design '
                     'against them as fixed contracts; a genuine need to '
@@ -6284,7 +6245,7 @@ class PipelineRunner:
         # — a dangling reference is worse than saying nothing.
         later = (
             ', or BELONGING TO A LATER INCREMENT of the plan above'
-            if self._active_subtask is not None
+            if self._progress.active_subtask is not None
             else ''
         )
         return (
@@ -6296,7 +6257,7 @@ class PipelineRunner:
             + _REVIEW_NOT_THE_GATE
             + _REVIEW_NOT_WEIGHTED.format(later=later)
             + self._scope_block()
-            + self._ledger.rulings_block(self._subtasks)
+            + self._ledger.rulings_block(self._progress.subtasks)
             + _FINDINGS_ASK
             + _ENVIRONMENT_ASK
             + self._guarded_block(stage)
@@ -6402,7 +6363,7 @@ class PipelineRunner:
             + _REVIEW_VERIFY
             + _REVIEW_NOT_THE_GATE
             + _REVIEW_NOT_WEIGHTED.format(later='')
-            + self._ledger.rulings_block(self._subtasks)
+            + self._ledger.rulings_block(self._progress.subtasks)
             + _FINDINGS_ASK
             + _ENVIRONMENT_ASK
             + self._guarded_block(stage)
@@ -6448,7 +6409,7 @@ class PipelineRunner:
 
         :returns: The clause, or ``''`` outside a campaign.
         """
-        if self._active_subtask is None:
+        if self._progress.active_subtask is None:
             return ''
         return (
             ' Weigh also WHETHER EACH STAYED INSIDE THE MARKED '
@@ -6476,7 +6437,7 @@ class PipelineRunner:
 
         :returns: The paragraph, or ``''`` outside a campaign.
         """
-        if self._active_subtask is None:
+        if self._progress.active_subtask is None:
             return ''
         return (
             'One finding may be answered instead of fixed, and only this '
@@ -6508,7 +6469,7 @@ class PipelineRunner:
 
         :returns: The paragraph, or ``''`` outside a campaign.
         """
-        if self._active_subtask is None:
+        if self._progress.active_subtask is None:
             return ''
         return (
             '\n\nScope is part of the contract, and it cuts both ways. '
@@ -6670,7 +6631,7 @@ class PipelineRunner:
         want = self._config.publish.branch
         if want is not None:
             return want
-        return self._last_branch_node
+        return self._progress.last_branch_node
 
     def _publish(self) -> str | None:
         if self._config.publish.mode == 'none':
@@ -6689,8 +6650,8 @@ class PipelineRunner:
             return None
         return self._publisher.publish_run(
             branch_node,
-            plan=self._plan_of_record,
-            module=self._active_subtask,
+            plan=self._progress.plan_of_record,
+            module=self._progress.active_subtask,
         )
 
     def _teardown(self, *, preserve_run: bool = False) -> None:
