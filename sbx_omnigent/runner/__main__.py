@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from sbx_omnigent.runner.run import main
+from sbx_omnigent.runner.cli import main
 
 if __name__ == '__main__':
     main()

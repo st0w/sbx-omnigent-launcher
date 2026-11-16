@@ -34,7 +34,7 @@ omni-sbx = "sbx_omnigent.entrypoint:main"
 omni-sbx-swarm = "sbx_omnigent.swarm:main"
 omni-sbx-worktrees = "sbx_omnigent.worktrees:main"
 # Fire a declarative pipeline.yaml to completion (the DAG runner).
-omni-sbx-pipeline = "sbx_omnigent.runner.run:main"
+omni-sbx-pipeline = "sbx_omnigent.runner.cli:main"
 # The Antigravity (agy) token harvester: bootstrap the trusted auth-agy box
 # and run the always-on refresh loop that keeps the wire-swap secret fresh.
 omni-sbx-agy = "sbx_omnigent.agy:main"
@@ -46,6 +46,7 @@ packages = [
     "sbx_omnigent",
     "sbx_omnigent.runner",
     "sbx_omnigent.runner.parsing",
+    "sbx_omnigent.runner.preflight",
     "sbx_omnigent.runner.prompts",
     "sbx_omnigent.runner.records",
     "sbx_omnigent.runner.render",

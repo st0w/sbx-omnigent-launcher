@@ -12,6 +12,7 @@ Run: .venv/bin/python -m unittest tests.test_packaging
 from __future__ import annotations
 
 import ast
+import importlib
 import re
 import sys
 import tomllib
@@ -87,6 +88,27 @@ class TestEveryPackageShips(unittest.TestCase):
         )
         self.assertIn('sbx_omnigent.runner', found)
         self.assertEqual(sorted(listed), found)
+
+
+class TestEveryCommandResolves(unittest.TestCase):
+    """Each ``[project.scripts]`` target names a callable that exists.
+
+    Moving a command's function leaves a stale ``module:function``
+    target that nothing else checks: the editable install keeps the
+    old script until it is reinstalled, and only then does the command
+    fail."""
+
+    def test_every_script_target_is_a_callable(self) -> None:
+        config = tomllib.loads(
+            (_ROOT / 'pyproject.toml').read_text(encoding='utf-8')
+        )
+        scripts = config['project']['scripts']
+        self.assertIn('omni-sbx-pipeline', scripts)
+        for name, target in scripts.items():
+            with self.subTest(script=name):
+                module_name, _, attr = target.partition(':')
+                module = importlib.import_module(module_name)
+                self.assertTrue(callable(getattr(module, attr, None)))
 
 
 if __name__ == '__main__':

@@ -180,8 +180,8 @@ class Subtask:
     One ordered build increment (a campaign chunk / module).
 
     Either proposed by the planner (flat campaign — see
-    :func:`sbx_omnigent.runner.run.parse_subtasks`) or supplied by
-    the human in the config's ``subtasks:`` / ``subtask_file:``.
+    :func:`sbx_omnigent.runner.parsing.plans.parse_subtasks`) or
+    given by the human in ``subtasks:`` / ``subtask_file:``.
 
     :param id: Sanitized, unique chunk id used to namespace the chunk's
         node branches/worktrees (e.g. ``m0`` → ``pl/<run>/m0-tests``).
@@ -268,7 +268,7 @@ class DiskSpec:
         clone plus whatever the agent builds inside it. Reader, judge,
         and reviewer worktrees are checkouts with no build output and
         are not counted (see
-        :func:`sbx_omnigent.runner.run.writer_worktrees`).
+        :func:`sbx_omnigent.runner.preflight.disk.writer_worktrees`).
     :param headroom_gb: Space left for the host itself.
     """
 
