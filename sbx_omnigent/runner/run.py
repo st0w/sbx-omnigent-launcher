@@ -49,8 +49,6 @@ from sbx_omnigent import (
     claude,
     codex,
     disk_metrics,
-    guest_log,
-    harness_versions,
     orphans,
     pane,
     pipeline,
@@ -60,6 +58,7 @@ from sbx_omnigent import (
 from sbx_omnigent.launch_args import launch_args_for
 from sbx_omnigent.runner import state
 from sbx_omnigent.runner.campaign import Campaign, CampaignHooks
+from sbx_omnigent.runner.captures import TurnCapture
 from sbx_omnigent.runner.context import RunContext
 from sbx_omnigent.runner.errors import (
     LostTurn,
@@ -67,8 +66,15 @@ from sbx_omnigent.runner.errors import (
     RunInterrupted,
     _Blocked,
 )
+from sbx_omnigent.runner.failure_notes import (
+    FailureNotes,
+    lost_not_failed,
+    session_failure_note,
+    turn_was_lost,
+)
 from sbx_omnigent.runner.filing import FindingFiler
 from sbx_omnigent.runner.gate import VerifyGate
+from sbx_omnigent.runner.harness_record import HarnessRecord
 from sbx_omnigent.runner.ledger import DecisionLedger
 from sbx_omnigent.runner.limits import (
     _DEFAULT_MAX_ROUNDS,
@@ -165,11 +171,9 @@ from sbx_omnigent.runner.records.reviews import (
 from sbx_omnigent.runner.render.pr_body import (
     environment_by_stage,
 )
-from sbx_omnigent.runner.render.sessions import (
-    render_turn_capture,
-)
 from sbx_omnigent.runner.repo_records import RepoRecords
 from sbx_omnigent.runner.review_book import ReviewBook
+from sbx_omnigent.runner.sandboxes import sandbox_for
 from sbx_omnigent.runner.security_records import SecurityRecords
 from sbx_omnigent.runner.session_registry import SessionRegistry
 from sbx_omnigent.runner.stage_kinds import (
@@ -187,8 +191,6 @@ from sbx_omnigent.swarm_session import (
     SwarmRunnerUnavailable,
     SwarmSessionClient,
     SwarmSessionError,
-    SwarmTurnTimeout,
-    looks_like_rate_limit,
 )
 from sbx_omnigent.worktrees import (
     WorktreeManager,
@@ -198,91 +200,6 @@ from sbx_omnigent.worktrees import (
 #: never pasted). Added to the clone's ``.git/info/exclude`` so it is
 #: neither committed nor seen by the settle-wait's ``git status``.
 _AGY_TASK_FILE = 'OMNI_TASK.md'
-
-
-def _recorded_version(entry: dict[str, object], cli: str) -> str | None:
-    """
-    The version of *cli* in one recorded harness-versions entry.
-
-    :param entry: ``{'runs': cli, 'versions': {cli: version}}``.
-    :param cli: The CLI to look up.
-    :returns: Its version, or ``None`` when the entry has none.
-    """
-    versions = entry.get('versions')
-    if not isinstance(versions, dict):
-        return None
-    version = versions.get(cli)
-    return version if isinstance(version, str) else None
-
-
-def _session_failure_note(snap: dict | None) -> str:
-    """
-    What the SESSION says about a turn that gave no reason.
-
-    A failed turn arrives as a status edge carrying no error, which the
-    runner then reports verbatim as ``failed: None`` — the least useful
-    sentence it can produce. The session itself is still readable at
-    that moment and carries three fields nobody consulted:
-    ``last_task_error`` (read only by the swarm CLI), ``runner_online``
-    (read nowhere at all), and ``sandbox_status``.
-
-    Reading them turns "failed: None" into a sentence, and separates the
-    two cases that matter: the AGENT failed, or its runner went away
-    underneath it.
-
-    :param snap: The session snapshot, or ``None`` when unreadable.
-    :returns: A note to append to the error, or ``''``.
-    """
-    if snap is None:
-        return ' (the session could not be read for a reason)'
-    bits: list[str] = []
-    err = snap.get('last_task_error')
-    if isinstance(err, str) and err.strip():
-        bits.append(f'last_task_error={err.strip()[:300]}')
-    if snap.get('runner_online') is False:
-        bits.append(
-            'its RUNNER IS OFFLINE — the turn did not fail so much '
-            'as lose the process running it'
-        )
-    sandbox = snap.get('sandbox_status')
-    if isinstance(sandbox, str) and sandbox:
-        bits.append(f'sandbox={sandbox}')
-    return f' ({"; ".join(bits)})' if bits else ''
-
-
-def _turn_was_lost(error: str | None, snap: dict | None) -> bool:
-    """
-    Whether a failed turn was lost rather than failed by its agent.
-
-    Lost means the runner under the turn went offline, or neither the
-    turn nor the session gives any error. An unreadable session with no
-    error on the turn reads as lost: "failed: None" is exactly the state
-    a retry is for, and the retry costs one turn.
-
-    :param error: The failed turn's error, if any.
-    :param snap: The session snapshot, or ``None`` when unreadable.
-    :returns: Whether the turn was lost.
-    """
-    snap = snap or {}
-    if snap.get('runner_online') is False:
-        return True
-    reported = snap.get('last_task_error')
-    return not (error and error.strip()) and not (
-        isinstance(reported, str) and reported.strip()
-    )
-
-
-def _lost_not_failed(exc: Exception) -> bool:
-    """
-    Whether a writer's failed turn is one worth a second attempt.
-
-    :param exc: What the turn raised.
-    :returns: ``True`` for a lost turn or a turn that never came back,
-        ``False`` for an agent error or a turn that ran out of time.
-    """
-    if isinstance(exc, SwarmSessionError):
-        return not isinstance(exc, SwarmTurnTimeout)
-    return isinstance(exc, LostTurn)
 
 
 class PipelineRunner:
@@ -356,14 +273,6 @@ class PipelineRunner:
         #: Each withdrawn candidate's ``(review stage, rounds)``, so the
         #: selection records the reduced field it was made from (#47).
         self._forfeits: dict[str, tuple[str, int]] = {}
-        #: Harness CLI versions each session's VM had installed, by
-        #: session label: ``{'runs': cli, 'versions': {cli: version}}``.
-        #: Persisted, so a wedged run can still be compared with the
-        #: known-good set after its VMs are gone (#17).
-        self._harness_versions: dict[str, dict[str, object]] = {}
-        #: CLIs already reported as off the known-good set, THIS
-        #: PROCESS: once per CLI, not once per session.
-        self._known_good_reported: set[str] = set()
         #: Writer nodes whose review stage reached APPROVED consensus.
         #: Read by :meth:`_all_reviewed` so a judge can be told its
         #: candidates are already verified and need not be re-built.
@@ -421,6 +330,15 @@ class PipelineRunner:
         )
         self._book = ReviewBook(
             self._ctx, progress=self._progress, save_state=self._save_state
+        )
+        self._harness = HarnessRecord(
+            self._ctx, registry=self._registry, save_state=self._save_state
+        )
+        self._capture = TurnCapture(
+            self._ctx, registry=self._registry, harness=self._harness
+        )
+        self._notes = FailureNotes(
+            self._ctx, registry=self._registry, keep=keep
         )
         self._ledger = DecisionLedger(self._ctx)
         self._policy = WriterPolicy(
@@ -581,7 +499,7 @@ class PipelineRunner:
         self._ledger.referrals = restored.referrals
         self._triage.dispositions = restored.dispositions
         self._triage.blocking_claims = restored.blocking_claims
-        self._harness_versions = restored.harness_versions
+        self._harness.recorded = restored.harness_versions
         self._book.reviews = restored.reviews
         self._reader_turns = restored.reader_turns
         self._book.picks = restored.picks
@@ -673,7 +591,7 @@ class PipelineRunner:
                 referrals=self._ledger.referrals,
                 dispositions=self._triage.dispositions,
                 blocking_claims=self._triage.blocking_claims,
-                harness_versions=self._harness_versions,
+                harness_versions=self._harness.recorded,
                 completed_chunks=self._progress.completed_chunks,
                 chunk_publishes=self._publisher.chunk_publishes,
                 reviewed_ok=self._reviewed_ok,
@@ -933,164 +851,6 @@ class PipelineRunner:
                 f'and --resume can try again.'
             )
         self._save_state()
-
-    def _sandbox_for_session(self, session: str) -> str | None:
-        """
-        The microVM name backing *session*, or ``None``.
-
-        A session names only its HOST; the sandbox is named after that
-        host, so this is two reads: the session for its ``host_id``, and
-        the host list for the name the launcher gave it. Deliberately
-        NOT derived from the id by string surgery — the naming rule is
-        the server's, and a convention baked in here would rot silently.
-
-        Best-effort to the point of catching everything short of a
-        KeyboardInterrupt. This runs only when a turn has ALREADY
-        failed, so the one outcome that must be impossible is this
-        lookup turning a diagnosable failure into a different one —
-        and the ways it can go wrong are open-ended: an older server
-        with no ``/v1/hosts``, a response shape that changed, an
-        injected client that does not
-        implement these reads at all. Every one of them means the same
-        thing to the caller: no pane. ``KeyboardInterrupt`` is not an
-        ``Exception`` and still gets out, matching
-        :meth:`_capture_turn` — a second Ctrl-C means now.
-
-        :param session: The session to locate.
-        :returns: The sandbox name, e.g. ``"managed-cb683c32"``.
-        """
-        try:
-            host = self._sc.session_host_id(session)
-            return self._sc.host_name(host) if host else None
-        except Exception:
-            return None
-
-    def _capture_pane(self, session: str, artifact: str) -> str | None:
-        """
-        Write the session's TUI pane beside its transcript.
-
-        The transcript is empty in exactly the case this exists for — a
-        harness blocked on a keystroke never produces a message — so the
-        pane is often the ONLY evidence. See :mod:`sbx_omnigent.pane`.
-
-        :param session: The session whose VM to read.
-        :param artifact: Repo-relative path of the transcript artifact,
-            used to derive the pane's own name.
-        :returns: The pane artifact's path, or ``None`` if none written.
-        """
-        sandbox = self._sandbox_for_session(session)
-        if sandbox is None:
-            return None
-        # Read before the pane, and kept even when there is no pane: a
-        # failed turn is the one whose versions matter most (#17).
-        versions = self._read_harness_versions(sandbox)
-        self._note_harness_versions(session, versions)
-        # capture_pane never raises by contract. Guarded anyway: this
-        # runs while a turn is already failing, and a regression in the
-        # diagnostic must not replace the failure it was diagnosing.
-        try:
-            text = pane.capture_pane(sandbox)
-        except Exception:
-            return None
-        if not text:
-            return None
-        path = artifact.removesuffix('.md') + '.pane.txt'
-        header = (
-            f'# TUI pane — {sandbox}\n'
-            f'# Captured because the turn did not report. A native '
-            f'harness blocked on a keystroke goes silent on every other '
-            f'channel, so this screen is usually the whole diagnosis.\n'
-            "# Nothing was typed into it — answering on the "
-            "human's behalf is not this tool's job.\n"
-            f'# Harness CLIs installed in this VM now: '
-            f'{harness_versions.format_versions(versions)}\n'
-        )
-        if harness_versions.pending_self_update(text):
-            header += (
-                '# The pane shows an installed update waiting on a '
-                'restart, so the process running here is older than '
-                'the version above.\n'
-            )
-        header += '\n'
-        # If the screen is a modal picker, SAY so. The failure a human
-        # otherwise sees describes the paste mechanism and buries the
-        # thing to do, with the picker dumped raw at the end of a
-        # RuntimeError. They are watching this console; they may never
-        # open the failed message bubble.
-        label = self._registry.label_of(session)
-        prompt = pane.modal_prompt(text)
-        if prompt is not None:
-            guidance = pane.blocked_on_prompt_message(label, prompt)
-            click.echo(f'[blocked] {guidance}')
-            header += (
-                '# THIS IS A MODAL PROMPT. A typed turn cannot answer '
-                'it — open the pane and choose there.\n\n'
-            )
-        if self._wt.write_run_artifact(self._run_id, path, header + text):
-            return path
-        return None
-
-    def _capture_turn(
-        self, session: str, reason: str, *, with_pane: bool = False
-    ) -> str | None:
-        """
-        Write a session's transcript to the run dir, best-effort.
-
-        Called at the moments the record is about to be lost: a turn
-        that failed or timed out (teardown is seconds away), a turn or
-        a planning session interrupted with Ctrl-C, and every loop-back
-        fix turn (its session is disposed at publish, and that turn is
-        the one a human most wants to read afterwards).
-
-        Never raises — a diagnostic that can fail a run is worse than
-        no diagnostic — but it deliberately does NOT swallow a
-        :exc:`KeyboardInterrupt`. Someone pressing Ctrl-C a second time
-        wants out now, not one more bounded HTTP read.
-
-        :param session: The session to read.
-        :param reason: Why it is being captured.
-        :param with_pane: Also capture the harness's TUI pane. Set on
-            the paths where the turn did NOT report — a timeout, a
-            failure, an interrupt — because that is exactly when the
-            transcript is empty and the screen is the only evidence.
-            Left off for routine captures so a healthy run does not pay
-            an ``sbx exec`` round-trip per review round.
-        :returns: The pane artifact's path when one was written, so the
-            caller can name it in the error a human will actually read.
-        """
-        label = self._registry.label_of(session)
-        try:
-            turns = self._sc.read_transcript(session)
-        except SwarmSessionError:
-            turns = []
-        seen = self._registry.captures.get(label, 0) + 1
-        self._registry.captures[label] = seen
-        suffix = '' if seen == 1 else f'-{seen}'
-        artifact = f'turns/{label}{suffix}.md'
-        # Transcript FIRST, so the guarantee this method already made is
-        # never traded for the new one: if the pane read is interrupted
-        # or hangs, the conversation is already on disk.
-        if self._wt.write_run_artifact(
-            self._run_id,
-            artifact,
-            render_turn_capture(
-                turns, title=f'Turn — {label}', reason=reason
-            ),
-        ):
-            click.echo(
-                f'[capture] wrote {label}{suffix} to the run directory '
-                f'({len(turns)} message(s)): {reason}'
-            )
-        if not with_pane:
-            return None
-        pane_path = self._capture_pane(session, artifact)
-        if pane_path is not None:
-            click.echo(
-                f'[capture] wrote the {label} TUI pane to {pane_path} — '
-                f'read it FIRST: a harness blocked on a keystroke '
-                f'reports nothing anywhere else.'
-            )
-        return pane_path
 
     def _security_folder_name(self) -> str:
         """The scan reports' folder name, for the record to cite."""
@@ -1363,7 +1123,7 @@ class PipelineRunner:
                 f'the turns still running.',
                 err=True,
             )
-            self._capture_interrupted_turns()
+            self._capture.interrupted()
             raise
         finally:
             pool.shutdown(wait=not interrupted, cancel_futures=interrupted)
@@ -1415,21 +1175,6 @@ class PipelineRunner:
                 f'work ({exc}); using the reply as it stands.'
             )
             return reply
-
-    def _capture_interrupted_turns(self) -> None:
-        """
-        Keep the record of every turn still running at Ctrl-C.
-
-        The workers driving them never see the interrupt, so their own
-        capture never runs, and teardown is about to delete the
-        sessions. A second Ctrl-C stops this too.
-        """
-        with self._lock:
-            running = sorted(self._registry.in_turn)
-        for session in running:
-            self._capture_turn(
-                session, 'interrupted (Ctrl-C) mid-turn', with_pane=True
-            )
 
     def _refuse_if_interrupted(self, label: str) -> None:
         """
@@ -2089,7 +1834,7 @@ class PipelineRunner:
             )
             report = security_scan.collect_report(worktree)
             if report is None:
-                self._capture_turn(session, 'the scan wrote no report')
+                self._capture.turn(session, 'the scan wrote no report')
             return report
         finally:
             self._free_session(
@@ -2382,7 +2127,7 @@ class PipelineRunner:
             # tens of minutes, and the plan reaches the run state only
             # once the stage COMPLETES — so interrupting here destroys
             # every question, answer and draft with the session.
-            self._capture_turn(
+            self._capture.turn(
                 session, 'interrupted (Ctrl-C) awaiting plan approval'
             )
             raise
@@ -2391,7 +2136,7 @@ class PipelineRunner:
             # after a long silence, and that path used to propagate
             # straight past the capture above — the one handler written
             # precisely to stop this session being thrown away.
-            self._capture_turn(
+            self._capture.turn(
                 session, 'timed out awaiting plan approval'
             )
             raise
@@ -2577,7 +2322,7 @@ class PipelineRunner:
         """
         if check_finished(out):
             return
-        self._capture_turn(session, 'did not finish its check')
+        self._capture.turn(session, 'did not finish its check')
         raise PipelineRunError(
             f'{stage.id}: the contract check did not finish. Neither its '
             f'reply nor the one it was asked for ends with a line reading '
@@ -2916,7 +2661,7 @@ class PipelineRunner:
                     attempt += 1
                     exhausted = (
                         attempt == _WRITER_TURN_ATTEMPTS
-                        or not _lost_not_failed(exc)
+                        or not lost_not_failed(exc)
                     )
                 if exhausted or not self._free_session(
                     node.session,
@@ -2985,7 +2730,7 @@ class PipelineRunner:
         """
         if parse_disputes(out) or work_finished(out):
             return
-        self._capture_turn(session, 'did not finish its turn')
+        self._capture.turn(session, 'did not finish its turn')
         self._commit_partial(stage_id)
         raise PipelineRunError(
             f'{stage_id}: the writer did not finish its turn. Neither its '
@@ -3097,7 +2842,7 @@ class PipelineRunner:
         # Kept even on success: this session is disposed at publish, and
         # what a writer did with a reviewer's findings is exactly what
         # someone reading the pull request later wants to see.
-        self._capture_turn(node.session, 'loop-back fix turn')
+        self._capture.turn(node.session, 'loop-back fix turn')
         self._wt.wait_for_node_settle(self._run_id, stage_id)
         self._halt_on_unfinished_writer(stage_id, node.session, node.output)
         self._commit(
@@ -3602,7 +3347,7 @@ class PipelineRunner:
         # complete under the binding constraints" and no way to learn
         # why.
         if node is not None and node.session:
-            self._capture_turn(node.session, captured_as)
+            self._capture.turn(node.session, captured_as)
         return claims
 
     def _halt_on_dispute(
@@ -3978,7 +3723,7 @@ class PipelineRunner:
             # so nothing is lost by stopping, and a human choosing
             # between two reviewed branches is a minute's work. A silent
             # default is the expensive outcome, not the stop.
-            self._capture_turn(
+            self._capture.turn(
                 session, 'the judge never stated a SELECT line'
             )
             click.echo(
@@ -4198,7 +3943,7 @@ class PipelineRunner:
         if agent is None:
             return
         label = self._registry.label_of(session)
-        sandbox = self._sandbox_for_session(session)
+        sandbox = sandbox_for(self._sc, session)
         if sandbox is None:
             return
         # capture_pane never raises by contract. Guarded anyway: this
@@ -4220,142 +3965,6 @@ class PipelineRunner:
             permission_mode=mode,
         ):
             click.echo(f'[launch] {label}: {why}')
-
-    def _read_harness_versions(self, sandbox: str) -> dict[str, str]:
-        """
-        Read *sandbox*'s harness CLI versions; never raises.
-
-        :param sandbox: The microVM name.
-        :returns: ``{cli: version}``, empty when nothing could be read.
-        """
-        # read_versions never raises by contract. Guarded anyway: the
-        # record is for later comparison, and must never fail a run.
-        try:
-            return harness_versions.read_versions(sandbox)
-        except Exception:
-            return {}
-
-    def _record_harness_versions(self, session: str) -> None:
-        """
-        Record the CLI versions in *session*'s VM after its first turn.
-
-        One ``sbx exec`` per session; see
-        :meth:`_note_harness_versions`.
-
-        :param session: The session whose first turn just completed.
-        """
-        sandbox = self._sandbox_for_session(session)
-        if sandbox is None:
-            return
-        self._note_harness_versions(
-            session, self._read_harness_versions(sandbox)
-        )
-
-    def _note_harness_versions(
-        self, session: str, versions: dict[str, str]
-    ) -> None:
-        """
-        Keep *session*'s versions and say when one has moved.
-
-        Only the CLI the session drives is compared, against:
-
-        * the version this session recorded at its first turn, when it
-          has one: the CLI updated itself mid-session;
-        * otherwise an earlier session in this run driving the same CLI,
-          including an earlier session of this same node: a retry's
-          dead VM, or the previous attempt a resume restored;
-        * the known-good set, once per CLI per process.
-
-        Readings are kept per node, so a node's new session replaces its
-        earlier one's. Each carries the session it came from, in memory
-        only: a resume restores readings that belong to no live session,
-        and comparing a new VM with one of those as "its first turn"
-        called a pinned VM a mid-session self-update.
-
-        WARNS, never raises, and the first reading for a session is the
-        one kept.
-
-        :param session: The session the versions were read from.
-        :param versions: ``{cli: version}`` from its VM.
-        """
-        agent = self._registry.agents.get(session)
-        if agent is None or not versions:
-            return
-        label = self._registry.label_of(session)
-        cli = harness_versions.cli_for_harness(agent.harness)
-        with self._lock:
-            recorded = self._harness_versions.get(label)
-            first = (
-                recorded
-                if recorded is not None
-                and recorded.get('session') == session
-                else None
-            )
-            warnings = self._version_warnings(
-                label, cli, versions.get(cli), first
-            )
-            if first is None:
-                self._harness_versions[label] = {
-                    'runs': cli,
-                    'versions': dict(versions),
-                    'session': session,
-                }
-        for warning in warnings:
-            click.echo(f'[versions] {warning}')
-        if first is None:
-            self._save_state()
-
-    def _version_warnings(
-        self,
-        label: str,
-        cli: str,
-        now: str | None,
-        first: dict[str, object] | None,
-    ) -> list[str]:
-        """
-        What to say about *cli* at version *now* on *label*.
-
-        Called under ``self._lock``.
-
-        :param label: The session's label.
-        :param cli: The CLI the session drives.
-        :param now: Its version as just read, or ``None``.
-        :param first: The session's own earlier record, if any.
-        :returns: The warnings, possibly none.
-        """
-        if now is None:
-            return []
-        if first is not None:
-            before = _recorded_version(first, cli)
-            if before is None or before == now:
-                return []
-            return [
-                f'{label}: {cli} {now} is installed now, but it ran '
-                f'{before} at its first turn. It updated itself '
-                f'mid-session.'
-            ]
-        warnings: list[str] = []
-        for other, entry in self._harness_versions.items():
-            before = _recorded_version(entry, cli)
-            if entry.get('runs') == cli and before not in (None, now):
-                ran = (
-                    f'an earlier session of {label}' if other == label
-                    else other
-                )
-                warnings.append(
-                    f'{label}: {cli} {now}, but {ran} ran {before} '
-                    f'earlier in this run.'
-                )
-                break
-        known = harness_versions.KNOWN_GOOD.get(cli)
-        if known not in (None, now) and cli not in self._known_good_reported:
-            self._known_good_reported.add(cli)
-            warnings.append(
-                f'{cli} {now} is not the known-good {known} recorded '
-                f'{harness_versions.KNOWN_GOOD_RECORDED}. If this run '
-                f'misbehaves, compare against docs/HARNESS-VERSIONS.md.'
-            )
-        return warnings
 
     def _create_session(
         self,
@@ -4487,7 +4096,7 @@ class PipelineRunner:
             # The turn never came back. Teardown is seconds away and
             # will delete this session, so capture NOW or the only
             # evidence is the timeout line itself.
-            self._capture_turn(
+            self._capture.turn(
                 session,
                 f'the turn did not return: {exc}',
                 with_pane=True,
@@ -4501,7 +4110,7 @@ class PipelineRunner:
             # toolchain, built the workspace and launched the suite was
             # interrupted, and its transcript had to be pulled out of
             # the API by hand before teardown deleted it.
-            self._capture_turn(
+            self._capture.turn(
                 session,
                 'interrupted (Ctrl-C) mid-turn',
                 with_pane=True,
@@ -4517,7 +4126,7 @@ class PipelineRunner:
             # never fire (observed — it read an empty pane every time).
             # One turn late still beats stage 6 of 8, and costs no wait.
             self._verify_launch(session)
-            self._record_harness_versions(session)
+            self._harness.record_first_turn(session)
         api_error = claude.api_error_reply(result.reply) if result.ok else None
         if api_error is not None:
             # The reply is Claude Code's refusal, not work. It can come
@@ -4525,18 +4134,18 @@ class PipelineRunner:
             # read here rather than trusted to that race.
             result = replace(result, status='failed', error=api_error)
         if not result.ok:
-            snap = self._session_snapshot(session)
-            note = _session_failure_note(snap) + claude.version_hint(
+            snap = self._notes.snapshot(session)
+            note = session_failure_note(snap) + claude.version_hint(
                 result.error
             )
-            auth = self._auth_failure_note(session, result.error, snap)
+            auth = self._notes.auth(session, result.error, snap)
             # A rejected credential is the more specific reading, so a
             # rate-limit note is only added when there is none.
-            limit = '' if auth else self._rate_limit_note(
+            limit = '' if auth else self._notes.rate_limit(
                 session, result.error, snap
             )
             note += limit
-            pane_path = self._capture_turn(
+            pane_path = self._capture.turn(
                 session,
                 f'the turn failed: {result.error}{note}{auth}',
                 with_pane=True,
@@ -4551,12 +4160,12 @@ class PipelineRunner:
             # returned nothing silently reproduced it.
             where = (
                 f' — see {pane_path}' if pane_path
-                else self._no_pane_note(session)
+                else self._notes.no_pane(session)
             )
             # A rejected credential is not a lost turn: retrying it on a
             # fresh VM would only fail the same way.
             error = (
-                LostTurn if not auth and _turn_was_lost(result.error, snap)
+                LostTurn if not auth and turn_was_lost(result.error, snap)
                 else PipelineRunError
             )
             raise error(
@@ -4564,136 +4173,6 @@ class PipelineRunner:
                 f'{result.error}{note}{auth}{where}'
             )
         return result.reply
-
-    def _auth_failure_note(
-        self, session: str, error: str | None, snap: dict | None
-    ) -> str:
-        """
-        Name the rejected credential behind a failed turn, if any.
-
-        A dead credential fails as a harness that never starts (#26).
-        Where the reason shows up depends on the harness:
-
-        * Claude: Claude Code fires ``StopFailure`` and Omnigent makes
-          its "Failed to authenticate. API Error: 401 ..." the turn's
-          error, and the session's ``last_task_error``. Checked first,
-          since it costs nothing.
-        * Codex: only the runner log inside the VM held the ``401`` on
-          2026-09-14, so that is read next, with one bounded
-          ``sbx exec``.
-
-        Best-effort like the pane capture: it runs while a turn is
-        already failing, so any error here yields no note rather than a
-        different failure. ``KeyboardInterrupt`` still gets out.
-
-        :param session: The session whose turn just failed.
-        :param error: The failed turn's error, if any.
-        :param snap: The session snapshot, or ``None`` if unreadable.
-        :returns: A parenthesised note for the failure message, or
-            ``''``.
-        """
-        reported = (snap or {}).get('last_task_error')
-        phrase = guest_log.auth_failure(error)
-        where = "the turn's error"
-        if phrase is None and isinstance(reported, str):
-            phrase = guest_log.auth_failure(reported)
-            where = "the session's last error"
-        if phrase is None:
-            sandbox = self._sandbox_for_session(session)
-            if sandbox is None:
-                return ''
-            try:
-                phrase = guest_log.auth_failure(
-                    guest_log.read_runner_log(sandbox)
-                )
-            except Exception:
-                return ''
-            if phrase is None:
-                return ''
-            where = f'the runner log in {sandbox}'
-        agent = self._registry.agents.get(session)
-        harness = agent.harness if agent is not None else ''
-        return (
-            f' ({where} shows an authentication failure, "{phrase}": '
-            f'the credential this agent runs on was rejected. To renew '
-            f'it, {guest_log.relogin_hint(harness)})'
-        )
-
-    def _rate_limit_note(
-        self, session: str, error: str | None, snap: dict | None
-    ) -> str:
-        """
-        Say so when a failed turn reads like a usage or rate limit.
-
-        Only the swarm CLI used to check, so a throttled pipeline turn
-        read exactly like a failed one, and nothing said which account's
-        limit it was (#35). Reads the turn's error and the session's
-        ``last_task_error`` only: the agent's reply and its pane hold
-        the task itself, where "quota" or "capacity" can be the subject.
-        A hint, not a verdict: a turn with error text is already treated
-        as the agent's failure and not retried.
-
-        :param session: The session whose turn just failed.
-        :param error: The failed turn's error, if any.
-        :param snap: The session snapshot, or ``None`` if unreadable.
-        :returns: A parenthesised note for the failure message, or
-            ``''``.
-        """
-        reported = (snap or {}).get('last_task_error')
-        if not looks_like_rate_limit(
-            error, reported if isinstance(reported, str) else None
-        ):
-            return ''
-        agent = self._registry.agents.get(session)
-        harness = agent.harness if agent is not None else ''
-        return (
-            f' (this reads like a usage or rate limit, not a defect in '
-            f'the work: {guest_log.usage_limit_hint(harness)}, then '
-            f'resume the run with --resume)'
-        )
-
-    def _no_pane_note(self, session: str) -> str:
-        """
-        Why a failed turn has no pane, and where its real error is.
-
-        This used to say "the sandbox was already gone" whenever no pane
-        came back. Seen live twice with the VM running: the terminal had
-        never started (tmux refused its launch command), so there was no
-        pane to read. The harness logs the reason inside the VM, and the
-        message has to point there.
-
-        :param session: The session whose turn failed.
-        :returns: A parenthesised note for the failure message.
-        """
-        sandbox = self._sandbox_for_session(session)
-        if sandbox is None:
-            return (
-                " (no pane captured — the session's VM could not be "
-                'located)'
-            )
-        kept = (
-            'This run keeps its VMs (--keep), so the VM is still there.'
-            if self._keep
-            else 'Teardown removes the VM, so re-run with --keep to read it.'
-        )
-        return (
-            f' (no pane captured from {sandbox}: most often the harness '
-            f'terminal never started. Its own error is in the runner log '
-            f"inside the VM: sbx exec {sandbox} -- sh -lc 'tail -120 "
-            f"~/.omnigent/logs/runner/runner-*.log'. {kept})"
-        )
-
-    def _session_snapshot(self, session: str) -> dict | None:
-        """
-        The session's state after a failed turn, or ``None``.
-
-        :param session: The session whose turn just failed.
-        :returns: The snapshot, or ``None`` when it could not be read.
-        """
-        try:
-            return self._sc.get_status(session)
-        except SwarmSessionError:
-            return None
 
     def _require_fresh_swap(self, session: str) -> None:
         """

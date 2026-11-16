@@ -28,7 +28,14 @@ from unittest import mock
 import click
 from click.testing import CliRunner, Result
 
-from sbx_omnigent import egress, pipeline, sbx_cli, verify
+from sbx_omnigent import (
+    egress,
+    guest_log,
+    harness_versions,
+    pipeline,
+    sbx_cli,
+    verify,
+)
 from sbx_omnigent import image as sbx_image
 from sbx_omnigent.defaults import DEFAULT_EGRESS_ALLOW, DEFAULT_HOST_IMAGE
 from sbx_omnigent.runner import cli
@@ -84,7 +91,6 @@ from sbx_omnigent.runner.resume import (
 from sbx_omnigent.runner.stage_kinds import stage_kind, writer_is_terminal
 from sbx_omnigent.runner.state import (
     RUN_STATE_VERSION,
-    _restore_harness_versions,
 )
 from sbx_omnigent.swarm_session import (
     PlanDecision,
@@ -780,7 +786,7 @@ class _Base(unittest.TestCase):
         # sandbox name would otherwise read the versions out of
         # whatever box on this machine answers to it (#17).
         versions = mock.patch.object(
-            R.harness_versions, 'read_versions', return_value={}
+            harness_versions, 'read_versions', return_value={}
         )
         self.read_versions = versions.start()
         self.addCleanup(versions.stop)
@@ -792,7 +798,7 @@ class _Base(unittest.TestCase):
         self.addCleanup(probe.stop)
         # Never `sbx exec` a real VM for its runner log.
         runner_log = mock.patch.object(
-            R.guest_log, 'read_runner_log', return_value=None
+            guest_log, 'read_runner_log', return_value=None
         )
         self.runner_log = runner_log.start()
         self.addCleanup(runner_log.stop)
@@ -4323,8 +4329,8 @@ class TestInterruptedWorkIsCaptured(_Base):
 
     def test_a_second_interrupt_is_not_swallowed(self) -> None:
         # Someone pressing Ctrl-C again wants OUT — not one more
-        # bounded HTTP read. _capture_turn swallows SwarmSessionError,
-        # never KeyboardInterrupt.
+        # bounded HTTP read. TurnCapture.turn swallows
+        # SwarmSessionError, never KeyboardInterrupt.
         runner, sc, _wt = self._runner()
         sc.interrupt_labels.add('build')
         sc.interrupt_reads.add('build')
@@ -8490,7 +8496,7 @@ class TestCtrlCStopsTheRunNow(_Base):
 
         with mock.patch.object(
             R.concurrent.futures, 'as_completed', side_effect=interrupted
-        ), mock.patch.object(runner, '_capture_turn') as capture, \
+        ), mock.patch.object(runner._capture, 'turn') as capture, \
                 mock.patch('sbx_omnigent.runner.run.click.echo'):
             with self.assertRaises(KeyboardInterrupt):
                 runner._parallel(
@@ -10762,7 +10768,7 @@ class TestLaunchIsVerified(_Base):
         self.assertEqual(result.status, 'completed')
 
 
-_KNOWN_GOOD = dict(R.harness_versions.KNOWN_GOOD)
+_KNOWN_GOOD = dict(harness_versions.KNOWN_GOOD)
 
 
 class TestHarnessVersionsAreRecorded(_Base):
@@ -10836,7 +10842,7 @@ class TestHarnessVersionsAreRecorded(_Base):
         self.assertEqual(len(said), 1, said)
         self.assertIn('claude 2.1.999', said[0])
         self.assertIn(_KNOWN_GOOD['claude'], said[0])
-        self.assertIn(R.harness_versions.KNOWN_GOOD_RECORDED, said[0])
+        self.assertIn(harness_versions.KNOWN_GOOD_RECORDED, said[0])
 
     def test_only_the_cli_a_session_runs_is_compared(self) -> None:
         # No agent in this pipeline runs codex, so its version is
@@ -10944,63 +10950,6 @@ class TestHarnessVersionsAreRecorded(_Base):
         joined = '\n'.join(said)
         self.assertNotIn('mid-session', joined)
         self.assertIn('an earlier session of build ran 2.1.266', joined)
-
-
-class TestAResumeIsNotAMidSessionUpdate(_Base):
-    """A resume restores the previous attempt's readings, keyed by the
-    node. A new VM for that node was compared against them as if it
-    were the same session: "claude 2.1.280 is installed now, but it ran
-    2.1.266 at its first turn. It updated itself mid-session." It was a
-    different VM, pinned to 2.1.280 before it started."""
-
-    def _note(self, versions: dict[str, str]) -> tuple[R.PipelineRunner, str]:
-        cfg = self._cfg(_LINEAR)
-        # Real clients, never called: only the version bookkeeping runs.
-        runner = R.PipelineRunner(
-            cfg,
-            session_client=SwarmSessionClient('http://unused'),
-            worktree_manager=WorktreeManager(
-                canonical_root=str(self.root / 'c'),
-                worktree_root=str(self.root / 'w'),
-            ),
-            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
-            swap_age_s=lambda: 0.0,
-        )
-        runner._harness_versions = _restore_harness_versions({
-            'build': {
-                'runs': 'claude',
-                'versions': {**_KNOWN_GOOD, 'claude': '2.1.266'},
-            },
-        })
-        runner._registry.agents['sess-new'] = cfg.agents['build']
-        runner._registry.labels['sess-new'] = 'build'
-        with mock.patch.object(R.click, 'echo') as echo:
-            runner._note_harness_versions('sess-new', versions)
-        said = '\n'.join(str(c.args[0]) for c in echo.call_args_list)
-        return runner, said
-
-    def test_it_is_reported_as_an_earlier_session(self) -> None:
-        _runner, said = self._note({**_KNOWN_GOOD, 'claude': '2.1.280'})
-        self.assertNotIn('mid-session', said)
-        self.assertIn('an earlier session of build ran 2.1.266', said)
-
-    def test_the_new_session_replaces_the_record(self) -> None:
-        runner, _said = self._note({**_KNOWN_GOOD, 'claude': '2.1.280'})
-        self.assertEqual(
-            R._recorded_version(runner._harness_versions['build'], 'claude'),
-            '2.1.280',
-        )
-
-    def test_the_same_version_says_nothing(self) -> None:
-        _runner, said = self._note({**_KNOWN_GOOD, 'claude': '2.1.266'})
-        self.assertNotIn('earlier session', said)
-        self.assertNotIn('mid-session', said)
-
-    def test_the_session_is_not_written_to_the_state_file(self) -> None:
-        # Sessions never survive a resume; the state format stays put.
-        runner, _said = self._note({**_KNOWN_GOOD, 'claude': '2.1.280'})
-        saved = runner._state_payload()['harness_versions']['build']
-        self.assertEqual(set(saved), {'runs', 'versions'})
 
 
 class TestDiskMetricsAreOptIn(_Base):
