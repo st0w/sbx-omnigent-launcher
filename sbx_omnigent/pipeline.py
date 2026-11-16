@@ -431,7 +431,7 @@ class PipelineConfig:
     :param generated: Glob patterns for files that do NOT count as
         implementation (lockfiles and other build output). Empty uses
         the runner's default set. See
-        :meth:`sbx_omnigent.runner.run.PipelineRunner._require_implementation`.
+        :meth:`sbx_omnigent.runner.writer_policy.WriterPolicy._require_implementation`.
     :param test_paths: Glob patterns a ``tests_only`` stage may change.
         Unset uses the built-in default. Dependency manifests are NOT
         listed here: a test needing a new dev-dependency must edit
@@ -463,7 +463,7 @@ class PipelineConfig:
     generated: tuple[str, ...] = ()
     guarded: tuple[str, ...] = ()
     #: What a ``tests_only`` stage may change. Empty means the built-in
-    #: default set; see ``runner._TEST_PATH_GLOBS``.
+    #: default set (``runner.writer_policy._TEST_PATH_GLOBS``).
     test_paths: tuple[str, ...] = ()
     #: Boot writer VMs while the interactive planner waits on a human.
     prewarm: bool = True

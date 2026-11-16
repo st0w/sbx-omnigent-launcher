@@ -11,10 +11,10 @@ from __future__ import annotations
 #: this environment. The change is a self-contained, logically-verified
 #: fix",
 #: and the round accepted it. Nothing downstream catches that either:
-#: :meth:`_require_implementation` proves only that the diff is
-#: non-empty, never that any of it compiled. A fix nobody compiled is a
-#: guess wearing a commit message, and it is handed straight to a judge
-#: as if it were a tested change.
+#: :meth:`WriterPolicy._require_implementation` proves only that the
+#: diff is non-empty, never that any of it compiled. A fix nobody
+#: compiled is a guess wearing a commit message, and it is handed
+#: straight to a judge as if it were a tested change.
 _FIX_MUST_VERIFY = (
     'Before you report back you MUST build the project and run its '
     'tests, and your reply MUST state the command you ran and its '

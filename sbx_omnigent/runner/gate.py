@@ -10,7 +10,6 @@ the host or in an agent's own VM.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Protocol
 
 import click
 
@@ -23,26 +22,12 @@ from sbx_omnigent.runner.prompts.writer import (
     _FIX_MUST_VERIFY,
     _FIX_NO_WEAKENING,
 )
+from sbx_omnigent.runner.redrive import RedriveWriter
 from sbx_omnigent.runner.stage_kinds import stage_kind
 
 #: Stage kinds that check a writer's branch, and so run again after a
 #: verify-gate fix changes it (see :meth:`VerifyGate.rechecks_after`).
 _RECHECK_KINDS = frozenset({'review', 'scan', 'verify'})
-
-
-class RedriveWriter(Protocol):
-    """Hands a writer stage findings to fix, and waits for its turn."""
-
-    def __call__(
-        self, stage_id: str, findings: str, *, message: str | None = None,
-    ) -> None:
-        """
-        Re-drive *stage_id* to fix *findings*.
-
-        :param stage_id: The writer stage.
-        :param findings: What it must fix.
-        :param message: The commit message for its fix.
-        """
 
 
 class VerifyGate:
