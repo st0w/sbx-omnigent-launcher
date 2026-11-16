@@ -117,7 +117,12 @@ from sbx_omnigent.runner.parsing.verdicts import (
     parse_verdict,
     work_finished,
 )
-from sbx_omnigent.runner.paths import plan_artifact_path, security_folder
+from sbx_omnigent.runner.paths import (
+    chunk_plan_path,
+    plan_artifact_path,
+    security_folder,
+    session_record_path,
+)
 from sbx_omnigent.runner.prompts.checks import (
     _APPROVED_AS_IS,
     _CHECK_COMPLETE,
@@ -176,11 +181,12 @@ from sbx_omnigent.runner.render.reviews import (
     render_review_records,
 )
 from sbx_omnigent.runner.render.sessions import (
-    render_planning_session,
     render_turn_capture,
 )
+from sbx_omnigent.runner.repo_records import RepoRecords
 from sbx_omnigent.runner.security_records import SecurityRecords
 from sbx_omnigent.runner.stage_kinds import (
+    is_planner,
     stage_kind,
     writer_is_terminal,
 )
@@ -632,6 +638,12 @@ class PipelineRunner:
             triage=self._triage,
             chunk_reviews=self._chunk_reviews,
         )
+        self._records = RepoRecords(
+            self._ctx,
+            chunk_reviews=self._chunk_reviews,
+            chunk_picks=self._chunk_picks,
+            reader_turns=lambda: self._reader_turns,
+        )
         self._security = SecurityRecords(
             self._ctx,
             publish_repo=self._publish_repo,
@@ -703,8 +715,9 @@ class PipelineRunner:
     def _drive_to_completion(self) -> RunResult:
         blocked: str | None = None
         finished = False
-        planner = [s for s in self._config.stages if self._is_planner(s)]
-        build = [s for s in self._config.stages if not self._is_planner(s)]
+        stages = self._config.stages
+        planner = [s for s in stages if is_planner(s, self._config)]
+        build = [s for s in stages if not is_planner(s, self._config)]
         try:
             try:
                 if self._config.subtasks:
@@ -795,7 +808,10 @@ class PipelineRunner:
         planner_ids = (
             set()
             if per_module
-            else {s.id for s in self._config.stages if self._is_planner(s)}
+            else {
+                s.id for s in self._config.stages
+                if is_planner(s, self._config)
+            }
         )
         writer_ids = {
             s.id for s in pipeline._iter_stages(loop_stages) if s.write
@@ -1382,16 +1398,7 @@ class PipelineRunner:
             return
         plan, plan_path = self._chunk_plan_of_record(sub, first=first)
         if plan:
-            self._wt.write_tracked_file(
-                self._wt.node_worktree_path(self._run_id, winner),
-                plan_path,
-                plan,
-            )
-            self._wt.commit_node(
-                self._run_id, winner,
-                message='docs: add plan of record',
-                author='planner <planner@pipeline.local>',
-            )
+            self._records.commit_plan(winner, plan_path, plan)
         self._ledger.record_referrals(
             self._active_subtask.id if self._active_subtask else None,
             self._chunk_reviews(),
@@ -1403,14 +1410,20 @@ class PipelineRunner:
         # Per-module mode has a planner per module, and a per-module
         # path, so it records every chunk.
         if self._config.subtasks or first:
-            self._commit_planning_session(winner, plan_path)
-        review_doc = self._commit_review_records(winner, plan_path)
+            self._records.commit_planning_session(
+                winner, plan_path, module=self._active_subtask
+            )
+        review_doc = self._records.commit_reviews(
+            winner, plan_path, module=self._active_subtask
+        )
         self._security.commit_reports(winner, plan_path)
         self._filing.publish(winner, review_doc)
         security_doc = self._security.commit_summary(
             winner, plan_path, module=self._active_subtask
         )
-        pick_doc = self._commit_judge_record(winner, plan_path)
+        pick_doc = self._records.commit_selection(
+            winner, plan_path, module=self._active_subtask
+        )
         open_pr = self._config.publish.mode == 'pr'
         span = self._chunk_span(winner) if open_pr else None
         body = self._pr_body(
@@ -1626,7 +1639,9 @@ class PipelineRunner:
         :param security_doc: Repo path of the security scan summary.
         :returns: The markdown body.
         """
-        has_plan = self._planner_node_id() is not None
+        has_plan = any(
+            is_planner(stage, self._config) for stage in self._config.stages
+        )
         return render_pr_body(
             summary=summary,
             series_note=series_note,
@@ -1638,7 +1653,7 @@ class PipelineRunner:
             findings=list(self._filing.filed),
             plan_doc=plan_path if has_plan else None,
             session_doc=(
-                self._session_artifact_path(plan_path)
+                session_record_path(plan_path)
                 if has_plan
                 else None
             ),
@@ -1950,103 +1965,13 @@ class PipelineRunner:
             )
         ]
 
-    def _commit_review_records(
-        self, winner: str, plan_path: str
-    ) -> str | None:
-        """
-        Commit the reviewer reports onto the branch about to publish.
-
-        Best-effort like the planning-session record: worth having,
-        never worth failing a publish over.
-
-        :param winner: The node whose branch publishes.
-        :param plan_path: The plan artifact path, whose name this record
-            is derived from (it needs no plan to exist).
-        :returns: The committed repo path, or ``None``.
-        """
-        records = self._chunk_reviews()
-        if not records:
-            return None
-        sub = self._active_subtask
-        title = f'Reviews — {self._config.name}'
-        if sub is not None:
-            title += f' [{sub.id}] {sub.title}'
-        doc = render_review_records(records, title=title)
-        path = self._review_artifact_path(plan_path)
-        try:
-            self._wt.write_tracked_file(
-                self._wt.node_worktree_path(self._run_id, winner),
-                path,
-                doc,
-            )
-            committed = self._wt.commit_node(
-                self._run_id, winner,
-                message='docs: add reviewer reports',
-                author='reviewer <reviewer@pipeline.local>',
-            )
-        except click.ClickException:
-            return None
-        if not committed:
-            return None
-        click.echo(
-            f'[review] committed {len(records)} reviewer report(s) '
-            f'to {path}.'
-        )
-        return path
-
     def _security_folder_name(self) -> str:
         """The scan reports' folder name, for the record to cite."""
         return PurePosixPath(
             security_folder(
-                self._chunk_plan_path(self._active_subtask)
+                chunk_plan_path(self._config, self._active_subtask)
             )
         ).name
-
-    def _commit_judge_record(
-        self, winner: str, plan_path: str
-    ) -> str | None:
-        """
-        Commit the judge's choice onto the branch about to publish.
-
-        Best-effort like the reviewer reports: worth having, never worth
-        failing a publish over. A pipeline with no judge writes nothing.
-
-        :param winner: The node whose branch publishes.
-        :param plan_path: The plan artifact path, whose name this record
-            is derived from (it needs no plan to exist).
-        :returns: The committed repo path, or ``None``.
-        """
-        picks = self._chunk_picks()
-        if not picks:
-            return None
-        sub = self._active_subtask
-        title = f'Selection — {self._config.name}'
-        if sub is not None:
-            title += f' [{sub.id}] {sub.title}'
-        doc = render_judge_decision(picks, title=title)
-        path = self._decision_artifact_path(plan_path)
-        try:
-            self._wt.write_tracked_file(
-                self._wt.node_worktree_path(self._run_id, winner),
-                path,
-                doc,
-            )
-            committed = self._wt.commit_node(
-                self._run_id, winner,
-                message='docs: add the judge selection',
-                # A role, like the planner and reviewer records — never
-                # the judge AGENT's name, which would put the deciding
-                # model back into git log.
-                author='judge <judge@pipeline.local>',
-            )
-        except click.ClickException:
-            return None
-        if not committed:
-            return None
-        click.echo(
-            f'[judge] committed {len(picks)} selection(s) to {path}.'
-        )
-        return path
 
     def _retain_losers(
         self, candidates: list[str], selected: str
@@ -2226,168 +2151,6 @@ class PipelineRunner:
         chunk = self._active_subtask.id if self._active_subtask else None
         return [p for p in self._picks if p.chunk == chunk]
 
-    def _chunk_artifact_base(self, plan_path: str) -> str:
-        """
-        The base path this chunk's OWN records hang off.
-
-        Per-chunk records must not share a path across chunks. Each
-        chunk publishes its own pull request, and the campaign thread
-        carries every earlier chunk's records into the later ones, so a
-        shared path would be one file rewritten by every chunk: each
-        chunk's record would replace the one before it, and two pull
-        requests merged out of order would conflict on it.
-
-        Per-module mode never hit this because its *plan_path* is
-        already per-module (``discover-m1.md``), which these records
-        inherit; it is passed through untouched here so the chunk id is
-        not folded in twice. Flat campaign mode shares one plan_path
-        across every chunk, so the chunk id is folded in HERE.
-
-        :param plan_path: The chunk's plan artifact path.
-        :returns: The base path to derive per-chunk record names from.
-        """
-        sub = self._active_subtask
-        if sub is None or self._config.subtasks:
-            return plan_path
-        p = PurePosixPath(plan_path)
-        return str(p.with_name(f'{p.stem}-{sub.id}{p.suffix}'))
-
-    def _decision_artifact_path(self, plan_path: str) -> str:
-        """The judge record's repo path, beside the reviewers'."""
-        p = PurePosixPath(self._chunk_artifact_base(plan_path))
-        return str(p.with_name(f'{p.stem}-selection{p.suffix}'))
-
-    def _review_artifact_path(self, plan_path: str) -> str:
-        """The reviewer reports' repo path, beside the plan's."""
-        p = PurePosixPath(self._chunk_artifact_base(plan_path))
-        return str(p.with_name(f'{p.stem}-reviews{p.suffix}'))
-
-    def _session_artifact_path(self, plan_path: str) -> str:
-        """The session record's repo path, beside the plan's."""
-        p = PurePosixPath(plan_path)
-        return str(p.with_name(f'{p.stem}-session{p.suffix}'))
-
-    def _planner_node_id(self) -> str | None:
-        """The planner node for the active chunk, else the run's."""
-        for stage in self._config.stages:
-            if not self._is_planner(stage):
-                continue
-            sub = self._active_subtask
-            if sub is not None and self._config.subtasks:
-                return f'{sub.id}-{stage.id}'
-            return stage.id
-        return None
-
-    def _planning_turns(
-        self, node_id: str
-    ) -> list[tuple[str, str]] | None:
-        """
-        The planner's conversation, or ``None`` with the reason logged.
-
-        The BUFFER first, and a live session only as the fallback. The
-        two used to be the other way round, which is why no planning
-        session record ever reached the repo: a resumed run restores its
-        nodes WITHOUT a session (deliberately — see
-        ``test_state_never_records_a_session``: a session handle names
-        a VM the new run cannot reattach to), so the session guard
-        returned
-        before the buffer — the one copy that survives — was ever
-        consulted. The buffer needs no live session by construction; it
-        exists precisely because the VM is gone.
-
-        :param node_id: The planner node.
-        :returns: Its turns, or ``None`` when there are none to record.
-        """
-        node = self._nodes.get(node_id)
-        if node is None:
-            click.echo(
-                f'[plan-record] no session record: planner node '
-                f"{node_id!r} is not among the run's nodes "
-                f'({", ".join(sorted(self._nodes)) or "none"}).'
-            )
-            return None
-        buffered = self._reader_turns.get(node_id)
-        if buffered is not None:
-            return list(buffered)
-        if not node.session:
-            click.echo(
-                f'[plan-record] no session record: nothing was buffered '
-                f'for {node_id!r} and it has no live session to read '
-                f"(a resumed run cannot reattach to the planner's VM)."
-            )
-            return None
-        # The shipped read_transcript swallows SwarmSessionError and
-        # returns [], so an empty result is the DISPOSED session — but
-        # the guard stays: this must never be able to fail a publish,
-        # whatever client is injected.
-        try:
-            turns = self._sc.read_transcript(node.session)
-        except SwarmSessionError:
-            click.echo(
-                f'[plan-record] no session record: {node_id!r} was not '
-                f'buffered and its session could not be read.'
-            )
-            return None
-        if not turns:
-            click.echo(
-                f'[plan-record] no session record: nothing was buffered '
-                f'for {node_id!r} and its session reads back empty (it '
-                f'has been disposed).'
-            )
-        return turns
-
-    def _commit_planning_session(
-        self, winner: str, plan_path: str
-    ) -> None:
-        """
-        Commit the planner's whole conversation beside its plan.
-
-        Best-effort by construction: a design record is worth having,
-        but never worth failing a publish over, so an unreadable session
-        or a git error simply skips it.
-
-        :param winner: The node whose branch publishes.
-        :param plan_path: Repo path of this plan of record.
-        """
-        node_id = self._planner_node_id()
-        if node_id is None:
-            return  # no planner in this pipeline: nothing to record
-        turns = self._planning_turns(node_id)
-        if turns is None:
-            return
-        sub = self._active_subtask
-        title = f'Planning session — {self._config.name}'
-        if sub is not None:
-            title += f' [{sub.id}] {sub.title}'
-        doc = render_planning_session(
-            turns, title=title, plan_doc=plan_path
-        )
-        if not doc:
-            click.echo(
-                f'[plan-record] no session record: {node_id!r} produced '
-                f'{len(turns)} message(s), which rendered to nothing.'
-            )
-            return
-        path = self._session_artifact_path(plan_path)
-        try:
-            self._wt.write_tracked_file(
-                self._wt.node_worktree_path(self._run_id, winner),
-                path,
-                doc,
-            )
-            committed = self._wt.commit_node(
-                self._run_id, winner,
-                message='docs: add planning session record',
-                author='planner <planner@pipeline.local>',
-            )
-        except click.ClickException:
-            return
-        if committed:
-            click.echo(
-                f'[plan] committed the planning session '
-                f'({len(turns)} turns) to {path}.'
-            )
-
     def _chunk_plan_of_record(
         self, sub: pipeline.Subtask, *, first: bool
     ) -> tuple[str | None, str]:
@@ -2403,22 +2166,9 @@ class PipelineRunner:
         if self._config.subtasks:
             node = self._nodes.get(f'{sub.id}-plan')
             plan = node.output if node else None
-            return plan, self._chunk_plan_path(sub)
+            return plan, chunk_plan_path(self._config, sub)
         plan = self._plan_of_record if first else None
-        return plan, self._chunk_plan_path(sub)
-
-    def _chunk_plan_path(self, sub: pipeline.Subtask | None) -> str:
-        """
-        The repo path a chunk's plan of record is committed to.
-
-        :param sub: The chunk, or ``None`` outside a campaign.
-        :returns: ``…-<module>.md`` in per-module mode, otherwise the
-            run's own plan path.
-        """
-        if sub is not None and self._config.subtasks:
-            p = PurePosixPath(plan_artifact_path(self._config))
-            return str(p.with_name(f'{p.stem}-{sub.id}{p.suffix}'))
-        return plan_artifact_path(self._config)
+        return plan, chunk_plan_path(self._config, sub)
 
     def _chunk_preamble(self) -> str:
         """A directive scoping a builder turn to the active chunk."""
@@ -2891,7 +2641,7 @@ class PipelineRunner:
         if stage.id not in self._completed:
             return False
         target = self._stage_by_id.get(stage.checks) if stage.checks else None
-        if target is not None and self._is_planner(target):
+        if target is not None and is_planner(target, self._config):
             return True
         node = self._nodes.get(stage.id)
         if target is not None and not check_finished(
@@ -3103,7 +2853,7 @@ class PipelineRunner:
             self._run_id, stage.id, from_node=self._seed_from(stage),
             replace=self._resume,
         )
-        if self._is_planner(stage):
+        if is_planner(stage, self._config):
             # BEFORE the instruction is built: the ledger block is
             # assembled from the ledger, so seeding after would hand
             # this planner an empty one.
@@ -3114,9 +2864,9 @@ class PipelineRunner:
             stage.id, 'reader', worktree=wt, session=session, output=out
         )
         self._nodes[stage.id] = node
-        if not self._is_planner(stage):
+        if not is_planner(stage, self._config):
             self._halt_on_reader_dispute(stage)
-        if self._is_planner(stage):
+        if is_planner(stage, self._config):
             in_module = self._active_subtask is not None
             if self._interactive_plan:
                 # The up-front planner posted its questions; the human
@@ -3427,7 +3177,7 @@ class PipelineRunner:
         """
         assert stage.checks is not None
         target = self._stage_by_id[stage.checks]
-        if self._is_planner(target):
+        if is_planner(target, self._config):
             # Reached only when the plan finished in an earlier attempt:
             # a live plan stage runs its checks inside its approval.
             node = self._nodes.get(target.id)
@@ -6458,7 +6208,7 @@ class PipelineRunner:
         # "Task: add <feature>" implementation directive — else the
         # concrete build instruction overrides its plan-only role prompt
         # and it tries to implement (or hunt for a writable path).
-        if self._is_planner(stage):
+        if is_planner(stage, self._config):
             return self._planner_instruction(stage)
         ctx = self._reader_context(stage)
         return self._task_block() + (f'\n\n{ctx}' if ctx else '')
@@ -6654,13 +6404,6 @@ class PipelineRunner:
         if ctx:
             instr += f'\n\n{ctx}'
         return instr
-
-    def _is_planner(self, stage: pipeline.PipelineStage) -> bool:
-        """Whether this stage's own agent is the shipped planner."""
-        if not stage.run:
-            return False
-        agent = self._config.agents.get(stage.run[0])
-        return bool(agent and agent.template == 'planner')
 
     def _writer_instruction(self, stage: pipeline.PipelineStage) -> str:
         # A test-writer IS a writer node, but its turn must be framed as
@@ -7235,24 +6978,22 @@ class PipelineRunner:
         # Commit the plan of record onto the branch about to ship, so
         # the approved design travels with the code in the PR.
         if self._plan_of_record:
-            self._wt.write_tracked_file(
-                self._wt.node_worktree_path(self._run_id, branch_node),
+            self._records.commit_plan(
+                branch_node,
                 plan_artifact_path(self._config),
                 self._plan_of_record,
             )
-            self._wt.commit_node(
-                self._run_id,
+            self._records.commit_planning_session(
                 branch_node,
-                message='docs: add plan of record',
-                author='planner <planner@pipeline.local>',
-            )
-            self._commit_planning_session(
-                branch_node, plan_artifact_path(self._config)
+                plan_artifact_path(self._config),
+                module=self._active_subtask,
             )
         # NOT gated on a plan existing: a pipeline with no planner still
         # has reviewers, and their reports are just as much the record.
-        review_doc = self._commit_review_records(
-            branch_node, plan_artifact_path(self._config)
+        review_doc = self._records.commit_reviews(
+            branch_node,
+            plan_artifact_path(self._config),
+            module=self._active_subtask,
         )
         self._security.commit_reports(
             branch_node, plan_artifact_path(self._config)
@@ -7263,8 +7004,10 @@ class PipelineRunner:
             plan_artifact_path(self._config),
             module=self._active_subtask,
         )
-        pick_doc = self._commit_judge_record(
-            branch_node, plan_artifact_path(self._config)
+        pick_doc = self._records.commit_selection(
+            branch_node,
+            plan_artifact_path(self._config),
+            module=self._active_subtask,
         )
         result = self._wt.publish_node(
             self._run_id,
