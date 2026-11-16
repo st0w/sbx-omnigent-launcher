@@ -81,3 +81,20 @@ def recorded_by_scan(
     """
     stage = stage_by_id.get(rec.stage)
     return stage is not None and stage.scans is not None
+
+
+def is_planner(
+    stage: pipeline.PipelineStage, config: pipeline.PipelineConfig
+) -> bool:
+    """
+    Whether *stage*'s own agent is the shipped planner.
+
+    :param stage: The stage.
+    :param config: The parsed pipeline, which defines its agent.
+    :returns: ``True`` when the stage's first agent uses the
+        ``planner`` template.
+    """
+    if not stage.run:
+        return False
+    agent = config.agents.get(stage.run[0])
+    return bool(agent and agent.template == 'planner')
