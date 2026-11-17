@@ -84,9 +84,6 @@ from sbx_omnigent.runner.parsing.dispositions import (
     parse_blocking_dispositions,
     parse_dispositions,
 )
-from sbx_omnigent.runner.parsing.findings import (
-    parse_findings,
-)
 from sbx_omnigent.runner.parsing.plans import (
     _PLAN_REPLY_TAIL,
     parse_subtasks,
@@ -98,7 +95,6 @@ from sbx_omnigent.runner.parsing.text import (
 )
 from sbx_omnigent.runner.parsing.verdicts import (
     _UNVERIFIED,
-    _check_done,
     _review_done,
     _writer_done,
     check_finished,
@@ -111,11 +107,6 @@ from sbx_omnigent.runner.progress import RunProgress
 from sbx_omnigent.runner.prompts.checks import (
     _APPROVED_AS_IS,
     _CHECK_COMPLETE,
-    _CHECK_DISPUTED,
-    _CHECK_FINISH_ASK,
-    _CHECK_RULES,
-    _CHECK_VERDICT,
-    _PLAN_CHECK_RULES,
     _PLAN_DECISION_PHRASES,
 )
 from sbx_omnigent.runner.prompts.environment import setup_block
@@ -164,6 +155,7 @@ from sbx_omnigent.runner.stage_kinds import (
     stage_kind,
     writer_is_terminal,
 )
+from sbx_omnigent.runner.stages.check import CheckStage
 from sbx_omnigent.runner.stages.scan import ScanStage
 from sbx_omnigent.runner.triage import FindingTriage
 from sbx_omnigent.runner.writer_policy import WriterPolicy
@@ -330,6 +322,16 @@ class PipelineRunner:
             registry=self._registry,
             keep=keep,
             save_state=self._save_state,
+        )
+        self._checks = CheckStage(
+            self._ctx,
+            book=self._book,
+            driver=self._driver,
+            capture=self._capture,
+            briefing=self._briefing,
+            disputes=self._disputes,
+            resume=resume,
+            release_session=self._release_completed_session,
         )
         self._scan = ScanStage(
             self._ctx,
@@ -1115,7 +1117,7 @@ class PipelineRunner:
             'writer': self._run_writer,
             'judge': self._run_judge,
             'verify': self._run_verify,
-            'check': self._run_check,
+            'check': self._checks.run,
             'scan': self._scan.run,
             'review': self._run_review,
         }.get(kind, self._run_reader)
@@ -1425,69 +1427,6 @@ class PipelineRunner:
                     node.output,
                 )
 
-    def _run_check(self, stage: pipeline.PipelineStage) -> None:
-        """
-        Read the frozen contract once, before any writer builds on it.
-
-        A ``checks:`` stage reads the tests stage's suite beside the
-        brief and the plan (#50). A contract that cannot be satisfied is
-        a dispute, and the run stops here, before two writers spend a
-        full stage each on it. Weaker-but-satisfiable problems (a test
-        that already passes, one asserting on source text, a requirement
-        with no test) are recorded in its ``FINDINGS:`` block, and the
-        run goes on.
-
-        A check that lets the writers go on is recorded beside the
-        reviewers' reports, so its findings reach the findings ledger
-        and the verifier like theirs. ``turns/`` alone would lose them:
-        a completed run deletes its run directory. It never reaches the
-        writers as design context — :meth:`Briefing.reader_context`
-        passes on readers only — and it is not counted as a vote on the
-        branch.
-
-        :param stage: The stage declaring ``checks:``.
-        :raises PipelineRunError: When the check raised a dispute.
-        """
-        assert stage.checks is not None
-        target = self._stage_by_id[stage.checks]
-        if is_planner(target, self._config):
-            # Reached only when the plan finished in an earlier attempt:
-            # a live plan stage runs its checks inside its approval.
-            node = self._nodes.get(target.id)
-            plan = node.output if node is not None else ''
-            self._disputes.halt_on_plan(
-                target,
-                [
-                    (stage.id, claim)
-                    for claim in self._run_plan_check(stage, plan)
-                ],
-            )
-            return
-        wt = self._wt.create_node_worktree(
-            self._run_id, stage.id, from_node=stage.checks,
-            replace=self._resume,
-        )
-        session = self._driver.create(stage.run[0], wt, 'ro', stage.id)
-        first = self._driver.drive(
-            session, self._check_instruction(stage), done=_check_done
-        )
-        out = self._finish_check(stage.id, session, first)
-        self._nodes[stage.id] = NodeResult(
-            stage.id, 'check', worktree=wt, session=session, output=out
-        )
-        self._disputes.halt_on_reader(stage)
-        self._halt_on_unfinished_check(stage, session, out)
-        self._book.record_review(
-            stage.id, stage.run[0], self._book.next_round(stage.id),
-            _CHECK_VERDICT, session, out,
-        )
-        findings = parse_findings(out)
-        click.echo(
-            f'[check] {stage.id}: no dispute, so the writers go ahead; '
-            f'{len(findings)} finding(s) recorded with the review '
-            f'reports.'
-        )
-
     def _await_plan_approval(
         self,
         session: str,
@@ -1524,7 +1463,7 @@ class PipelineRunner:
         :param stage: The plan stage, to find the checks that name it.
         :returns: The plan of record.
         """
-        checks = self._plan_checks(stage) if stage is not None else []
+        checks = self._checks.plan_checks(stage) if stage is not None else []
         click.echo(
             f'[plan] Planner is awaiting your review in the Omnigent UI '
             f'(session {session}). Answer its questions there, then send '
@@ -1681,23 +1620,6 @@ class PipelineRunner:
             )
         return plan or approved or first_reply
 
-    def _plan_checks(
-        self, stage: pipeline.PipelineStage
-    ) -> list[pipeline.PipelineStage]:
-        """
-        The ``checks:`` stages that name *stage*, a planner.
-
-        Looked up by id across every registered stage, so a campaign's
-        renamed per-module check finds its own module's plan.
-
-        :param stage: The plan stage.
-        :returns: The checks naming it, in declaration order.
-        """
-        return [
-            check for check in self._stage_by_id.values()
-            if check.checks == stage.id
-        ]
-
     def _run_plan_checks(
         self, stage: pipeline.PipelineStage, plan: str
     ) -> list[tuple[str, str]]:
@@ -1711,11 +1633,11 @@ class PipelineRunner:
         :param plan: The plan to check.
         :returns: ``(check id, claim)`` per dispute, check by check.
         """
-        checks = self._plan_checks(stage)
+        checks = self._checks.plan_checks(stage)
         found: dict[str, tuple[str, ...]] = {}
 
         def run(check: pipeline.PipelineStage) -> None:
-            found[check.id] = self._run_plan_check(check, plan)
+            found[check.id] = self._checks.run_plan_check(check, plan)
 
         self._parallel(
             f'{stage.id}-checks',
@@ -1728,114 +1650,6 @@ class PipelineRunner:
             for check in checks
             for claim in found.get(check.id, ())
         ]
-
-    def _run_plan_check(
-        self, check: pipeline.PipelineStage, plan: str
-    ) -> tuple[str, ...]:
-        """
-        Drive one plan check on a fresh read-only clone, and record it.
-
-        A fresh clone each round: a re-check after the human settled a
-        dispute must not read a tree the last round's agent touched.
-
-        The clone is cut from the planner's own seed, so the check reads
-        exactly the tree the plan was written against: in every module,
-        every round, and on a resume that runs only the check. Its own
-        seed would be wrong in a campaign: a check is not seeded from
-        the campaign tip, and its only need is a planner, which has no
-        branch, so it fell back to the base branch. Live, a later
-        module's check then reported the earlier modules' work missing.
-
-        :param check: The check stage.
-        :param plan: The plan to check.
-        :returns: Its disputes; empty when it found none.
-        """
-        assert check.checks is not None
-        planner = self._stage_by_id[check.checks]
-        wt = self._wt.create_node_worktree(
-            self._run_id, check.id, from_node=seed_from(planner, self._nodes),
-            replace=True,
-        )
-        session = self._driver.create(check.run[0], wt, 'ro', check.id)
-        out = self._finish_check(
-            check.id, session,
-            self._driver.drive(
-                session,
-                self._plan_check_instruction(check, plan),
-                done=_check_done,
-            ),
-        )
-        claims = parse_disputes(out)
-        if not claims and not check_finished(out):
-            # Counted as a problem: interactive approval reopens with
-            # the human told why, and unattended planning stops.
-            claim = (
-                f'{check.id} did not finish: its reply never ended with '
-                f'{_CHECK_COMPLETE}, so the plan was not fully checked.'
-            )
-            claims = (claim,)
-            out = f'{claim}\n\nIts last reply:\n\n{out}'
-        elif not claims:
-            self._disputes.warn_near_miss(check.id, out)
-        self._nodes[check.id] = NodeResult(
-            check.id, 'check', worktree=wt, session=session, output=out
-        )
-        self._book.record_review(
-            check.id, check.run[0], self._book.next_round(check.id),
-            _CHECK_DISPUTED if claims else _CHECK_VERDICT, session, out,
-        )
-        self._release_completed_session(check, 'check')
-        return claims
-
-    def _finish_check(self, check_id: str, session: str, out: str) -> str:
-        """
-        Ask a check once more when it neither disputed nor finished.
-
-        A dispute is never asked again: the claim is the evidence, and
-        it stops the run or reopens approval either way. Only a pass
-        has to be said, so only a reply with neither is sent
-        :data:`_CHECK_FINISH_ASK`, and its answer replaces the reply.
-
-        :param check_id: The check stage's id.
-        :param session: Its session, still alive.
-        :param out: Its reply.
-        :returns: The reply to judge: *out*, or the answer to the ask.
-        """
-        if parse_disputes(out) or check_finished(out):
-            return out
-        click.echo(
-            f'[check] {check_id}: its reply neither raised a dispute nor '
-            f'ended with {_CHECK_COMPLETE}, so it has not finished; '
-            f'asking it once to finish.'
-        )
-        return self._driver.drive(session, _CHECK_FINISH_ASK, done=_check_done)
-
-    def _halt_on_unfinished_check(
-        self, stage: pipeline.PipelineStage, session: str, out: str
-    ) -> None:
-        """
-        Stop when a contract check never said it finished.
-
-        Called after the dispute halt, so a reply reaching here has no
-        dispute. Without :data:`_CHECK_COMPLETE` it is not a pass, so
-        nothing after the check may run on it. The stage is not
-        recorded as complete, so ``--resume`` runs it again.
-
-        :param stage: The contract check stage.
-        :param session: Its session, still alive, to capture.
-        :param out: Its reply after the one ask to finish.
-        :raises PipelineRunError: When the reply never said it finished.
-        """
-        if check_finished(out):
-            return
-        self._capture.turn(session, 'did not finish its check')
-        raise PipelineRunError(
-            f'{stage.id}: the contract check did not finish. Neither its '
-            f'reply nor the one it was asked for ends with a line reading '
-            f'{_CHECK_COMPLETE}, so it cannot count as a pass, and nothing '
-            f'after {stage.id} has run. Its reply is in the run directory '
-            f'under turns/. A --resume runs {stage.id} again.'
-        )
 
     def _report_plan_disputes(
         self,
@@ -3220,88 +3034,6 @@ class PipelineRunner:
             return self._planner_instruction(stage)
         ctx = self._briefing.reader_context(stage)
         return self._briefing.task_block() + (f'\n\n{ctx}' if ctx else '')
-
-    def _check_instruction(self, stage: pipeline.PipelineStage) -> str:
-        """
-        Frame a contract check's turn: check it, and build nothing.
-
-        Carries everything the tests stage worked from and what it
-        wrote, so the check reads the same contract the writers will
-        get. The halting rules are in the turn rather than only in the
-        template, so a pipeline that gives the checker its own prompt
-        still stops on a contract that cannot be met.
-
-        :param stage: The stage declaring ``checks:``.
-        :returns: The turn text.
-        """
-        assert stage.checks is not None
-        target = self._stage_by_id[stage.checks]
-        try:
-            changed = self._wt.node_diff_files(
-                self._run_id, target.id, against=seed_ref(self._ctx, target)
-            )
-        except click.ClickException:
-            changed = []
-        files = (
-            '\n'.join(f'  - {path}' for path in sorted(changed))
-            or '  (none could be listed; read the branch history)'
-        )
-        design = self._briefing.reader_context(target)
-        acceptance = (
-            f'\n\nAcceptance contract:\n{self._config.acceptance}'
-            if self._config.acceptance
-            else ''
-        )
-        preamble = self._briefing.chunk_preamble()
-        return (
-            f'{preamble}CHECK THE CONTRACT before anyone '
-            f'builds against it. Do NOT implement anything and do not '
-            f'change the tests: your mount is read-only, and the writers '
-            f'start only after you reply. Stage {target.id!r} wrote a '
-            f'frozen test suite for the brief below; two writers will '
-            f'each build against it. Read the brief, the acceptance '
-            f'contract, the plan and the suite together, run the suite '
-            f'against this unmodified tree, and decide whether any '
-            f'implementation could satisfy all of them.\n\n'
-            f'Brief:\n{self._config.task}{acceptance}'
-            + (f'\n\n{design}' if design else '')
-            + f'\n\nFiles {target.id!r} added or changed:\n{files}'
-            f'{_CHECK_RULES}{_REVIEW_MOUNT}'
-            f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}'
-            + setup_block(self._config)
-        )
-
-    def _plan_check_instruction(
-        self, stage: pipeline.PipelineStage, plan: str
-    ) -> str:
-        """
-        Frame a plan check's turn: check its facts, build nothing.
-
-        The plan is in the turn because it is not in the tree yet: the
-        check runs before the plan of record is committed.
-
-        :param stage: The stage declaring ``checks: <planner stage>``.
-        :param plan: The consolidated plan the human approved.
-        :returns: The turn text.
-        """
-        acceptance = (
-            f'\n\nAcceptance contract:\n{self._config.acceptance}'
-            if self._config.acceptance
-            else ''
-        )
-        preamble = self._briefing.chunk_preamble()
-        return (
-            f'{preamble}CHECK THE PLAN before it becomes the '
-            f'plan of record. Do NOT implement anything: your mount is '
-            f'read-only, and it is the repository as it stands before any '
-            f'of the plan is built. A human has approved the plan below, '
-            f'pending this check; every later stage will build on it.'
-            f'\n\nBrief:\n{self._config.task}{acceptance}'
-            f'\n\nThe plan ({stage.checks!r}):\n{plan}'
-            f'{_PLAN_CHECK_RULES}{_REVIEW_MOUNT}'
-            f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}'
-            + setup_block(self._config)
-        )
 
     def _planner_instruction(self, stage: pipeline.PipelineStage) -> str:
         """
