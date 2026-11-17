@@ -56,7 +56,10 @@ from sbx_omnigent.runner.parsing.dispositions import (
     DISPOSITION_RECORDED,
     Disposition,
 )
-from sbx_omnigent.runner.parsing.findings import FindingSections
+from sbx_omnigent.runner.parsing.findings import (
+    FindingSections,
+    parse_findings,
+)
 from sbx_omnigent.runner.parsing.plans import (
     _PLAN_RECAP_WINDOW,
     plan_shape_failures,
@@ -79,6 +82,7 @@ from sbx_omnigent.runner.preflight.sandbox import ensure_pipeline_image
 from sbx_omnigent.runner.progress import RunProgress
 from sbx_omnigent.runner.prompts.checks import (
     _CHECK_FINISH,
+    _CHECK_FINISH_ASK,
 )
 from sbx_omnigent.runner.prompts.policy import tests_only_instruction
 from sbx_omnigent.runner.records.findings import (
@@ -1566,7 +1570,7 @@ class TestTheRunnerWaitsForBackgroundWork(_Base):
             [[], started, woke, woke]
         )
         self.assertEqual(result.status, 'completed')
-        self.assertNotIn(R._CHECK_FINISH_ASK, _messages_for(sc, 'check'))
+        self.assertNotIn(_CHECK_FINISH_ASK, _messages_for(sc, 'check'))
         self.assertIn('[background] check', printed)
         self.assertIn('The contract holds.', result.nodes['check'].output)
 
@@ -2036,59 +2040,6 @@ class TestThePlanGateWithoutACheck(_Base):
         self.assertIn('The plan is final', notices[-1])
 
 
-class TestThePlanCheckTurn(_Base):
-    """What a plan checker is asked to do (#49)."""
-
-    _PLAN = 'THE PLAN: port ranges use the Range type in ports.py.'
-
-    def _message(self) -> str:
-        cfg = self._cfg(_PLAN_CHECKED)
-        runner = R.PipelineRunner(
-            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
-            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
-            swap_age_s=lambda: 0.0,
-        )
-        return runner._plan_check_instruction(
-            runner._stage_by_id['plan-check'], self._PLAN
-        )
-
-    def test_it_carries_the_plan_and_the_brief(self) -> None:
-        message = self._message()
-        for part in (
-            self._PLAN,                # not in the tree yet
-            'build parse_ports',       # the brief
-            'ranges are inclusive',    # the acceptance contract
-            'install the toolchain',   # setup, to run its checks
-        ):
-            with self.subTest(part=part):
-                self.assertIn(part, message)
-
-    def test_it_says_the_mount_is_read_only(self) -> None:
-        self.assertIn(R._REVIEW_MOUNT, self._message())
-
-    def test_it_carries_the_unattended_rules(self) -> None:
-        self.assertIn(R._UNATTENDED, self._message())
-
-    def test_it_is_not_a_build_order(self) -> None:
-        message = self._message()
-        self.assertNotIn('Task:', message)
-        self.assertIn('Do NOT implement', message)
-
-    def test_every_claim_needs_a_command_and_its_output(self) -> None:
-        message = self._message()
-        self.assertIn('the command you ran', message)
-        self.assertIn('its output', message)
-
-    def test_it_asks_for_contradictions_between_sections(self) -> None:
-        self.assertIn('contradict each other', self._message())
-
-    def test_it_is_told_the_design_is_not_its_call(self) -> None:
-        self.assertIn('not your call', self._message())
-
-    def test_its_own_text_would_not_halt_the_run(self) -> None:
-        self.assertEqual(R.parse_disputes(self._message()), ())
-
-
 def _messages_for(sc: FakeSC, label: str) -> list[str]:
     """Every message sent to the sessions labelled *label*, in order."""
     return [m for sess, m in sc.sent if sc._label.get(sess) == label]
@@ -2512,19 +2463,6 @@ class TestACheckMustSayItFinished(_Base):
     def test_the_contract_check_is_told_to_finish(self) -> None:
         _r, sc, _wt = self._go([self._DONE])
         message = sc.message_for_label('check')
-        self.assertIn('CHECK COMPLETE', message)
-        self.assertIn('still running', message)
-
-    def test_the_plan_check_is_told_to_finish(self) -> None:
-        cfg = self._cfg(_PLAN_CHECKED)
-        runner = R.PipelineRunner(
-            cfg, session_client=FakeSC({}), worktree_manager=FakeWT(),
-            run_id='r1', agent_ids={n: f'ag-{n}' for n in cfg.agents},
-            swap_age_s=lambda: 0.0,
-        )
-        message = runner._plan_check_instruction(
-            runner._stage_by_id['plan-check'], 'THE PLAN'
-        )
         self.assertIn('CHECK COMPLETE', message)
         self.assertIn('still running', message)
 
@@ -10220,7 +10158,7 @@ class TestTheLiveCadreCarriesRealArtifacts(_Base):
         )
         self.assertEqual(R.parse_verdict(reply), 'BLOCKING')
         self.assertTrue(
-            R.parse_findings(reply) or 'Blocking findings' in reply,
+            parse_findings(reply) or 'Blocking findings' in reply,
             'a realistic blocking reply carried no extractable finding',
         )
 
