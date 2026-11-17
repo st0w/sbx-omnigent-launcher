@@ -5,14 +5,20 @@ Run: python -m unittest tests.test_runner_parsing_verdicts
 
 from __future__ import annotations
 
+import importlib
+import pkgutil
 import unittest
+from pathlib import Path
 
+from sbx_omnigent import runner as runner_package
 from sbx_omnigent.runner.parsing.verdicts import (
+    dispute_near_misses,
     parse_disputes,
     parse_select,
     parse_verdict,
     work_finished,
 )
+from tests.support.disputes import NEAR_MISS_REPLY
 
 _PS_CANDIDATES = ['m0-impl-a', 'm0-impl-b']
 
@@ -188,6 +194,69 @@ class TestParseVerdictAndSelect(unittest.TestCase):
     def test_parse_select(self) -> None:
         self.assertEqual(parse_select('reasons\nSELECT: impl-b'), 'impl-b')
         self.assertIsNone(parse_select('undecided'))
+
+
+class TestADisputeNearMiss(unittest.TestCase):
+    """
+    A correct dispute in the wrong shape was lost in silence.
+
+    `_DISPUTE_RE` demands the marker at the start of a line followed by
+    the claim, and that strictness is right: the bare word appears in
+    almost every healthy report as the instruction echoed back, and
+    halting on it would have killed two shipped builds. So the near
+    miss is REPORTED, not acted on — the run continues, and the one
+    line of output is what turns a silent budget-burning loop into
+    something a human can see.
+    """
+
+    def test_the_heading_form_is_a_near_miss(self) -> None:
+        self.assertTrue(dispute_near_misses(NEAR_MISS_REPLY))
+
+    def test_the_marker_alone_on_a_line_is_a_near_miss(self) -> None:
+        self.assertTrue(dispute_near_misses('**DISPUTED**\n\nbecause x'))
+
+    def test_a_parseable_dispute_is_not_a_near_miss(self) -> None:
+        # It parses, so the halt fires and there is nothing to report.
+        self.assertEqual(
+            dispute_near_misses('DISPUTED: x.py:50 forbids it'), ()
+        )
+
+    def test_a_reply_that_never_mentions_it_is_not_a_near_miss(self) -> None:
+        self.assertEqual(dispute_near_misses('all done, tests green'), ())
+
+    def test_an_instruction_echo_is_not_a_near_miss(self) -> None:
+        # The bare word is in almost every healthy report. Measured
+        # across four campaigns: 34 echoes on the two shipped builds.
+        for echo in (
+            'If it cannot be resolved I will label it DISPUTED and stop.',
+            'Nothing here is DISPUTED.',
+            'I found no DISPUTED findings in this module.',
+            'A contract I cannot satisfy is reported as DISPUTED.',
+        ):
+            with self.subTest(echo=echo):
+                self.assertEqual(dispute_near_misses(echo), ())
+
+    def test_the_shipped_prompts_contain_no_near_miss(self) -> None:
+        # The instruction that ASKS for the marker must not look like
+        # someone using it. Guards every template and turn blob at
+        # once, so a future edit cannot quietly start self-triggering.
+        # Every module of the runner package, so a constant that moves
+        # from one module to another never drops out of this.
+        sources = [
+            v
+            for info in pkgutil.walk_packages(
+                runner_package.__path__, runner_package.__name__ + '.'
+            )
+            for k, v in vars(importlib.import_module(info.name)).items()
+            if k.isupper() and isinstance(v, str) and 'DISPUTED' in v
+        ]
+        sources += [
+            f.read_text(encoding='utf-8')
+            for f in Path('sbx_omnigent/templates').glob('*.md')
+        ]
+        self.assertTrue(sources, 'nothing scanned')
+        for text in sources:
+            self.assertEqual(dispute_near_misses(text), ())
 
 
 if __name__ == '__main__':

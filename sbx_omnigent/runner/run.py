@@ -49,9 +49,11 @@ from sbx_omnigent import (
     pipeline,
 )
 from sbx_omnigent.runner import state
+from sbx_omnigent.runner.briefing import Briefing
 from sbx_omnigent.runner.campaign import Campaign, CampaignHooks
 from sbx_omnigent.runner.captures import TurnCapture
 from sbx_omnigent.runner.context import RunContext
+from sbx_omnigent.runner.disputes import Disputes
 from sbx_omnigent.runner.errors import (
     PipelineRunError,
     _Blocked,
@@ -100,7 +102,6 @@ from sbx_omnigent.runner.parsing.verdicts import (
     _review_done,
     _writer_done,
     check_finished,
-    dispute_near_misses,
     parse_disputes,
     parse_select,
     parse_verdict,
@@ -310,6 +311,8 @@ class PipelineRunner:
         self._notes = FailureNotes(
             self._ctx, registry=self._registry, keep=keep
         )
+        self._briefing = Briefing(self._ctx, progress=self._progress)
+        self._disputes = Disputes(self._ctx, capture=self._capture)
         self._driver = SessionDriver(
             self._ctx,
             registry=self._registry,
@@ -821,84 +824,6 @@ class PipelineRunner:
                 f'[disk] {event}: recorded {len(records)} measurement(s) '
                 f'to {self._wt.metrics_path(self._run_id)}.'
             )
-
-    def _chunk_preamble(self) -> str:
-        """A directive scoping a builder turn to the active chunk."""
-        sub = self._progress.active_subtask
-        if sub is None:
-            return ''
-        # Claiming prior work on the FIRST increment sends an agent
-        # hunting for artifacts that cannot exist, and a careful one
-        # then (rightly) refuses to build against the missing baseline.
-        #
-        # But `active_is_first` is a POSITION in this run's row list,
-        # not a claim about the tree, and the two came apart the moment
-        # a campaign ran against a repo with earlier modules already
-        # merged. On `ingestion-m3-1` every m3a agent was told the tree
-        # was at base state while m0, m0b, m1 and m2 sat in it — handed
-        # to reviewers vetting a module whose brief is "mirror the [m2]
-        # pattern". So say only what the position proves: no earlier
-        # ROW of this run has been built. The tree speaks for itself.
-        prior = (
-            'It is the FIRST increment, so none of the increments '
-            'below has been built yet; do not go looking for their '
-            'artifacts. Anything already in your worktree is earlier, '
-            'separate work — treat it as frozen and build against it.'
-            if self._progress.active_is_first
-            else 'Earlier increments are already implemented in your '
-            'worktree; later ones come afterwards.'
-        )
-        # The title is NOT repeated here: the table below carries it,
-        # marked, and a plan whose rows are full scope paragraphs would
-        # otherwise print the active one twice in every single turn.
-        return (
-            f'This is build increment [{sub.id}] of a multi-part plan. '
-            f'{prior} Do ONLY this increment now — not the '
-            'whole plan.\n\nThe full increment list, in order — the '
-            f'marked row is yours:\n\n{self._increment_table(sub)}\n\n'
-            'The Task below is the contract for the WHOLE plan, not for '
-            'your increment alone. A requirement it states that another '
-            "row owns is that row's job — not yours, and NOT missing."
-            '\n\n'
-        )
-
-    def _increment_table(self, sub: pipeline.Subtask) -> str:
-        """
-        The ordered increment list, the active row marked.
-
-        Every role — writer, reviewer and judge alike — is handed the
-        WHOLE plan's brief as its contract, with the active increment as
-        a one-line qualifier above it. A reviewer reading a 15,000-word
-        brief that says "pagination on every listing call" and seeing an
-        unpaginated call has, from where it stands, found an unmet
-        requirement that nobody owns; blocking on it is the faithful
-        move. Observed live on `gcp-scope-topology-1`: the [topology]
-        bug reviewer blocked on `ListServiceAccounts` pagination, which
-        the plan assigns to [identities], and the writer — for whom a
-        blocking finding is not optional — implemented it. The judge
-        then scored that as a strength.
-
-        Showing the other rows converts "nobody has done this" into
-        "row [identities] owns this", which is the only form a reviewer
-        can reasonably let pass. Exactly the reasoning behind
-        :meth:`_module_table` one level up, where a planner shown only
-        its own row designed its neighbours' scope into its module.
-
-        :param sub: The increment being worked.
-        :returns: One ``[id] title`` row per increment: ``✓`` for one
-            already published, ``▶`` for the active one, blank for one
-            still to come.
-        """
-        rows = []
-        for other in self._progress.subtasks:
-            if other.id == sub.id:
-                mark = '▶'
-            elif other.id in self._progress.completed_chunks:
-                mark = '✓'
-            else:
-                mark = ' '
-            rows.append(f'    {mark} [{other.id}] {other.title}')
-        return '\n'.join(rows)
 
     def _dispose_prewarmed(self) -> None:
         """
@@ -1447,7 +1372,7 @@ class PipelineRunner:
         )
         self._nodes[stage.id] = node
         if not is_planner(stage, self._config):
-            self._halt_on_reader_dispute(stage)
+            self._disputes.halt_on_reader(stage)
         if is_planner(stage, self._config):
             in_module = self._progress.active_subtask is not None
             if self._interactive_plan:
@@ -1472,7 +1397,7 @@ class PipelineRunner:
                 node.output = self._sc.read_latest_reply(session) or out
                 # Nobody is in the session to settle a dispute, so one
                 # can only stop the run.
-                self._halt_on_plan_disputes(
+                self._disputes.halt_on_plan(
                     stage, self._run_plan_checks(stage, node.output)
                 )
             if not in_module:
@@ -1489,7 +1414,7 @@ class PipelineRunner:
                     )
             else:
                 # Per-module: this planner's design reaches THIS
-                # module's builders via _reader_context (needs the
+                # module's builders via the briefing (needs the
                 # planner node) and is committed per-module in
                 # Campaign._publish — it never overwrites the human
                 # module list nor the plan of record. What it CAN
@@ -1516,8 +1441,9 @@ class PipelineRunner:
         reviewers' reports, so its findings reach the findings ledger
         and the verifier like theirs. ``turns/`` alone would lose them:
         a completed run deletes its run directory. It never reaches the
-        writers as design context — :meth:`_reader_context` passes on
-        readers only — and it is not counted as a vote on the branch.
+        writers as design context — :meth:`Briefing.reader_context`
+        passes on readers only — and it is not counted as a vote on the
+        branch.
 
         :param stage: The stage declaring ``checks:``.
         :raises PipelineRunError: When the check raised a dispute.
@@ -1529,7 +1455,7 @@ class PipelineRunner:
             # a live plan stage runs its checks inside its approval.
             node = self._nodes.get(target.id)
             plan = node.output if node is not None else ''
-            self._halt_on_plan_disputes(
+            self._disputes.halt_on_plan(
                 target,
                 [
                     (stage.id, claim)
@@ -1549,7 +1475,7 @@ class PipelineRunner:
         self._nodes[stage.id] = NodeResult(
             stage.id, 'check', worktree=wt, session=session, output=out
         )
-        self._halt_on_reader_dispute(stage)
+        self._disputes.halt_on_reader(stage)
         self._halt_on_unfinished_check(stage, session, out)
         self._book.record_review(
             stage.id, stage.run[0], self._book.next_round(stage.id),
@@ -1850,7 +1776,7 @@ class PipelineRunner:
             claims = (claim,)
             out = f'{claim}\n\nIts last reply:\n\n{out}'
         elif not claims:
-            self._warn_dispute_near_miss(check.id, out)
+            self._disputes.warn_near_miss(check.id, out)
         self._nodes[check.id] = NodeResult(
             check.id, 'check', worktree=wt, session=session, output=out
         )
@@ -1970,34 +1896,6 @@ class PipelineRunner:
             f'with the full reports. Settle them there, then reply '
             f'APPROVED (consolidated and checked again) or '
             f'{_APPROVED_AS_IS} (accepted without another check).'
-        )
-
-    def _halt_on_plan_disputes(
-        self,
-        stage: pipeline.PipelineStage,
-        disputes: list[tuple[str, str]],
-    ) -> None:
-        """
-        Stop when a plan nobody can revise has disputed claims.
-
-        Unattended planning, or a plan finished in an earlier attempt:
-        there is no human in the planning session to settle a dispute.
-
-        :param stage: The plan stage.
-        :param disputes: ``(check id, claim)`` per dispute.
-        :raises PipelineRunError: When there is any dispute.
-        """
-        if not disputes:
-            return
-        listed = '\n'.join(f'  [{cid}] {claim}' for cid, claim in disputes)
-        raise PipelineRunError(
-            f'{stage.id}: the plan check raised {len(disputes)} '
-            f'dispute(s) — a claim the repository contradicts, or two '
-            f'sections that contradict each other:\n\n{listed}\n\n'
-            f'Nothing after the plan has run, and nobody is in the '
-            f'planning session to settle it. The full reports are in the '
-            f'run directory under reviews/. Correct the brief, or plan '
-            f'interactively, and re-run.'
         )
 
     def _plan_consolidation_instruction(self) -> str:
@@ -2182,7 +2080,7 @@ class PipelineRunner:
         # Before the gates below: both answer a problem by re-driving,
         # and a writer cannot re-drive its way out of a contract it
         # cannot satisfy.
-        self._halt_on_writer_dispute(stage)
+        self._disputes.halt_on_writer(stage)
         self._policy.enforce(stage)
         self._progress.last_branch_node = stage.id
 
@@ -2742,7 +2640,7 @@ class PipelineRunner:
                 raise _Blocked(
                     stage.id, self._book.rounds_spent(stage.id) + 1
                 )
-            self._halt_on_dispute(stage, outputs, blocking)
+            self._disputes.halt_on_review(stage, outputs, blocking)
             rounds = self._book.spend_round(stage.id)
             if rounds > self._max_rounds or not stage.on_block:
                 self._nodes[stage.id] = NodeResult(
@@ -2793,205 +2691,6 @@ class PipelineRunner:
             f'[environment] {stage_id}: the sandbox stopped '
             f'{len(fresh)} supplementary check(s). They were not run, '
             f'and are not filed as findings:\n{listed}'
-        )
-
-    def _warn_dispute_near_miss(self, label: str, text: str | None) -> None:
-        """
-        Say so when a reply declares a dispute the parser cannot read.
-
-        WARNS and returns. Halting here would mean acting on the bare
-        word, which is the false-positive risk :data:`_DISPUTE_RE` was
-        tightened to avoid; saying nothing is what let a correct
-        refusal be relayed until the round budget died, with nobody
-        told why.
-
-        :param label: The stage or reviewer whose reply it was.
-        :param text: That reply.
-        """
-        missed = dispute_near_misses(text)
-        if not missed:
-            return
-        click.echo(
-            f'[dispute] {label}: its reply declares a dispute the '
-            f'orchestrator cannot read, so the run is CONTINUING and '
-            f'will keep relaying this finding until the round budget '
-            f'is gone. A dispute is only heard as `DISPUTED:` at the '
-            f'START OF A LINE, followed by the claim — in a heading or '
-            f'as a label it is invisible. Found: '
-            + '; '.join(repr(line) for line in missed)
-        )
-
-    def _halt_on_writer_dispute(self, stage: pipeline.PipelineStage) -> None:
-        """
-        Stop when a WRITER says its own contract cannot be satisfied.
-
-        :meth:`_halt_on_dispute` covers the review path, but a writer
-        meets an impossible contract first: it is the party that has to
-        satisfy it. Its dispute was parsed by nothing and the run
-        carried on to discover the same thing the expensive way.
-
-        Observed on `ingestion-m2-3`. An implementer reported three
-        unsatisfiable tests with file:line — a fixture value one test
-        required persisted and another forbade, a SQL alias on the
-        reserved word ``constraint`` that cannot parse, and a
-        frozen-API call with the wrong signature. Every one correct.
-        The run continued 51 minutes, reviewed both candidates and
-        forfeited with nothing published; the sibling had made that same
-        broken test pass by EDITING A FROZEN MODULE, which is the breach
-        the frozen boundary exists to prevent. An impossible contract
-        does not merely fail a candidate — it pushes one into the
-        violation.
-
-        Called AFTER the stage commits, so the disputed work is durable
-        and a resume keeps it (that implementer had 2,013 insertions on
-        its branch), and BEFORE the tests-only and
-        implementation-present gates, which answer a dispute by
-        re-driving a writer that cannot act on it.
-
-        :param stage: The writer stage that just finished.
-        :raises PipelineRunError: When the writer raised a dispute.
-        """
-        claims = self._stage_disputes(stage, 'disputed its own contract')
-        if not claims:
-            return
-        listed = '\n'.join(f'  {claim}' for claim in claims)
-        raise PipelineRunError(
-            f'{stage.id}: the writer raised {len(claims)} dispute(s) — it '
-            f'says its own contract is impossible, not that its code is '
-            f'wrong:\n\n{listed}\n\nRe-driving {stage.id} cannot '
-            f'resolve this: it is not the party that can change what is '
-            f'disputed. A contract no implementation can satisfy does not '
-            f'just fail this stage — it pressures the next one into '
-            f'breaking a frozen boundary to get green. Its full reply is '
-            f'in the run directory under turns/; read it, settle the '
-            f'contract, and re-run.'
-        )
-
-    def _halt_on_reader_dispute(self, stage: pipeline.PipelineStage) -> None:
-        """
-        Stop when a READER says the contract cannot be satisfied.
-
-        Every reader turn ends with :data:`_UNATTENDED`, which tells it
-        to stop on a ``DISPUTED:`` line when a conflict cannot be
-        resolved, and nothing read it: a reader that did as told was
-        ignored, and the writers after it built against the contract it
-        had just disputed. A read-only check of the tests before the
-        writers (#50), or of the plan's claims after it (#49), is only
-        worth running if its dispute stops the run.
-
-        Called before the stage completes, so a resume runs the reader
-        again once the contract is settled. Not for the planner: it is
-        never told about the marker, and a human approves its plan.
-
-        :param stage: The reader stage that just finished.
-        :raises PipelineRunError: When the reader raised a dispute.
-        """
-        claims = self._stage_disputes(stage, 'disputed the contract')
-        if not claims:
-            return
-        listed = '\n'.join(f'  {claim}' for claim in claims)
-        role = 'contract check' if stage.checks else 'reader'
-        raise PipelineRunError(
-            f'{stage.id}: the {role} raised {len(claims)} dispute(s) — it '
-            f'says the contract the stages after it would build on cannot '
-            f'be satisfied:\n\n{listed}\n\nNothing after {stage.id} has '
-            f'run. Its full reply is in the run directory under turns/; '
-            f'read it, settle the contract, and re-run. A --resume runs '
-            f'{stage.id} again.'
-        )
-
-    def _stage_disputes(
-        self, stage: pipeline.PipelineStage, captured_as: str
-    ) -> tuple[str, ...]:
-        """
-        The disputes in a finished stage's reply, its reply captured.
-
-        Warns on a near miss and returns nothing, so the caller only
-        has to word its halt.
-
-        :param stage: The writer or reader stage that just finished.
-        :param captured_as: Why the turn is captured, for its record.
-        :returns: The claims, or ``()`` when there are none.
-        """
-        node = self._nodes.get(stage.id)
-        output = node.output if node else None
-        claims = parse_disputes(output)
-        if not claims:
-            self._warn_dispute_near_miss(stage.id, output)
-            return ()
-        # The claim after the marker is one line. The REASONING that
-        # makes it actionable — which test, which two clauses, why no
-        # code satisfies both — is the rest of the reply, and this
-        # stage is about to end the run and dispose the VM. Capture
-        # before raising, the same reason `_await_plan_approval` does.
-        # Live on `ingestion-m2-5` this was missing: the halt fired
-        # correctly and the human was left with "m2 cannot be marked
-        # complete under the binding constraints" and no way to learn
-        # why.
-        if node is not None and node.session:
-            self._capture.turn(node.session, captured_as)
-        return claims
-
-    def _halt_on_dispute(
-        self,
-        stage: pipeline.PipelineStage,
-        outputs: dict[str, str],
-        blocking: list[str],
-    ) -> None:
-        """
-        Stop when a blocking reviewer says the CONTRACT cannot be met.
-
-        A BLOCKING verdict means the code is wrong, and re-driving the
-        writer is the answer. A dispute means the writer's own contract
-        is impossible — a test no implementation can pass, two stages
-        disagreeing — and re-driving the writer cannot resolve it: it is
-        not the party able to change the thing at fault.
-
-        Without this the run spends its whole review budget relaying an
-        unanswerable finding. Both [m2] campaigns did that: 9 and
-        10 correct disputes, ignored, four blocked rounds on every
-        candidate, and every candidate forfeited with nothing published.
-
-        Only a BLOCKING reviewer's dispute counts. One raised beside an
-        APPROVAL is an observation, and the run is not stuck on it.
-
-        :param stage: The review stage that just blocked.
-        :param outputs: Each reviewer's reply, by agent name.
-        :param blocking: The reviewers that returned BLOCKING.
-        :raises PipelineRunError: When a blocking reviewer disputes.
-        """
-        disputes = [
-            (name, claim)
-            for name in blocking
-            for claim in parse_disputes(outputs.get(name))
-        ]
-        if not disputes:
-            # Only a BLOCKING reviewer's, for the same reason the halt
-            # is: one raised beside an approval is an observation, and
-            # the run is not stuck on it.
-            for name in blocking:
-                self._warn_dispute_near_miss(name, outputs.get(name))
-            return
-        self._nodes[stage.id] = NodeResult(
-            stage.id, 'review', verdict='BLOCKING'
-        )
-        listed = '\n'.join(
-            f'  [{name}] {claim}' for name, claim in disputes
-        )
-        target = stage.on_block or 'the writer'
-        click.echo(
-            f'[review] {stage.id}: HALTING — a blocking reviewer says the '
-            f'contract itself cannot be satisfied. Re-driving {target} '
-            f'cannot fix that, so the remaining rounds would be spent '
-            f'relaying it.'
-        )
-        raise PipelineRunError(
-            f'{stage.id}: {len(disputes)} dispute(s) raised alongside a '
-            f'BLOCKING verdict — a stage says its own contract is '
-            f'impossible, not that the code is wrong:\n\n{listed}\n\n'
-            f'Re-driving {target} cannot resolve this: it is not the '
-            f'party that can change what is disputed. Read the reviewer '
-            f'reports, settle the contract, and re-run.'
         )
 
     @staticmethod
@@ -3512,23 +3211,6 @@ class PipelineRunner:
 
     # ── instruction composition ───────────────────────────────────
 
-    def _task_block(self) -> str:
-        block = f'{self._chunk_preamble()}Task:\n{self._config.task}'
-        if self._config.acceptance:
-            block += f'\n\nAcceptance contract:\n{self._config.acceptance}'
-        return (
-            f'{block}\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}'
-            + setup_block(self._config)
-        )
-
-    def _reader_context(self, stage: pipeline.PipelineStage) -> str:
-        parts = []
-        for need in stage.needs:
-            node = self._nodes.get(need)
-            if node and node.kind == 'reader' and node.output:
-                parts.append(f'--- Design from {need} ---\n{node.output}')
-        return '\n\n'.join(parts)
-
     def _reader_instruction(self, stage: pipeline.PipelineStage) -> str:
         # A planner must be told to PLAN the feature, not handed the raw
         # "Task: add <feature>" implementation directive — else the
@@ -3536,8 +3218,8 @@ class PipelineRunner:
         # and it tries to implement (or hunt for a writable path).
         if is_planner(stage, self._config):
             return self._planner_instruction(stage)
-        ctx = self._reader_context(stage)
-        return self._task_block() + (f'\n\n{ctx}' if ctx else '')
+        ctx = self._briefing.reader_context(stage)
+        return self._briefing.task_block() + (f'\n\n{ctx}' if ctx else '')
 
     def _check_instruction(self, stage: pipeline.PipelineStage) -> str:
         """
@@ -3564,14 +3246,15 @@ class PipelineRunner:
             '\n'.join(f'  - {path}' for path in sorted(changed))
             or '  (none could be listed; read the branch history)'
         )
-        design = self._reader_context(target)
+        design = self._briefing.reader_context(target)
         acceptance = (
             f'\n\nAcceptance contract:\n{self._config.acceptance}'
             if self._config.acceptance
             else ''
         )
+        preamble = self._briefing.chunk_preamble()
         return (
-            f'{self._chunk_preamble()}CHECK THE CONTRACT before anyone '
+            f'{preamble}CHECK THE CONTRACT before anyone '
             f'builds against it. Do NOT implement anything and do not '
             f'change the tests: your mount is read-only, and the writers '
             f'start only after you reply. Stage {target.id!r} wrote a '
@@ -3606,8 +3289,9 @@ class PipelineRunner:
             if self._config.acceptance
             else ''
         )
+        preamble = self._briefing.chunk_preamble()
         return (
-            f'{self._chunk_preamble()}CHECK THE PLAN before it becomes the '
+            f'{preamble}CHECK THE PLAN before it becomes the '
             f'plan of record. Do NOT implement anything: your mount is '
             f'read-only, and it is the repository as it stands before any '
             f'of the plan is built. A human has approved the plan below, '
@@ -3617,29 +3301,6 @@ class PipelineRunner:
             f'{_PLAN_CHECK_RULES}{_REVIEW_MOUNT}'
             f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}'
             + setup_block(self._config)
-        )
-
-    def _module_table(self, sub: pipeline.Subtask) -> str:
-        """
-        The full ordered module list, with the active one marked.
-
-        A per-module planner is otherwise shown ONLY its own row, so it
-        cannot tell which adjacent work belongs to somebody else and
-        reasonably designs the neighbours' scope into its module.
-        Observed live: module 0's planner specified the storage layer
-        and snapshot diffing that the human's own table assigns to
-        module 1, and the test writer stopped to ask which bar to hold
-        it to — the one time that conflict was caught rather than
-        frozen into a test suite.
-
-        :param sub: The module being designed.
-        :returns: One ``[id] title`` row per module, the active one
-            arrow-marked.
-        """
-        return '\n'.join(
-            f'{"▶ " if other.id == sub.id else "  "}'
-            f'[{other.id}] {other.title}'
-            for other in self._progress.subtasks
         )
 
     def _planner_instruction(self, stage: pipeline.PipelineStage) -> str:
@@ -3669,7 +3330,7 @@ class PipelineRunner:
                 'marked with an arrow. Every other row is designed and '
                 'built in its OWN run — do not design, implement, or '
                 'pull their scope into yours:\n'
-                f'{self._module_table(sub)}\n\n'
+                f'{self._briefing.module_table(sub)}\n\n'
                 + (
                     'This is the FIRST module of this run: no '
                     'earlier module of this run has been built, so '
@@ -3726,7 +3387,7 @@ class PipelineRunner:
                 'questions — ask what you need, then invite them to reply '
                 '"APPROVED" to release the plan.'
             )
-        ctx = self._reader_context(stage)
+        ctx = self._briefing.reader_context(stage)
         if ctx:
             instr += f'\n\n{ctx}'
         return instr
@@ -3743,8 +3404,8 @@ class PipelineRunner:
         # feature" — same role-framing reason as the test writer.
         if self._is_refactor(stage):
             return self._refactor_instruction(stage)
-        instr = f'{self._task_block()}\n\n{_WRITER_BUILD}'
-        ctx = self._reader_context(stage)
+        instr = f'{self._briefing.task_block()}\n\n{_WRITER_BUILD}'
+        ctx = self._briefing.reader_context(stage)
         if ctx:
             instr += f'\n\n{ctx}'
         if self._has_upstream_tests(stage):
@@ -3769,7 +3430,7 @@ class PipelineRunner:
         test-author role prompt: add tests only, do not implement.
         """
         instr = (
-            f'{self._chunk_preamble()}'
+            f'{self._briefing.chunk_preamble()}'
             'Write a failing TEST SUITE for the feature described below. '
             'A separate implementer will write the production code to make '
             'your tests pass — you must NOT implement the feature yourself '
@@ -3786,7 +3447,7 @@ class PipelineRunner:
             f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}\n\n{_WRITER_BUILD}'
             + setup_block(self._config)
         )
-        ctx = self._reader_context(stage)
+        ctx = self._briefing.reader_context(stage)
         if ctx:
             instr += f'\n\n{ctx}'
         return instr
@@ -3842,7 +3503,7 @@ class PipelineRunner:
         :returns: The first-turn instruction.
         """
         instr = (
-            f'{self._chunk_preamble()}'
+            f'{self._briefing.chunk_preamble()}'
             'A COMPLETE, WORKING implementation (the winning candidate) '
             'is already in your worktree.\n\n'
             f'{self._refactor_contract()}\n\n'
@@ -3858,7 +3519,7 @@ class PipelineRunner:
             f'\n\n{_UNATTENDED}\n\n{_DISPOSABLE_VM}\n\n{_WRITER_BUILD}'
             + setup_block(self._config)
         )
-        ctx = self._reader_context(stage)
+        ctx = self._briefing.reader_context(stage)
         if ctx:
             instr += f'\n\n{ctx}'
         return instr
@@ -3902,7 +3563,7 @@ class PipelineRunner:
             else ''
         )
         return (
-            self._task_block()
+            self._briefing.task_block()
             + _REVIEW_MOUNT
             + '\n\nReview the working tree in your mount against this '
             'contract.'
@@ -3982,7 +3643,7 @@ class PipelineRunner:
             else ''
         )
         return (
-            f'{self._chunk_preamble()}'
+            f'{self._briefing.chunk_preamble()}'
             'You are reviewing a REFACTOR. A complete implementation of '
             'this increment was reviewed on its own merits and APPROVED '
             'by consensus before it reached this stage; a separate '
@@ -4167,7 +3828,7 @@ class PipelineRunner:
         """
         listed = ', '.join(f'./{c}' for c in candidates)
         instr = (
-            self._task_block()
+            self._briefing.task_block()
             + f'\n\nCompare the candidate implementations in {listed} '
             'against this contract, then end your reply with a line '
             'reading exactly:\n\n    SELECT: <id>\n\nwhere <id> is '

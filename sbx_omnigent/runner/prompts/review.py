@@ -189,13 +189,13 @@ _REVIEW_VERDICT_LINE = (
 
 #: How a REVIEWER reports a contract that cannot be satisfied.
 #:
-#: `_halt_on_dispute` stops the run on a blocking reviewer's dispute,
-#: but reviewers were never told how to raise one: implementation
-#: reviewers met the marker only in :data:`_UNATTENDED`, whose wording
-#: and example are a writer's, and refactor reviewers never met it. A
-#: reviewer who could not name the channel blocked instead, re-driving
-#: a writer who cannot change the contract until the rounds ran out
-#: (#48).
+#: `Disputes.halt_on_review` stops the run on a blocking reviewer's
+#: dispute, but reviewers were never told how to raise one:
+#: implementation reviewers met the marker only in :data:`_UNATTENDED`,
+#: whose wording and example are a writer's, and refactor reviewers
+#: never met it. A reviewer who could not name the channel blocked
+#: instead, re-driving a writer who cannot change the contract until
+#: the rounds ran out (#48).
 #:
 #: The bar is deliberately high, so a halt reaches a human with both
 #: sides of the conflict on the page. The marker is kept mid-sentence:
