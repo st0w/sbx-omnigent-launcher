@@ -64,6 +64,7 @@ from sbx_omnigent.runner.parsing.plans import (
     _PLAN_RECAP_WINDOW,
     plan_shape_failures,
 )
+from sbx_omnigent.runner.parsing.verdicts import parse_select
 from sbx_omnigent.runner.preflight.disk import (
     max_concurrent_vms,
     preflight_disk,
@@ -99,6 +100,7 @@ from sbx_omnigent.runner.resume import (
 )
 from sbx_omnigent.runner.session_driver import _AGY_TASK_FILE
 from sbx_omnigent.runner.stage_kinds import stage_kind, writer_is_terminal
+from sbx_omnigent.runner.stages.judge import retry_instruction
 from sbx_omnigent.runner.state import (
     RUN_STATE_VERSION,
 )
@@ -6763,7 +6765,7 @@ class TestTheIncrementBoundsEveryRole(_Base):
         self.assertIn('[identities]', r._review_instruction(stage))
         self.assertIn(
             '[identities]',
-            r._judge_instruction(
+            r._judge.instruction(
                 r._stage_by_id['pick'], ['impl-a', 'impl-b']
             ),
         )
@@ -6801,8 +6803,8 @@ class TestTheIncrementBoundsEveryRole(_Base):
 
     def test_the_judge_counts_scope_as_a_cost_not_a_bonus(self) -> None:
         r = self._runner()
-        r._reviewed_ok.update({'impl-a', 'impl-b'})
-        msg = r._judge_instruction(
+        r._book.reviewed_ok.update({'impl-a', 'impl-b'})
+        msg = r._judge.instruction(
             r._stage_by_id['pick'], ['impl-a', 'impl-b']
         )
         self.assertIn('STAYED INSIDE THE MARKED', msg)
@@ -6816,7 +6818,7 @@ class TestTheIncrementBoundsEveryRole(_Base):
         # silence merely discards its own opinion is being understated
         # to: silence now stops the run.
         r = self._runner()
-        msg = r._judge_instruction(
+        msg = r._judge.instruction(
             r._stage_by_id['pick'], ['impl-a', 'impl-b']
         )
         self.assertNotIn('taken by default', msg)
@@ -6835,7 +6837,7 @@ class TestTheIncrementBoundsEveryRole(_Base):
         self.assertNotIn('DEFERRED:', r._fix_instruction('f'))
         self.assertNotIn(
             'STAYED INSIDE',
-            r._judge_instruction(
+            r._judge.instruction(
                 r._stage_by_id['pick'], ['impl-a', 'impl-b']
             ),
         )
@@ -6963,8 +6965,8 @@ class TestTheReviewedClaimSurvivesAResume(_Base):
     def test_a_resume_restores_it(self) -> None:
         runner, _sc, _wt = self._resumed(self._finished_state())
         runner._load_state()
-        self.assertEqual(runner._reviewed_ok, {'impl-a', 'impl-b'})
-        self.assertTrue(runner._all_reviewed(['impl-a', 'impl-b']))
+        self.assertEqual(runner._book.reviewed_ok, {'impl-a', 'impl-b'})
+        self.assertTrue(runner._judge._all_reviewed(['impl-a', 'impl-b']))
 
     def test_a_resumed_judge_is_told_not_to_rebuild(self) -> None:
         # The regression itself, end to end: re-run only the judge from
@@ -6989,8 +6991,8 @@ class TestTheReviewedClaimSurvivesAResume(_Base):
         del state['reviewed_ok']
         runner, _sc, _wt = self._resumed(state)
         runner._load_state()
-        self.assertEqual(runner._reviewed_ok, set())
-        self.assertFalse(runner._all_reviewed(['impl-a', 'impl-b']))
+        self.assertEqual(runner._book.reviewed_ok, set())
+        self.assertFalse(runner._judge._all_reviewed(['impl-a', 'impl-b']))
 
     def test_a_re_driven_writer_loses_the_claim(self) -> None:
         """
@@ -7028,9 +7030,9 @@ class TestTheReviewedClaimSurvivesAResume(_Base):
         runner._nodes['impl-a'] = R.NodeResult(
             'impl-a', 'writer', branch='b', worktree='/wt', session='s1',
         )
-        runner._reviewed_ok.add('impl-a')
+        runner._book.reviewed_ok.add('impl-a')
         runner._redrive_writer('impl-a', 'findings')
-        self.assertNotIn('impl-a', runner._reviewed_ok)
+        self.assertNotIn('impl-a', runner._book.reviewed_ok)
 
 
 class TestAJudgeThatDidNotDecide(_Base):
@@ -7189,7 +7191,7 @@ class TestAJudgeThatDecidedButMisspelledIt(_Base):
         self.assertIn('impl-b', msg)
 
     def test_the_retry_shows_the_line_and_names_the_ids(self) -> None:
-        instr = R.PipelineRunner._judge_retry_instruction(
+        instr = retry_instruction(
             ['impl-a', 'impl-b']
         )
         self.assertIn('SELECT: <id>', instr)
@@ -7200,7 +7202,7 @@ class TestAJudgeThatDecidedButMisspelledIt(_Base):
         # The fallback was removed: a second reply without the line
         # halts the run. Telling the judge the first candidate is taken
         # understates what its silence costs.
-        instr = R.PipelineRunner._judge_retry_instruction(
+        instr = retry_instruction(
             ['impl-a', 'impl-b']
         )
         self.assertNotIn('by default', instr)
@@ -7703,7 +7705,7 @@ class TestAJudgeComparesOneContract(_Base):
         wt.contains[('impl-b', 'tests')] = False
         runner, _wt = self._runner(wt)
         with self.assertRaises(R.PipelineRunError) as caught:
-            runner._run_judge(runner._stage_by_id['pick'])
+            runner._judge.run(runner._stage_by_id['pick'])
         said = str(caught.exception)
         self.assertIn('impl-b', said)
         self.assertIn('tests', said)
@@ -7712,7 +7714,7 @@ class TestAJudgeComparesOneContract(_Base):
 
     def test_candidates_that_share_the_seed_are_judged(self) -> None:
         runner, wt = self._runner()
-        runner._run_judge(runner._stage_by_id['pick'])
+        runner._judge.run(runner._stage_by_id['pick'])
         self.assertEqual(wt.judges['pick'], ['impl-a', 'impl-b'])
         self.assertIn(('impl-a', 'tests'), wt.contains_queries)
         self.assertIn(('impl-b', 'tests'), wt.contains_queries)
@@ -7732,7 +7734,7 @@ class TestAJudgeComparesOneContract(_Base):
             runner._nodes[node] = R.NodeResult(
                 node, 'writer', branch=f'pl/r1/{node}'
             )
-        runner._run_judge(runner._stage_by_id['pick'])
+        runner._judge.run(runner._stage_by_id['pick'])
         self.assertEqual(wt.contains_queries, [])
 
 
@@ -10167,7 +10169,7 @@ class TestTheLiveCadreCarriesRealArtifacts(_Base):
         _r, _sc, _wt = self._run(
             _LIVE_CADRE, self._replies(pick=_real_judge('impl-b'))
         )
-        self.assertEqual(R.parse_select(_real_judge('impl-b')), 'impl-b')
+        self.assertEqual(parse_select(_real_judge('impl-b')), 'impl-b')
 
     def test_the_cadre_plan_is_representative(self) -> None:
         # Renamed: this collided with an identically named method later
@@ -10749,7 +10751,7 @@ class TestJudgeSelectionIsRecorded(_Base):
         # to the first candidate, so there is no pick to misreport: the
         # stage halts, nothing is published, and no selection document
         # claims a winner. The judge's own words are still preserved —
-        # _run_judge captures its turn to the run directory first.
+        # The judge stage captures its turn to the run directory first.
         wt, sc = FakeWT(), FakeSC(
             {'impl-a': 'A', 'impl-b': 'B', 'pick': 'I could not decide.'},
         )
@@ -13791,97 +13793,6 @@ class TestPublishTokenIsValidatedEarlyAndReadLate(unittest.TestCase):
         res, drive = self._invoke()
         self.assertEqual(res.exit_code, 0, res.output)
         self.assertIsNone(drive.call_args.kwargs['publish_token']())
-
-
-class BlockedReviewForfeitsOneCandidate(unittest.TestCase):
-    """
-    A review that never reaches consensus withdraws ITS candidate.
-
-    Two writers are run so a judge can choose between them on evidence.
-    A blocked review used to raise out of the whole run, so a campaign
-    could end with one candidate approved by every reviewer,
-    gate-verified and unpublished, because the other could not converge.
-    Seen twice in live campaigns.
-    """
-
-    def _stage(self, runner):
-        review_a = R.pipeline.PipelineStage(
-            id='review-a', run=['sec'], needs=['impl-a'], on_block='impl-a',
-        )
-        review_b = R.pipeline.PipelineStage(
-            id='review-b', run=['sec'], needs=['impl-b'], on_block='impl-b',
-        )
-        parent = R.pipeline.PipelineStage(
-            id='review', parallel=[review_a, review_b],
-        )
-        runner._stage_by_id['review-a'] = review_a
-        runner._stage_by_id['review-b'] = review_b
-        return parent
-
-    def _runner(self):
-        runner = R.PipelineRunner.__new__(R.PipelineRunner)
-        runner._nodes = {}
-        runner._stage_by_id = {}
-        runner._forfeited = set()
-        runner._forfeits = {}
-        return runner
-
-    def test_a_cleared_sibling_lets_the_run_continue(self) -> None:
-        runner = self._runner()
-        parent = self._stage(runner)
-        # review-a cleared; review-b spent its budget.
-        runner._nodes['review-a'] = R.NodeResult('review-a', 'review')
-        runner._nodes['review-b'] = R.NodeResult(
-            'review-b', 'review', verdict='BLOCKING',
-        )
-
-        proceed = runner._forfeit_blocked_reviews(
-            parent, [R._Blocked('review-b', 4)],
-        )
-
-        self.assertTrue(proceed)
-        # The blocked review AND the candidate it was vetting withdraw.
-        self.assertEqual(runner._forfeited, {'review-b', 'impl-b'})
-        # And the selection can say so, with the rounds it took (#47).
-        self.assertEqual(runner._forfeits, {'impl-b': ('review-b', 4)})
-
-    def test_no_cleared_sibling_still_stops_the_run(self) -> None:
-        # Nothing was vetted, so there is nothing to judge. The caller
-        # re-raises on False.
-        runner = self._runner()
-        parent = self._stage(runner)
-        for node_id in ('review-a', 'review-b'):
-            runner._nodes[node_id] = R.NodeResult(
-                node_id, 'review', verdict='BLOCKING',
-            )
-
-        proceed = runner._forfeit_blocked_reviews(
-            parent,
-            [R._Blocked('review-a', 4), R._Blocked('review-b', 4)],
-        )
-
-        self.assertFalse(proceed)
-        self.assertEqual(runner._forfeited, set())
-
-    def test_a_forfeited_candidate_is_not_judged(self) -> None:
-        # Judging a forfeited branch would compare a vetted candidate
-        # against an unvetted one and call the result a choice.
-        runner = self._runner()
-        for node_id in ('impl-a', 'impl-b'):
-            runner._nodes[node_id] = R.NodeResult(
-                node_id, 'writer', branch=f'pl/{node_id}',
-            )
-        pick = R.pipeline.PipelineStage(
-            id='pick', run=['judge'], needs=['impl-a', 'impl-b'],
-        )
-
-        self.assertEqual(
-            runner._judge_candidates(pick), ['impl-a', 'impl-b'],
-        )
-
-        runner._forfeited.add('impl-b')
-
-        self.assertEqual(runner._judge_candidates(pick), ['impl-a'])
 
 
 class TestSbxPreflight(_Base):

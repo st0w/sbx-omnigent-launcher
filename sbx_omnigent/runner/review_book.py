@@ -43,6 +43,13 @@ class ReviewBook:
         run dir immediately and committed to the winner at publish.
     :ivar picks: The judge's choices, so the two-writer race can be
         evaluated over a series of modules rather than trusted.
+    :ivar reviewed_ok: Writer nodes whose review stage reached APPROVED
+        consensus, so a judge can be told its candidates are already
+        verified and need not be re-built. Persisted with the run
+        state: losing it on a resume left a judge untold, and an
+        untold judge starts a workspace build it cannot finish inside
+        its one turn. Re-driving a writer drops it from here the
+        moment its branch changes, which keeps the claim honest.
     """
 
     def __init__(
@@ -57,6 +64,7 @@ class ReviewBook:
         self._save_state = save_state
         self.reviews: list[ReviewRecord] = []
         self.picks: list[JudgePick] = []
+        self.reviewed_ok: set[str] = set()
         #: Review rounds spent per stage, THIS PROCESS.
         #:
         #: Deliberately not in the run state. The cap bounds the
