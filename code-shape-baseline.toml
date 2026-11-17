@@ -8,11 +8,11 @@
 "sbx_omnigent/entrypoint.py" = 1206
 "sbx_omnigent/launcher.py" = 1568
 "sbx_omnigent/pipeline.py" = 2005
-"sbx_omnigent/runner/run.py" = 3702
+"sbx_omnigent/runner/run.py" = 3181
 "sbx_omnigent/swarm.py" = 1715
 "sbx_omnigent/swarm_session.py" = 2608
 "sbx_omnigent/worktrees.py" = 2541
 "tests/test_agy.py" = 1302
 "tests/test_pipeline.py" = 1813
-"tests/test_runner.py" = 14946
+"tests/test_runner.py" = 14857
 "tests/test_swarm_session.py" = 2615

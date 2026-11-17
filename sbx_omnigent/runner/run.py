@@ -63,6 +63,7 @@ from sbx_omnigent.runner.failure_notes import (
     lost_not_failed,
 )
 from sbx_omnigent.runner.filing import FindingFiler
+from sbx_omnigent.runner.forfeits import Forfeits
 from sbx_omnigent.runner.gate import VerifyGate
 from sbx_omnigent.runner.harness_record import HarnessRecord
 from sbx_omnigent.runner.ledger import DecisionLedger
@@ -99,7 +100,6 @@ from sbx_omnigent.runner.parsing.verdicts import (
     _writer_done,
     check_finished,
     parse_disputes,
-    parse_select,
     parse_verdict,
     work_finished,
 )
@@ -156,6 +156,7 @@ from sbx_omnigent.runner.stage_kinds import (
     writer_is_terminal,
 )
 from sbx_omnigent.runner.stages.check import CheckStage
+from sbx_omnigent.runner.stages.judge import JudgeStage
 from sbx_omnigent.runner.stages.scan import ScanStage
 from sbx_omnigent.runner.triage import FindingTriage
 from sbx_omnigent.runner.writer_policy import WriterPolicy
@@ -230,22 +231,6 @@ class PipelineRunner:
         #: a resume may skip — deliberately not "has a branch", since a
         #: pre-warmed writer has a branch before it has ever run.
         self._completed: set[str] = set()
-        #: Nodes withdrawn because their review never reached consensus
-        #: — the blocked review stage and the writer it was vetting. A
-        #: forfeited candidate is excluded from judging: comparing a
-        #: vetted branch against an unvetted one is not a choice.
-        self._forfeited: set[str] = set()
-        #: Each withdrawn candidate's ``(review stage, rounds)``, so the
-        #: selection records the reduced field it was made from (#47).
-        self._forfeits: dict[str, tuple[str, int]] = {}
-        #: Writer nodes whose review stage reached APPROVED consensus.
-        #: Read by :meth:`_all_reviewed` so a judge can be told its
-        #: candidates are already verified and need not be re-built.
-        #: Deliberately NOT persisted: on a resume it starts empty, the
-        #: judge simply is not told, and it verifies for itself as it
-        #: always did. Degrading to the slower-but-correct behaviour is
-        #: the right failure for a claim about what was checked.
-        self._reviewed_ok: set[str] = set()
         #: The operator's allowlist for the verify gate, as the server
         #: published it (see :func:`read_operator_egress`). ``None``
         #: only when built outside ``main()``, which keeps the default.
@@ -322,6 +307,17 @@ class PipelineRunner:
             registry=self._registry,
             keep=keep,
             save_state=self._save_state,
+        )
+        self._forfeits = Forfeits(self._ctx)
+        self._judge = JudgeStage(
+            self._ctx,
+            progress=self._progress,
+            book=self._book,
+            driver=self._driver,
+            capture=self._capture,
+            briefing=self._briefing,
+            forfeits=self._forfeits,
+            resume=resume,
         )
         self._checks = CheckStage(
             self._ctx,
@@ -497,7 +493,7 @@ class PipelineRunner:
         self._completed = restored.completed
         self._progress.completed_chunks = restored.completed_chunks
         self._publisher.chunk_publishes = restored.chunk_publishes
-        self._reviewed_ok = restored.reviewed_ok
+        self._book.reviewed_ok = restored.reviewed_ok
         self._registry.stale = restored.sessions
         self._ledger.decisions = restored.decisions
         self._ledger.referrals = restored.referrals
@@ -556,7 +552,7 @@ class PipelineRunner:
                 harness_versions=self._harness.recorded,
                 completed_chunks=self._progress.completed_chunks,
                 chunk_publishes=self._publisher.chunk_publishes,
-                reviewed_ok=self._reviewed_ok,
+                reviewed_ok=self._book.reviewed_ok,
                 reviews=self._book.reviews,
                 reader_turns=self._reader_turns,
                 picks=self._book.picks,
@@ -726,61 +722,6 @@ class PipelineRunner:
             stage_id = stage_id[len(sub.id) + 1 :]
         return writer_is_terminal(self._config, stage_id)
 
-    def _retain_losers(
-        self, candidates: list[str], selected: str
-    ) -> tuple[tuple[str, str], ...]:
-        """
-        Preserve every candidate that did not win, as a git bundle.
-
-        Only the winner publishes, so without this a complete, reviewed,
-        test-passing implementation of the same frozen contract — by a
-        different model — is deleted with the run hub. It is the only
-        copy, and it is the evidence any future argument about model
-        choice would actually want.
-
-        Best-effort: a run that produced a shippable winner must not
-        fail because an archive could not be written. A failure is
-        reported loudly rather than swallowed, because the whole point
-        is that this data is otherwise unrecoverable.
-
-        :param candidates: Every node the judge compared.
-        :param selected: The node that won.
-        :returns: ``(node, bundle-path)`` for each loser retained.
-        """
-        kept: list[tuple[str, str]] = []
-        for node in candidates:
-            if node == selected:
-                continue
-            try:
-                path = self._wt.retain_node_bundle(
-                    self._run_id,
-                    node,
-                    # `base_branch:` is optional in a pipeline.yaml, and
-                    # a None here would bundle against the literal ref
-                    # 'None'. Same fallback as lineage.seed_ref.
-                    against=self._config.base_branch or 'main',
-                )
-            except Exception as exc:
-                # Loud, never fatal. The run produced a shippable
-                # winner; losing the archive is a real loss and must be
-                # SAID, but it is not a reason to fail the publish.
-                click.echo(
-                    f"[retain] {node}: could NOT be preserved ({exc})."
-                    f" Its branch lives only on this run's hub and"
-                    f" will go with it at teardown."
-                )
-                continue
-            if path is None:
-                continue
-            kept.append((node, path))
-            click.echo(
-                f'[retain] {node}: kept at {path} — restore with '
-                f"'git fetch {path} "
-                f"refs/heads/{self._wt.node_branch(self._run_id, node)}"
-                f":refs/heads/{node}'."
-            )
-        return tuple(kept)
-
     def _sample_disk(self, event: str) -> None:
         """
         Record what this run is holding on disk right now.
@@ -921,65 +862,6 @@ class PipelineRunner:
             click.echo(f'[parallel] {label}: {node_id} also failed: {exc}')
         raise failures[0][1]
 
-    def _forfeit_blocked_reviews(
-        self,
-        stage: pipeline.PipelineStage,
-        blocked: list[_Blocked],
-    ) -> bool:
-        """
-        Drop the candidates whose reviews blocked, if a sibling cleared.
-
-        Two writers are run so a judge can choose between them on
-        evidence. Before this, a review that spent its round budget
-        raised `_Blocked` all the way out of the run — so a campaign
-        could end with one candidate approved by every reviewer,
-        gate-verified and unpublished, because the OTHER one could not
-        converge. Seen twice: once with a candidate that was never
-        reviewed at all, and once with a candidate approved on round one
-        discarded beside a sibling that blocked four times.
-
-        A blocked review is a forfeit by that candidate, not a
-        verdict on the field. If at least one sibling review cleared,
-        the run continues with the survivors and the judge picks
-        among them.
-
-        Returns True when the stage may proceed. When NO sibling
-        cleared, returns False and the caller re-raises — nothing was
-        vetted, so there is nothing to judge.
-
-        :param stage: The parallel parent whose sub-stages are reviews.
-        :param blocked: The `_Blocked` raised by its sub-stages.
-        :returns: Whether the run may continue without these candidates.
-        """
-        blocked_ids = {exc.stage_id for exc in blocked}
-        survivors = [
-            sub.id
-            for sub in stage.parallel
-            if sub.id not in blocked_ids
-            and (node := self._nodes.get(sub.id)) is not None
-            and node.kind == 'review'
-            and node.verdict != 'BLOCKING'
-        ]
-        if not survivors:
-            return False
-        for exc in blocked:
-            sub = self._stage_by_id.get(exc.stage_id)
-            target = sub.on_block if sub is not None else None
-            self._forfeited.add(exc.stage_id)
-            if target:
-                self._forfeited.add(target)
-                self._forfeits[target] = (exc.stage_id, exc.rounds)
-            click.echo(
-                f'[forfeit] {exc.stage_id}: no consensus after '
-                f'{exc.rounds} round(s), so '
-                f'{target or "its candidate"} is withdrawn. '
-                f'{", ".join(survivors)} cleared, so the run continues '
-                f'with the remaining candidate(s) — the judge is now '
-                f'choosing from a REDUCED field, which is recorded with '
-                f'the selection.'
-            )
-        return True
-
     def _exec_top_level(self, stage: pipeline.PipelineStage) -> None:
         """
         Run a top-level stage; a blocked review may forfeit a candidate.
@@ -993,73 +875,8 @@ class PipelineRunner:
         except _Blocked as exc:
             if stage.parallel or stage_kind(stage) != 'review':
                 raise
-            if not self._forfeit_to_a_judge(stage, exc):
+            if not self._forfeits.forfeit_to_a_judge(stage, exc):
                 raise
-
-    def _forfeit_to_a_judge(
-        self, stage: pipeline.PipelineStage, exc: _Blocked
-    ) -> bool:
-        """
-        Withdraw a top-level review's candidate if a judge has rivals.
-
-        The forfeit used to be reached only for reviews grouped under
-        ``parallel:``, while both shipped race examples declare their
-        reviews as top-level stages. One candidate that could not
-        converge then ended the whole run, and its rival's review never
-        started (#47).
-
-        Reviews run in order here, so whether a rival clears is not yet
-        known. The candidate is withdrawn and the run continues. A
-        candidate is only ever withdrawn while a rival remains, so the
-        review that would withdraw the last one finds no rival and
-        blocks the run itself, and a judge is never left with none.
-
-        :param stage: The top-level review stage that blocked.
-        :param exc: Its ``_Blocked``.
-        :returns: Whether the run may continue without the candidate.
-        """
-        target = stage.on_block
-        if not target:
-            return False
-        rivals = self._rival_candidates(target)
-        if not rivals:
-            return False
-        with self._lock:
-            self._forfeited.update((stage.id, target))
-            self._forfeits[target] = (stage.id, exc.rounds)
-        click.echo(
-            f'[forfeit] {stage.id}: no consensus after {exc.rounds} '
-            f'round(s), so {target} is withdrawn. The judge still has '
-            f'{", ".join(rivals)}; if none of them clears review, the run '
-            f'blocks. The reduced field is recorded with the selection.'
-        )
-        return True
-
-    def _rival_candidates(self, target: str) -> list[str]:
-        """
-        Candidates still competing with *target* at any judge.
-
-        Read from the DECLARED pipeline: a rival whose review has not
-        run yet still counts.
-
-        :param target: The writer node being withdrawn.
-        :returns: Rival writer ids not already withdrawn, in order.
-        """
-        rivals: list[str] = []
-        for judge in self._stage_by_id.values():
-            if stage_kind(judge) != 'judge' or target not in judge.needs:
-                continue
-            for need in judge.needs:
-                declared = self._stage_by_id.get(need)
-                if (
-                    need != target
-                    and need not in self._forfeited
-                    and need not in rivals
-                    and declared is not None
-                    and stage_kind(declared) == 'writer'
-                ):
-                    rivals.append(need)
-        return rivals
 
     def _exec_stage(self, stage: pipeline.PipelineStage) -> None:
         if stage.parallel:
@@ -1086,7 +903,7 @@ class PipelineRunner:
                     and (node := self._nodes.get(sub.id)) is not None
                     and node.verdict == 'BLOCKING'
                 ]
-                if not self._forfeit_blocked_reviews(stage, blocked):
+                if not self._forfeits.forfeit_blocked_reviews(stage, blocked):
                     raise
             return
         if self._skip_as_completed(stage):
@@ -1115,7 +932,7 @@ class PipelineRunner:
         # an idle VM.
         run = {
             'writer': self._run_writer,
-            'judge': self._run_judge,
+            'judge': self._judge.run,
             'verify': self._run_verify,
             'check': self._checks.run,
             'scan': self._scan.run,
@@ -1223,7 +1040,7 @@ class PipelineRunner:
                 self._bind(label, reviewer, session, target_wt, 'ro')
             self._nodes[stage.id] = NodeResult(stage.id, 'review')
         else:  # judge
-            candidates = self._judge_candidates(stage)
+            candidates = self._forfeits.judge_candidates(stage)
             if not candidates:
                 return
             wt = self._wt.create_judge_worktree(
@@ -2109,7 +1926,7 @@ class PipelineRunner:
         # only in memory for one stage; now that it is persisted and
         # survives a resume, a stale entry would tell a later judge not
         # to check a branch nobody has checked since.
-        self._reviewed_ok.discard(stage_id)
+        self._book.reviewed_ok.discard(stage_id)
         self._ensure_writer_session(stage)
         assert node.session is not None
         # A loop-back reuses the writer's session so its fix turn keeps
@@ -2393,7 +2210,7 @@ class PipelineRunner:
                 # Every reviewer of this branch installed a toolchain
                 # and ran the suite against it. Remember that, so a
                 # downstream judge is not sent to re-derive it.
-                self._reviewed_ok.add(target)
+                self._book.reviewed_ok.add(target)
                 return
             if not blocking:
                 # Nobody objected; the review simply did not conclude.
@@ -2740,146 +2557,6 @@ class PipelineRunner:
         shown = verdict or 'NONE->BLOCKING'
         click.echo(f'[review] {label}: verdict={shown} (source={source})')
 
-    def _run_judge(self, stage: pipeline.PipelineStage) -> None:
-        candidates = self._judge_candidates(stage)
-        forfeited = tuple(
-            (need, *self._forfeits[need])
-            for need in stage.needs
-            if need in self._forfeits
-        )
-        if not candidates:
-            raise PipelineRunError(
-                f'judge {stage.id!r} has no writer candidates in needs'
-            )
-        self._require_one_contract(stage, candidates)
-        if forfeited and len(candidates) == 1:
-            self._select_uncontested(stage, candidates[0], forfeited)
-            return
-        wt = self._wt.create_judge_worktree(
-            self._run_id, stage.id, candidates, replace=self._resume
-        )
-        agent = stage.run[0]
-        session = self._driver.create(agent, wt, 'ro', stage.id)
-        out = self._driver.drive(
-            session, self._judge_instruction(stage, candidates)
-        )
-        stated = parse_select(out, candidates)
-        if stated is None:
-            # One nudge before the default takes over. A judge that
-            # answered without deciding — "I have launched the tests in
-            # the background ... I will process the results as soon as
-            # they are available" — has not refused to choose, it has
-            # misjudged how many turns it gets. Asking once converts a
-            # silent default into an actual decision; the alternative
-            # is discarding its judgement over a misunderstanding.
-            click.echo(
-                f'[judge] {stage.id}: no SELECT line in the first '
-                f'reply — asking once more before halting.'
-            )
-            retry = self._driver.drive(
-                session, self._judge_retry_instruction(candidates)
-            )
-            again = parse_select(retry, candidates)
-            if again is not None:
-                stated = again
-                out = f'{out}\n\n{retry}'
-        if stated not in candidates:
-            # HALT, do not guess. This used to fall back to
-            # `candidates[0]`, which turned "nobody judged" into a pick
-            # made by list order — indistinguishable, in the record,
-            # from a real decision. Observed live on
-            # `gcp-scope-topology-1`: the judge said it had started
-            # verification builds and would analyse them "once
-            # compilation completes", and impl-a shipped because it was
-            # first in `needs`.
-            #
-            # Halting is affordable precisely here: every candidate is
-            # committed to the hub and both reached their review gates,
-            # so nothing is lost by stopping, and a human choosing
-            # between two reviewed branches is a minute's work. A silent
-            # default is the expensive outcome, not the stop.
-            self._capture.turn(
-                session, 'the judge never stated a SELECT line'
-            )
-            click.echo(
-                f'[judge] {stage.id}: NO DECISION after a retry — '
-                f'halting rather than shipping the first candidate by '
-                f'default. Candidates: {", ".join(candidates)}. Their '
-                f'branches are on the hub and their reviews are in the '
-                f'run state; pick one and resume, or re-run this stage.'
-            )
-            raise PipelineRunError(
-                f'judge {stage.id!r} stated no SELECT line for any of '
-                f'{", ".join(candidates)} — refusing to pick one by '
-                f'position. See the captured turn in the run directory.'
-            )
-        sel = stated
-        # Record BEFORE the branch alias: the judge's session is
-        # disposed moments from now and its reasoning goes with it, and
-        # a run that fails after this point should still explain what
-        # it picked.
-        # Retain the losers BEFORE anything else touches the hub. Their
-        # branches live only there, and the run directory holds the only
-        # copy — teardown deletes it.
-        retained = self._retain_losers(candidates, sel)
-        self._book.record_pick(
-            stage.id, candidates, sel, stated, out, retained,
-            forfeited=forfeited,
-        )
-        # Publish the winner as the judge node's OWN hub branch, so a
-        # downstream stage can seed `from:` the judge (refactor the
-        # winner, review it) — a judge otherwise leaves no branch to
-        # inherit.
-        self._wt.alias_node_branch(self._run_id, stage.id, sel)
-        self._nodes[stage.id] = NodeResult(
-            stage.id,
-            'judge',
-            branch=self._nodes[sel].branch,
-            worktree=wt,
-            session=session,
-            output=out,
-            selected=sel,
-        )
-        self._progress.last_branch_node = stage.id
-
-    def _select_uncontested(
-        self,
-        stage: pipeline.PipelineStage,
-        selected: str,
-        forfeited: tuple[tuple[str, str, int], ...],
-    ) -> None:
-        """
-        Select the one candidate left, without booting a judge.
-
-        A judge VM choosing between one candidate buys nothing, and its
-        record would read as a judgment. Recorded as uncontested, with
-        the candidates that were withdrawn (#47).
-
-        :param stage: The judge stage.
-        :param selected: The only candidate left.
-        :param forfeited: ``(candidate, review, rounds)`` per forfeit.
-        """
-        withdrawn = ', '.join(
-            f'{cand} ({review}, {rounds} round(s))'
-            for cand, review, rounds in forfeited
-        )
-        click.echo(
-            f'[judge] {stage.id}: {selected} is the only candidate left '
-            f'after {withdrawn} withdrew, so no judge turn runs. '
-            f'Recorded as UNCONTESTED, not as a judgment.'
-        )
-        self._book.record_pick(
-            stage.id, [selected], selected, None, '',
-            forfeited=forfeited, uncontested=True,
-        )
-        self._wt.alias_node_branch(self._run_id, stage.id, selected)
-        self._nodes[stage.id] = NodeResult(
-            stage.id,
-            'judge',
-            branch=self._nodes[selected].branch,
-            selected=selected,
-        )
-        self._progress.last_branch_node = stage.id
 
     # ── wiring helpers ────────────────────────────────────────────
 
@@ -2938,59 +2615,6 @@ class PipelineRunner:
             f'resume whose state lost that node is the usual cause.'
         )
 
-    def _require_one_contract(
-        self, stage: pipeline.PipelineStage, candidates: list[str]
-    ) -> None:
-        """
-        Refuse to judge candidates built against different contracts.
-
-        A branch that does not contain its seed is not a worse
-        implementation of the same thing — it is an implementation of
-        something else, and picking between the two produces a record
-        that reads like a judgement.
-
-        Only candidates with a resolvable seed are checked: writers
-        that legitimately cut from base have no shared contract to
-        compare, which is the ordinary two-writer race.
-
-        :param stage: The judge stage.
-        :param candidates: The competing writer nodes.
-        :raises PipelineRunError: When a candidate lacks its seed.
-        """
-        for cand in candidates:
-            cand_stage = self._stage_by_id.get(cand)
-            if cand_stage is None:
-                continue
-            seed = seed_from(cand_stage, self._nodes)
-            if seed is None or seed not in self._nodes:
-                continue
-            if self._wt.branch_contains(
-                self._run_id, cand, ancestor=seed
-            ):
-                continue
-            raise PipelineRunError(
-                f'judge {stage.id!r} cannot compare {cand!r}: its '
-                f'branch does not contain {seed!r}, so it was built '
-                f'without the contract its rivals were held to. '
-                f'Judging it would compare two different contracts '
-                f'and record the result as a choice.'
-            )
-
-    def _judge_candidates(
-        self, stage: pipeline.PipelineStage
-    ) -> list[str]:
-        """The competing writer nodes a judge compares (from needs)."""
-        return [
-            need
-            for need in stage.needs
-            if self._nodes.get(need)
-            and self._nodes[need].branch
-            and self._nodes[need].kind == 'writer'
-            # A candidate whose review never reached consensus
-            # forfeited; judging it would compare a vetted branch
-            # against an unvetted one and call the result a choice.
-            and need not in self._forfeited
-        ]
 
     # ── session + turn plumbing ───────────────────────────────────
 
@@ -3443,31 +3067,6 @@ class PipelineRunner:
             # has the tree and the rest of its instruction.
             return []
 
-    def _judge_scope_clause(self) -> str:
-        """
-        Make staying inside the increment a judging criterion.
-
-        Unstated, the model reaches for it inconsistently: on
-        `gcp-scope-topology-1` the same judge penalised a candidate for
-        being "out of scope for this increment" in [transport] and then
-        praised the other one's later-increment work as a strength in
-        [topology]. Naming it, and saying which direction it counts in,
-        removes the coin flip.
-
-        :returns: The clause, or ``''`` outside a campaign.
-        """
-        if self._progress.active_subtask is None:
-            return ''
-        return (
-            ' Weigh also WHETHER EACH STAYED INSIDE THE MARKED '
-            'INCREMENT. A candidate that implemented a later '
-            "increment's work is not thereby ahead: that work was "
-            'reviewed against the wrong contract, and the increment '
-            'that owns it will inherit something its own plan did not '
-            'choose. Count it as a cost, not a bonus — and count it the '
-            'same way for every candidate.'
-        )
-
     def _defer_block(self) -> str:
         """
         The one way a writer may answer a finding instead of fixing it.
@@ -3529,126 +3128,6 @@ class PipelineRunner:
             'belongs to a later increment" is not a shield for something '
             'this change broke. If you cannot tell which, say so and '
             'block — an honest uncertainty is worth a round.'
-        )
-
-    def _judge_instruction(
-        self, stage: pipeline.PipelineStage, candidates: list[str]
-    ) -> str:
-        """
-        The turn handed to a judge.
-
-        Says two things the template cannot know. First, whether the
-        candidates have ALREADY been through their reviewer gates —
-        ``templates/judge.md`` asks "which candidate genuinely passes
-        the suite", and a judge that reads that with no other context
-        starts a build to find out. On a Rust workspace that is slow
-        enough that one judge backgrounded it and reported progress
-        instead of deciding. The suite has already been run, twice per
-        candidate, by reviewers who each installed a toolchain to do
-        it; re-running it is minutes of guest time for an answer
-        already on record.
-
-        Second, that this is its ONLY turn. The judge asked to "process
-        the results as soon as they are available" — a perfectly normal
-        thing to say in a conversation, and fatal here, because nothing
-        follows. Without a SELECT line the first candidate used to win
-        by default; now the run halts, which a judge must be told.
-
-        :param stage: The judge stage.
-        :param candidates: The writer nodes being judged.
-        :returns: The instruction text.
-        """
-        listed = ', '.join(f'./{c}' for c in candidates)
-        instr = (
-            self._briefing.task_block()
-            + f'\n\nCompare the candidate implementations in {listed} '
-            'against this contract, then end your reply with a line '
-            'reading exactly:\n\n    SELECT: <id>\n\nwhere <id> is '
-            f'one of: {", ".join(candidates)}. The colon is part of '
-            'the line, the id is copied verbatim, and nothing else '
-            'goes on it.'
-        )
-        if self._all_reviewed(candidates):
-            instr += (
-                '\n\nEVERY candidate here has already passed its own '
-                'review gate: each was independently verified by '
-                'reviewers who installed a toolchain and RAN the test '
-                'suite and the project gate against that exact branch. '
-                'Do NOT build or re-run the suite — the answer is '
-                'already on record, and re-deriving it costs minutes of '
-                'guest time and tells you nothing new. Judge on the '
-                'DIFFERENCES between the candidates: design, '
-                'simplicity, dependency minimalism, how each will read '
-                'to the next person, and what each does at the edges. '
-                'Read the code, do not run it.'
-                + self._judge_scope_clause()
-            )
-        instr += (
-            '\n\nThis is your ONLY turn. Nothing follows it, so do not '
-            'start work in the background and do not say you will '
-            'report once something finishes — there is no later message '
-            'and anything unfinished is simply lost. Decide now, on '
-            'what you can see. A reply without a SELECT line is not a '
-            'deferral: the run HALTS, no candidate is chosen, and a '
-            'human has to come and do this by hand. Your judgement is '
-            'not merely discarded — the pipeline stops. If you are '
-            'genuinely unsure, still SELECT, and say what you could '
-            'not check.'
-        )
-        return instr
-
-    @staticmethod
-    def _judge_retry_instruction(candidates: list[str]) -> str:
-        """
-        The one follow-up a judge gets when it did not decide.
-
-        Deliberately asks for nothing but the line, and SHOWS it
-        rather than naming it: the first version said "end with the
-        SELECT line", and a judge that had already chosen wrote
-        ``SELECT core-contracts-impl-a`` without the colon, which
-        parsed as nothing. A judge that deferred has usually done the
-        reading; what it lacked was either the knowledge that no further
-        turn was coming, or the exact format.
-
-        :param candidates: The writer node ids being judged.
-        :returns: The instruction text.
-        """
-        return (
-            'No decision was recorded from your reply: it carried no '
-            'line in the required form. This is the LAST turn — there '
-            'is no further message, and nothing you started in the '
-            'background will be waited for or read. Decide now, from '
-            'what you have already seen; a decision on partial '
-            'evidence is worth far more than none, because without '
-            'that line the run HALTS, no candidate is chosen, and a '
-            'human has to make this choice by hand.\n\nReply with a '
-            'one-paragraph rationale, then a final line reading '
-            'exactly:\n\n    SELECT: <id>\n\nwhere <id> is one '
-            f'of: {", ".join(candidates)}. Include the colon, copy '
-            'the id verbatim, and put nothing else on that line — no '
-            'backticks, no bold, no trailing prose.'
-        )
-
-    def _all_reviewed(self, candidates: list[str]) -> bool:
-        """
-        Whether every candidate already cleared a review stage.
-
-        A judge does not necessarily run downstream of reviewers — the
-        pipeline decides that — so the "already verified, do not
-        re-run" claim is only made when it is TRUE for every candidate.
-
-        It now SURVIVES a resume (it is in the run state), because
-        losing it was not the harmless understatement it was written to
-        be: an untold judge starts a workspace build, cannot finish it
-        inside its one turn, and states no SELECT. What keeps the claim
-        honest across a resume is that :meth:`_redrive_writer` drops a
-        candidate the moment its branch changes.
-
-        :param candidates: The writer nodes being judged.
-        :returns: ``True`` when each reached APPROVED consensus here.
-        """
-        return bool(candidates) and all(
-            c in self._reviewed_ok for c in candidates
         )
 
     def _fix_instruction(self, findings: str) -> str:
