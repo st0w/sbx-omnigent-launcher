@@ -29,7 +29,7 @@ repos:
   #
   # The one ruff version for this repository: CI runs it through this hook.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.17.4
+    rev: v0.17.5
     hooks:
       - id: ruff-check
 
