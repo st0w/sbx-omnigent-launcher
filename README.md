@@ -329,8 +329,9 @@ register at startup); model/effort/task/DAG edits are picked up by the runner wi
 no restart. Key runner flags: `--keep` (leave VMs up), `--run-id`,
 `--publish-repo`, `--publish-token-file` / `--publish-token-command`,
 `--no-interactive-plan`, `--no-auto-harvest`, `--resume`,
-`--turn-timeout`, `--server`. Full flag table and the provision-only mode (omit
-`task:`) are in [`docs/PIPELINES.md`](./docs/PIPELINES.md).
+`--turn-timeout`, `--server`, `--machine-client-id` / `--machine-secret-file`,
+`--share-with`. Full flag table and the provision-only mode (omit `task:`) are
+in [`docs/PIPELINES.md`](./docs/PIPELINES.md).
 
 Before anything touches sbx, the runner checks that the sbx daemon answers (a
 bounded `sbx ls`). A stuck daemon refuses the run with the steps to recover it,

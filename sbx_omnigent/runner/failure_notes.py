@@ -9,6 +9,7 @@ usage limit, or a terminal that never started.
 from __future__ import annotations
 
 from sbx_omnigent import guest_log
+from sbx_omnigent.rate_limits import looks_like_rate_limit
 from sbx_omnigent.runner.context import RunContext
 from sbx_omnigent.runner.errors import LostTurn
 from sbx_omnigent.runner.sandboxes import sandbox_for
@@ -16,7 +17,6 @@ from sbx_omnigent.runner.session_registry import SessionRegistry
 from sbx_omnigent.swarm_session import (
     SwarmSessionError,
     SwarmTurnTimeout,
-    looks_like_rate_limit,
 )
 
 
