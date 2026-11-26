@@ -23,6 +23,7 @@ import click
 from click.testing import CliRunner
 
 from sbx_omnigent.launch_args import YOLO_LAUNCH_ARGS, launch_args_for
+from sbx_omnigent.rate_limits import looks_like_rate_limit
 from sbx_omnigent.swarm import (
     _PUBLISH_MODE_ENV,
     Reviewer,
@@ -45,7 +46,6 @@ from sbx_omnigent.swarm import (
 from sbx_omnigent.swarm_session import (
     SwarmSessionError,
     SwarmTurnResult,
-    looks_like_rate_limit,
 )
 
 

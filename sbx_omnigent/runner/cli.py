@@ -32,6 +32,11 @@ from sbx_omnigent.runner.resume import (
     reclaim_for_resume,
 )
 from sbx_omnigent.runner.run import PipelineRunner
+from sbx_omnigent.runner.server_client import (
+    machine_client,
+    session_client,
+    share_target,
+)
 from sbx_omnigent.swarm_session import SwarmSessionClient
 from sbx_omnigent.worktrees import WorktreeManager
 
@@ -50,6 +55,32 @@ from sbx_omnigent.worktrees import WorktreeManager
     envvar='OMNI_SERVER',
     default='http://localhost:6767',
     show_default=True,
+    help='Omnigent server URL.',
+)
+@click.option(
+    '--machine-client-id',
+    envvar='OMNI_MACHINE_CLIENT_ID',
+    default=None,
+    help="On a server with accounts, the server's "
+    'OMNIGENT_MACHINE_CLIENT_ID. The runner signs in as that machine '
+    'client (Omnigent 0.23.0 or later).',
+)
+@click.option(
+    '--machine-secret-file',
+    envvar='OMNI_MACHINE_SECRET_FILE',
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, resolve_path=True),
+    help="File holding only the machine client's secret, readable by no "
+    'other users. Read at every sign-in, so a rotated secret is used.',
+)
+@click.option(
+    '--share-with',
+    envvar='OMNI_SHARE_WITH',
+    default=None,
+    callback=share_target,
+    help='Omnigent account to share every session with, so it appears '
+    "in that person's web UI: planners with edit access (to answer "
+    'them), the rest read-only.',
 )
 @click.option(
     '--canonical-root', envvar='OMNI_SBX_CANONICAL_ROOT', required=True
@@ -136,6 +167,9 @@ from sbx_omnigent.worktrees import WorktreeManager
 def main(
     config_path: str,
     server: str,
+    machine_client_id: str | None,
+    machine_secret_file: str | None,
+    share_with: str | None,
     canonical_root: str,
     worktree_root: str,
     run_id: str | None,
@@ -154,6 +188,12 @@ def main(
 ) -> None:
     """Fire a pipeline.yaml; provision-only when it has no task."""
     config = pipeline.load_pipeline(config_path)
+    client = session_client(
+        server,
+        machine=machine_client(machine_client_id, machine_secret_file),
+        share_with=share_with,
+        auto_approve=not no_auto_approve,
+    )
 
     def publish_token_provider() -> str | None:
         return resolve_publish_token(
@@ -191,6 +231,7 @@ def main(
             default_branch=config.base_branch or 'main',
             manager=manager,
             config=config,
+            client=client,
         )
         # Counted AFTER the reclaim, from what is left, rather than
         # counted before and adjusted by what the reclaim reports.
@@ -231,7 +272,7 @@ def main(
             config,
             resume=resume,
             turn_timeout=turn_timeout,
-            server=server,
+            client=client,
             canonical_root=canonical_root,
             worktree_root=worktree_root,
             run_id=run_id,
@@ -239,7 +280,6 @@ def main(
             publish_token=publish_token_provider,
             keep=keep,
             no_interactive_plan=no_interactive_plan,
-            no_auto_approve=no_auto_approve,
             gate_egress=operator_egress,
         )
     except KeyboardInterrupt:
@@ -301,7 +341,7 @@ def _drive(
     *,
     resume: bool = False,
     turn_timeout: float | None = None,
-    server: str,
+    client: SwarmSessionClient,
     canonical_root: str,
     worktree_root: str,
     run_id: str | None,
@@ -309,11 +349,9 @@ def _drive(
     publish_token: str | Callable[[], str | None] | None,
     keep: bool,
     no_interactive_plan: bool,
-    no_auto_approve: bool,
     gate_egress: tuple[str, ...] | None = None,
 ) -> None:
     """Build the runner, drive the run, and report its outcome."""
-    client = SwarmSessionClient(server, auto_approve=not no_auto_approve)
     ids = resolve_agent_ids(config, client.list_builtin_agents())
     runner = PipelineRunner(
         config,

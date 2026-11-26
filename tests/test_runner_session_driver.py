@@ -25,12 +25,18 @@ from sbx_omnigent.runner.harness_record import HarnessRecord
 from sbx_omnigent.runner.limits import _FIRST_TURN_MAX_RESUBMITS
 from sbx_omnigent.runner.session_driver import _AGY_TASK_FILE, SessionDriver
 from sbx_omnigent.runner.session_registry import SessionRegistry
-from sbx_omnigent.swarm_session import SwarmSessionError, SwarmTurnResult
+from sbx_omnigent.swarm_session import (
+    EDIT_ACCESS,
+    READ_ACCESS,
+    SwarmSessionError,
+    SwarmTurnResult,
+)
 
 
-def _agent(harness: str) -> PipelineAgent:
+def _agent(harness: str, template: str = 'coder') -> PipelineAgent:
     agent = mock.Mock(spec=PipelineAgent)
     agent.harness = harness
+    agent.template = template
     agent.model = 'claude-sonnet-5'
     agent.effort = 'medium'
     return agent
@@ -60,6 +66,7 @@ class _DriverTest(unittest.TestCase):
         self.config.agents = {
             'build': _agent('claude-native'),
             'plan': _agent(next(iter(agy.AGY_HARNESSES))),
+            'design': _agent('claude-native', template='planner'),
         }
 
     def driver(self) -> SessionDriver:
@@ -81,7 +88,8 @@ class _DriverTest(unittest.TestCase):
             capture=TurnCapture(ctx, registry=self.registry,
                                 harness=harness),
             notes=FailureNotes(ctx, registry=self.registry, keep=False),
-            agent_ids={'build': 'ag-build', 'plan': 'ag-plan'},
+            agent_ids={'build': 'ag-build', 'plan': 'ag-plan',
+                       'design': 'ag-design'},
             turn_timeout=600.0,
             swap_age_s=lambda: self.swap_age,
             interrupted=self.interrupted,
@@ -105,6 +113,25 @@ class TestCreating(_DriverTest):
 
     def test_it_is_saved_at_once_so_a_resume_can_reclaim_it(self) -> None:
         self.driver().create('build', '/w/build', 'rw', 'build')
+        self.assertEqual(self.saves, 1)
+
+    def test_a_planner_is_shared_so_its_plan_can_be_answered(self) -> None:
+        self.driver().create('design', '/w/design', 'ro', 'design')
+        self.sessions.share.assert_called_once_with(
+            'sess-1', level=EDIT_ACCESS
+        )
+
+    def test_every_other_agent_is_shared_to_watch(self) -> None:
+        self.driver().create('build', '/w/build', 'rw', 'build')
+        self.sessions.share.assert_called_once_with(
+            'sess-1', level=READ_ACCESS
+        )
+
+    def test_a_refused_share_leaves_the_session_reclaimable(self) -> None:
+        self.sessions.share.side_effect = SwarmSessionError('refused')
+        with self.assertRaises(SwarmSessionError):
+            self.driver().create('build', '/w/build', 'rw', 'build')
+        self.assertEqual(self.registry.label_of('sess-1'), 'build')
         self.assertEqual(self.saves, 1)
 
     def test_an_agy_terminal_is_warmed_before_its_first_turn(self) -> None:

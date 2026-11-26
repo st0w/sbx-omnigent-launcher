@@ -1842,6 +1842,9 @@ Override any of them with an inline `prompt`/`prompt_file`, and augment with
 | `--canonical-root` | Host dir for the canonical repo mirrors (required; `OMNI_SBX_CANONICAL_ROOT`). |
 | `--worktree-root` | Host dir for per-run worktrees (required; must equal `sbx.worktree_root`; `OMNI_SBX_WORKTREE_ROOT`). |
 | `--server` | Omnigent server URL (default `http://localhost:6767`; `OMNI_SERVER`). |
+| `--machine-client-id` | On a server with accounts, the server's `OMNIGENT_MACHINE_CLIENT_ID`; the runner signs in as that machine client (`OMNI_MACHINE_CLIENT_ID`; see [Servers with accounts](#servers-with-accounts)). |
+| `--machine-secret-file` | File holding only that client's secret, readable by no other users (`OMNI_MACHINE_SECRET_FILE`). Give both or neither. |
+| `--share-with` | Omnigent username to share every session with, so the run shows in that person's web UI (`OMNI_SHARE_WITH`). Planners get edit access, to be answered; every other session is read-only. |
 | `--run-id` | Unique run id (default: the pipeline `name`). |
 | `--publish-repo` | Push target for publish (default: `repo`). |
 | `--keep` | Leave the microVMs + worktrees up for inspection instead of tearing down. |
@@ -1851,6 +1854,55 @@ Override any of them with an inline `prompt`/`prompt_file`, and augment with
 | `--skip-codex-check` | Skip the check that the server accepts the host Codex login, for a network that blocks WebSockets but reaches Codex over HTTPS (see [Codex notes](#codex-notes)). An expired access token is still refused. |
 | `--resume` | Continue the run with this `--run-id` instead of starting clean (see [Resuming a run](#resuming-a-run)). |
 | `--turn-timeout` | Seconds one agent turn may take, overriding the pipeline's `turn_timeout`. |
+
+## Servers with accounts
+
+A server started with `OMNIGENT_AUTH_ENABLED=1` refuses every request that
+carries no token. The runner signs in as a **machine client**, the OAuth 2.0
+client-credentials grant Omnigent added in 0.23.0, and sends its token with
+every request.
+
+**On the server**, set three variables before it starts:
+
+| Variable | Value |
+| --- | --- |
+| `OMNIGENT_MACHINE_CLIENT_ID` | A label of your choosing, e.g. `pipeline-runner`. |
+| `OMNIGENT_MACHINE_CLIENT_SECRET_HASH` | The secret's digest, never the secret: HMAC-SHA256 of the secret keyed by the server's hex-decoded accounts cookie secret, hex-encoded. |
+| `OMNIGENT_MACHINE_SUB` | The account its tokens act as. Give it a fresh name that is no person's account and not an admin: the server refuses to sign in an admin, and every agent's VM acts as the account that owns its session. |
+
+The cookie secret is `OMNIGENT_ACCOUNTS_COOKIE_SECRET` when set, otherwise the
+`accounts-cookie-secret` file in the server's data directory. Generate the
+secret with `secrets.token_urlsafe(32)`, or anything else that has no `+`, `%`
+or spaces in it. Omnigent's `designs/CLIENT_CREDENTIALS.md` has the digest
+recipe. Rotating the cookie secret invalidates the digest, and every token.
+
+**For the runner**, pass the same id and a file holding only the secret:
+
+```bash
+--machine-client-id pipeline-runner --machine-secret-file /path/to/machine-secret
+```
+
+- **The secret file** may be readable by its owner and group, never by other
+  users; the runner refuses one that is. It is read at every sign-in, so a
+  rotated secret is picked up mid-run.
+- **Sign-in happens first.** A refused client stops the run before any
+  preflight, with what to fix: no machine sign-in on the server, a wrong id or
+  secret, or an admin machine account.
+- **Tokens renew themselves.** A token lasts at most an hour, so the runner
+  signs in again two minutes before it expires, and once more if the server
+  refuses one. The endpoint allows about ten sign-ins a minute from one address.
+- **One machine client per server.** Every run on the server shares it.
+
+The machine account owns every session the runner creates, and the web UI
+lists only the sessions a person owns or was given. So pass
+`--share-with <username>` to share each session with whoever watches the run:
+a planner with edit access, which answering it takes, and every other session
+read-only. A server whose sharing is turned off refuses the grant, and the run
+stops at its first session. One whose sharing is limited to read-only refuses
+the planner's edit grant, so the run stops at the planner.
+
+A server without accounts needs none of this: leave the machine client out, and
+nothing is sent. `--share-with` there is untested; leave it out.
 
 ## Codex notes
 

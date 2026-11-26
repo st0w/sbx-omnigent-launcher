@@ -25,6 +25,18 @@ still spans both sides of it:
 | `RepoWorkspace` | `omnigent.server.managed_hosts` | `omnigent.onboarding.sandboxes.types` | `_compat.repo_workspace` (resolved lazily) |
 | `start_host` repositories | `repo_url` / `repo_branch` / `repo_name` | `repos: Sequence[RepoWorkspace]` | `SbxLauncher.start_host` accepts both; delegates in the shape the installed base declares |
 
+## Signing in to a server with accounts
+
+The runner signs in to a server with accounts as a machine client, through
+`POST /oauth/token` with `grant_type=client_credentials`
+(`sbx_omnigent/server_auth.py`). That grant is new in **v0.23.0**, so against
+an earlier server with accounts the runner stops at sign-in and says it needs
+0.23.0. Against a server without accounts it sends nothing, as before, on every
+supported release.
+
+It shares each session with `PUT /v1/sessions/{id}/permissions` (body `user_id`,
+`level`), which has the same shape in v0.13.0, v0.20.0 and v0.23.0.
+
 ## Checking a new release
 
 Last checked against **v0.13.0**, **v0.19.1** and **v0.20.0**: the full unit suite

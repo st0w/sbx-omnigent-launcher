@@ -19,6 +19,16 @@
 # need different tokens):
 #
 #   OMNI_LAUNCHER_PY   Python interpreter of the sbx-omnigent-launcher venv.
+#   OMNI_SERVER        http:// or https:// URL of the Omnigent server.
+#   OMNI_MACHINE_CLIENT_ID
+#                      The server's OMNIGENT_MACHINE_CLIENT_ID: the runner
+#                      signs in as that machine client (Omnigent 0.23.0+).
+#   OMNI_MACHINE_SECRET_FILE
+#                      File holding only that client's secret, readable by
+#                      no other users. Read at every sign-in.
+#   OMNI_SHARE_WITH    Omnigent username of the person watching the run.
+#                      Every session is shared with them, so it shows in
+#                      their web UI; planners with edit access, to answer.
 #   OMNI_CANONICAL_ROOT
 #                      Root of the canonical mirrors.
 #   OMNI_WORKTREE_ROOT Root of the run worktrees. Must equal
@@ -28,8 +38,9 @@
 #                      runner on the HOST and passed to git/gh through the
 #                      environment — never into argv, never into a VM.
 #
-# OMNI_PIPELINE, OMNI_LAUNCHER_PY and the two roots must be ABSOLUTE paths,
-# so nothing depends on the directory the script is started from.
+# OMNI_PIPELINE, OMNI_LAUNCHER_PY, OMNI_MACHINE_SECRET_FILE and the two
+# roots must be ABSOLUTE paths, so nothing depends on the directory the
+# script is started from.
 #
 # Example (adapt to whatever secret store you use — the runner only cares
 # that the command prints a token):
@@ -37,6 +48,10 @@
 #   export OMNI_PIPELINE="/path/to/repos/<repo>/omnigent/pipeline.live.yaml"
 #   export OMNI_PUBLISH_REPO="https://github.com/<org>/<repo>"
 #   export OMNI_LAUNCHER_PY="/path/to/sbx-omnigent-launcher/.venv/bin/python"
+#   export OMNI_SERVER="http://127.0.0.1:6767"
+#   export OMNI_MACHINE_CLIENT_ID="<client-id>"
+#   export OMNI_MACHINE_SECRET_FILE="/path/to/machine-secret"
+#   export OMNI_SHARE_WITH="<username>"
 #   export OMNI_CANONICAL_ROOT="$HOME/sbx-canonical"
 #   export OMNI_WORKTREE_ROOT="$HOME/sbx-worktrees"
 #   export PUBLISH_TOKEN_CMD='pass show <store>/publish-token'
@@ -107,6 +122,10 @@ set -eu
 : "${OMNI_PIPELINE:?set OMNI_PIPELINE to the pipeline definition}"
 : "${OMNI_PUBLISH_REPO:?set OMNI_PUBLISH_REPO to the https://github.com/ URL of the publish repo}"
 : "${OMNI_LAUNCHER_PY:?set OMNI_LAUNCHER_PY to the launcher venv python}"
+: "${OMNI_SERVER:?set OMNI_SERVER to the Omnigent server URL}"
+: "${OMNI_MACHINE_CLIENT_ID:?set OMNI_MACHINE_CLIENT_ID to the machine client id the server is configured with}"
+: "${OMNI_MACHINE_SECRET_FILE:?set OMNI_MACHINE_SECRET_FILE to the file holding the machine client secret}"
+: "${OMNI_SHARE_WITH:?set OMNI_SHARE_WITH to the Omnigent username watching the run}"
 : "${OMNI_CANONICAL_ROOT:?set OMNI_CANONICAL_ROOT to the canonical mirror root}"
 : "${OMNI_WORKTREE_ROOT:?set OMNI_WORKTREE_ROOT to the worktree root}"
 : "${PUBLISH_TOKEN_CMD:?set PUBLISH_TOKEN_CMD to a command printing a push token}"
@@ -124,12 +143,18 @@ require_absolute() {
 }
 require_absolute OMNI_PIPELINE "$OMNI_PIPELINE"
 require_absolute OMNI_LAUNCHER_PY "$OMNI_LAUNCHER_PY"
+require_absolute OMNI_MACHINE_SECRET_FILE "$OMNI_MACHINE_SECRET_FILE"
 require_absolute OMNI_CANONICAL_ROOT "$OMNI_CANONICAL_ROOT"
 require_absolute OMNI_WORKTREE_ROOT "$OMNI_WORKTREE_ROOT"
 
 # The push authenticates with PUBLISH_TOKEN_CMD's GitHub token, which only
 # applies over https. An ssh URL would push with whatever key the host
 # offers instead, the same broad-credential problem described above.
+case $OMNI_SERVER in
+  http://* | https://*) ;;
+  *) die "OMNI_SERVER must be an http:// or https:// URL, not '$OMNI_SERVER'" ;;
+esac
+
 case $OMNI_PUBLISH_REPO in
   https://github.com/*) ;;
   *) die "OMNI_PUBLISH_REPO must be an https://github.com/ URL, not '$OMNI_PUBLISH_REPO'" ;;
@@ -178,6 +203,10 @@ esac
 
 exec "$OMNI_LAUNCHER_PY" -m sbx_omnigent.runner \
   -c "$OMNI_PIPELINE" \
+  --server "$OMNI_SERVER" \
+  --machine-client-id "$OMNI_MACHINE_CLIENT_ID" \
+  --machine-secret-file "$OMNI_MACHINE_SECRET_FILE" \
+  --share-with "$OMNI_SHARE_WITH" \
   --canonical-root "$OMNI_CANONICAL_ROOT" \
   --worktree-root "$OMNI_WORKTREE_ROOT" \
   --publish-repo "$OMNI_PUBLISH_REPO" \

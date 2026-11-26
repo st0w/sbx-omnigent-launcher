@@ -39,7 +39,11 @@ from sbx_omnigent.runner.parsing.text import _single_line
 from sbx_omnigent.runner.sandboxes import sandbox_for
 from sbx_omnigent.runner.session_registry import SessionRegistry
 from sbx_omnigent.swarm import credential_kind_for, mount_sentinel
-from sbx_omnigent.swarm_session import SwarmSessionError
+from sbx_omnigent.swarm_session import (
+    EDIT_ACCESS,
+    READ_ACCESS,
+    SwarmSessionError,
+)
 
 #: Filename a node worktree carries an agy turn in (read by the agent,
 #: never pasted). Added to the clone's ``.git/info/exclude`` so it is
@@ -119,6 +123,8 @@ class SessionDriver:
         :param label: The node it serves, for titles and file names.
         :returns: The new session's id.
         :raises RunInterrupted: When Ctrl-C has been pressed.
+        :raises SwarmSessionError: When the server refuses to share
+            the session with the person running the pipeline.
         """
         self.refuse_if_interrupted(label)
         agent = self.ctx.config.agents[agent_name]
@@ -158,6 +164,17 @@ class SessionDriver:
         # subsequent resume and had to be found and deleted by hand.
         # One cheap write buys a VM that can always be reclaimed.
         self._save_state()
+        # Shared before its first turn, so the person running the
+        # pipeline can watch it from the start: on a server with
+        # accounts the runner's own account owns it, and the web UI
+        # lists only what a person owns or was given. After the save,
+        # so a refused share still leaves the VM reclaimable. A planner
+        # is answered there too, which takes edit.
+        self.ctx.sessions.share(
+            session,
+            level=EDIT_ACCESS if agent.template == 'planner'
+            else READ_ACCESS,
+        )
         if is_agy:
             self._registry.agy.add(session)
             # Warm the just-created agy TUI before it is driven, so the

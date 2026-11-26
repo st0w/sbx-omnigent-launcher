@@ -43,11 +43,11 @@ from sbx_omnigent.launch_args import (
     harness_by_ref,
     launch_args_for,
 )
+from sbx_omnigent.rate_limits import looks_like_rate_limit
 from sbx_omnigent.swarm_session import (
     SwarmSessionClient,
     SwarmSessionError,
     SwarmTurnResult,
-    looks_like_rate_limit,
 )
 from sbx_omnigent.worktrees import WorktreeManager
 

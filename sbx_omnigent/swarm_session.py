@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import sys
 import threading
 import time
@@ -36,6 +37,7 @@ import click
 
 from sbx_omnigent import agy
 from sbx_omnigent.launch_args import harness_by_ref, launch_args_for
+from sbx_omnigent.sse import SseFrame, parse_sse
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -253,33 +255,6 @@ _DEFAULT_TERMINAL_SETTLE_S = 20.0
 _DEFAULT_TERMINAL_POLL_S = 1.0
 _DEFAULT_STREAM_READ_TIMEOUT_S = 60.0
 _DEFAULT_REQUEST_TIMEOUT_S = 30.0
-
-#: Lowercase substrings that mark an LLM usage/rate limit rather than a
-#: task failure. Matched against a turn's error text, its
-#: ``last_task_error``, and (as a weak signal) the agent's own reply, so
-#: a turn that ended because the model was throttled is flagged instead
-#: of read as a bug. Deliberately broad — a false positive only adds a
-#: "might be a rate limit" hint, it never fails a good turn.
-_RATE_LIMIT_MARKERS: frozenset[str] = frozenset(
-    {
-        'rate limit',
-        'rate-limit',
-        'rate_limit',
-        'usage limit',
-        'usage-limit',
-        'usage cap',
-        'quota',
-        'too many requests',
-        'http 429',
-        ' 429',
-        'overloaded',
-        'insufficient_quota',
-        'resets at',
-        'try again later',
-        'capacity',
-    }
-)
-
 
 def _assistant_reply_items(
     items: list[dict[str, object]],
@@ -600,26 +575,6 @@ def _on_idle_edge(
     return None
 
 
-def looks_like_rate_limit(*texts: str | None) -> bool:
-    """
-    Whether any of *texts* reads like an LLM usage/rate-limit signal.
-
-    A best-effort heuristic (see :data:`_RATE_LIMIT_MARKERS`) so callers
-    can warn "this may be a rate limit, not a bug" when a turn ends
-    early, empty, or failed. Case-insensitive; ``None`` entries ignored.
-
-    :param texts: Candidate strings (error, ``last_task_error``, reply).
-    :returns: ``True`` if any contains a known rate-limit marker.
-    """
-    for text in texts:
-        if not text:
-            continue
-        low = text.lower()
-        if any(marker in low for marker in _RATE_LIMIT_MARKERS):
-            return True
-    return False
-
-
 class SwarmSessionError(click.ClickException):
     """A swarm-session operation failed (HTTP, timeout, or protocol)."""
 
@@ -699,50 +654,6 @@ class SwarmTurnResult:
     def ok(self) -> bool:
         """:returns: ``True`` when the turn completed cleanly."""
         return self.status == _STATUS_IDLE
-
-
-@dataclass(frozen=True)
-class _SseFrame:
-    """One parsed SSE frame: an ``event:`` type (or None) + its data."""
-
-    event: str | None
-    data: str
-
-
-def parse_sse(lines: Iterator[str]) -> Iterator[_SseFrame]:
-    """
-    Parse a line stream into SSE frames.
-
-    Minimal SSE: ``event:`` sets the frame type, ``data:`` lines
-    accumulate (newline-joined), a blank line dispatches the frame, and
-    ``:`` comment lines are ignored. Trailing newlines on each input
-    line are tolerated.
-
-    :param lines: Iterator of decoded stream lines (with or without a
-        trailing newline).
-    :returns: Iterator of :class:`_SseFrame`, one per dispatched event.
-    """
-    event: str | None = None
-    data: list[str] = []
-    for raw in lines:
-        line = raw.rstrip('\n').rstrip('\r')
-        if line == '':
-            if data or event is not None:
-                yield _SseFrame(event=event, data='\n'.join(data))
-            event = None
-            data = []
-            continue
-        if line.startswith(':'):
-            continue
-        field, _, value = line.partition(':')
-        if value.startswith(' '):
-            value = value[1:]
-        if field == 'event':
-            event = value
-        elif field == 'data':
-            data.append(value)
-    if data or event is not None:
-        yield _SseFrame(event=event, data='\n'.join(data))
 
 
 class Transport(Protocol):
@@ -985,6 +896,36 @@ class _StreamEvent:
     reply: str | None = None
 
 
+#: Access :meth:`SwarmSessionClient.share` grants, numbered as the
+#: server numbers them. Read lets a person watch a session; edit lets
+#: them post to it, which answering a planner takes.
+READ_ACCESS = 1
+EDIT_ACCESS = 2
+
+#: Omnigent's own rule for an account name (``_USERNAME_RE`` in its
+#: accounts routes): the server creates any user it is told to share
+#: with, so a name it would never accept is refused here instead.
+_ACCOUNT_NAME_RE = re.compile(
+    r'[a-z0-9][a-z0-9._-]{0,63}(@[a-z0-9.-]+\.[a-z]{2,})?'
+)
+
+
+def check_account_name(name: str) -> str:
+    """
+    Refuse an account name Omnigent would never accept.
+
+    :param name: The account to share sessions with, e.g. ``"alice"``.
+    :returns: *name*, unchanged.
+    :raises ValueError: When it is not a lowercase Omnigent username.
+    """
+    if not _ACCOUNT_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f'cannot share sessions with {name!r}: give the Omnigent '
+            f'username, lowercase, e.g. "alice"'
+        )
+    return name
+
+
 class SwarmSessionClient:
     """
     Create and drive managed swarm sessions over the Omnigent API.
@@ -996,6 +937,9 @@ class SwarmSessionClient:
         :class:`UrllibTransport`); tests pass a fake.
     :param request_timeout: Socket timeout for unary requests.
     :param stream_read_timeout: Per-read timeout on the SSE stream.
+    :param share_with: Account each session is shared with, see
+        :meth:`share`; ``None`` shares none.
+    :raises ValueError: For a *share_with* Omnigent would not accept.
     """
 
     def __init__(
@@ -1007,7 +951,11 @@ class SwarmSessionClient:
         request_timeout: float = _DEFAULT_REQUEST_TIMEOUT_S,
         stream_read_timeout: float = _DEFAULT_STREAM_READ_TIMEOUT_S,
         auto_approve: bool = True,
+        share_with: str | None = None,
     ) -> None:
+        self._share_with = (
+            None if share_with is None else check_account_name(share_with)
+        )
         #: Answer interactive prompts instead of failing the turn.
         #: On by default: the microVM is the containment boundary, so
         #: a prompt inside one carries no safety information — it is
@@ -1232,6 +1180,29 @@ class SwarmSessionClient:
             ):
                 return True
         return False
+
+    def share(self, session_id: str, *, level: int) -> None:
+        """
+        Let the person running the pipeline open *session_id*.
+
+        The runner's account owns every session it creates, and the web
+        UI lists only the sessions a person owns or was given. No-op
+        without ``share_with``.
+
+        :param session_id: The session to share.
+        :param level: :data:`READ_ACCESS` or :data:`EDIT_ACCESS`.
+        :raises ValueError: For any other level: nothing here hands
+            out management of a session.
+        :raises SwarmSessionError: When the server refuses the grant,
+            e.g. because sharing is turned off on it.
+        """
+        if level not in (READ_ACCESS, EDIT_ACCESS):
+            raise ValueError(f'share level must be read or edit: {level}')
+        if self._share_with is not None:
+            self._json(
+                'PUT', f'/v1/sessions/{session_id}/permissions',
+                {'user_id': self._share_with, 'level': level}, ok=(200,),
+            )
 
     def list_builtin_agents(self) -> list[dict[str, object]]:
         """
@@ -1969,7 +1940,7 @@ class SwarmSessionClient:
 
     @staticmethod
     def _dispatch_frame(
-        frame: _SseFrame,
+        frame: SseFrame,
         events: queue.Queue[_StreamEvent],
         delta_buf: list[str],
     ) -> None:
