@@ -31,7 +31,6 @@ from sbx_omnigent import (
     background,
     codex,
     egress,
-    guest_log,
     harness_versions,
     pane,
     pipeline,
@@ -111,6 +110,7 @@ from sbx_omnigent.swarm_session import (
 )
 from sbx_omnigent.worktrees import WorktreeManager
 from tests.support.disputes import NEAR_MISS_REPLY
+from tests.support.host import isolate_from_host
 from tests.support.plans import plan_text, plan_with_decisions
 from tests.support.reviews import AUDIT_LIMIT, SCAN_LIMIT
 from tests.support.sessions import WORK_COMPLETE, FakeSC
@@ -440,14 +440,11 @@ def _staged_file(
 class _Base(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(tempfile.mkdtemp(prefix='rn-'))
-        # Never touch the host's real harvester lock: a harvester
-        # running on this machine would otherwise make a CLI test block
-        # for the full first-refresh deadline.
-        patcher = mock.patch.object(
-            R.agy, 'HARVEST_LOCK', self.root / 'agy-harvest.lock'
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        host = isolate_from_host(self, self.root)
+        self.read_versions = host.read_versions
+        self.probe_login = host.probe_login
+        self.runner_log = host.runner_log
+        self.orphan_advice = host.orphan_advice
         # No test may spend the reviewer-retry backoff. It exists to
         # outlast a provider outage in production, which is minutes;
         # four tests drive a reviewer that dies on purpose, and paying
@@ -460,35 +457,6 @@ class _Base(unittest.TestCase):
         )
         writer_backoff.start()
         self.addCleanup(writer_backoff.stop)
-        # Never `sbx exec` into a real VM. A test that resolves a
-        # sandbox name would otherwise read the versions out of
-        # whatever box on this machine answers to it (#17).
-        versions = mock.patch.object(
-            harness_versions, 'read_versions', return_value={}
-        )
-        self.read_versions = versions.start()
-        self.addCleanup(versions.stop)
-        # Never run the real `codex doctor` on this host.
-        probe = mock.patch.object(
-            codex, 'probe_login', return_value=None
-        )
-        self.probe_login = probe.start()
-        self.addCleanup(probe.stop)
-        # Never `sbx exec` a real VM for its runner log.
-        runner_log = mock.patch.object(
-            guest_log, 'read_runner_log', return_value=None
-        )
-        self.runner_log = runner_log.start()
-        self.addCleanup(runner_log.stop)
-        # Never read this host's snapshot store or run its `sbx ls`. A
-        # disk refusal names leaked guest disks, and without this the
-        # six tests that refuse asked the real sbx on whatever machine
-        # ran the suite, and depended on its store.
-        advice = mock.patch.object(
-            R.orphans, 'orphan_advice', return_value=None
-        )
-        self.orphan_advice = advice.start()
-        self.addCleanup(advice.stop)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)

@@ -12,43 +12,9 @@ import unittest
 from pathlib import Path
 
 from sbx_omnigent import claude_plugins as cp
+from tests.support.claude_plugins import PLUGIN_ID, PluginHome
 
-_ID = 'claude-security@claude-plugins-official'
-
-
-class _Home:
-    """A temporary home with one installed plugin."""
-
-    def __init__(self) -> None:
-        self.home = Path(tempfile.mkdtemp(prefix='plugin-home-'))
-        self.plugins = self.home / '.claude' / 'plugins'
-        self.install = (
-            self.plugins / 'cache' / 'claude-plugins-official'
-            / 'claude-security' / '0.12.0'
-        )
-        (self.install / '.claude-plugin').mkdir(parents=True)
-        (self.install / '.claude-plugin' / 'plugin.json').write_text(
-            json.dumps({'name': 'claude-security', 'version': '0.12.0'})
-        )
-        (self.install / 'skills').mkdir()
-        (self.install / 'skills' / 'SKILL.md').write_text('scan things\n')
-        (self.install / '.in_use').mkdir()
-        (self.install / '.in_use' / '1203').write_text('pid\n')
-        self.register(_ID, self.install, '0.12.0')
-
-    def register(self, plugin_id: str, path: Path, version: str) -> None:
-        registry = self.plugins / 'installed_plugins.json'
-        data = (
-            json.loads(registry.read_text())
-            if registry.exists() else {'version': 2, 'plugins': {}}
-        )
-        data['plugins'][plugin_id] = [
-            {'scope': 'user', 'installPath': str(path), 'version': version}
-        ]
-        registry.write_text(json.dumps(data))
-
-    def cleanup(self) -> None:
-        shutil.rmtree(self.home, ignore_errors=True)
+_ID = PLUGIN_ID
 
 
 class TestAPluginIdIsValidated(unittest.TestCase):
@@ -65,7 +31,7 @@ class TestAPluginIdIsValidated(unittest.TestCase):
 
 class TestAnInstalledPluginIsFound(unittest.TestCase):
     def setUp(self) -> None:
-        self.h = _Home()
+        self.h = PluginHome()
         self.addCleanup(self.h.cleanup)
 
     def test_it_resolves_to_its_install(self) -> None:
@@ -103,7 +69,7 @@ class TestAnInstalledPluginIsFound(unittest.TestCase):
 
 class TestTheDigest(unittest.TestCase):
     def setUp(self) -> None:
-        self.h = _Home()
+        self.h = PluginHome()
         self.addCleanup(self.h.cleanup)
 
     def _digest(self) -> str:
@@ -130,7 +96,7 @@ class TestTheDigest(unittest.TestCase):
 
 class TestStagingAMarketplace(unittest.TestCase):
     def setUp(self) -> None:
-        self.h = _Home()
+        self.h = PluginHome()
         self.addCleanup(self.h.cleanup)
         self.dest = Path(tempfile.mkdtemp(prefix='plugin-stage-'))
         self.addCleanup(shutil.rmtree, self.dest, True)
